@@ -705,21 +705,20 @@ subroutine set_diffusivity(u, v, h, u_h, v_h, tv, fluxes, optics, visc, dt, Kd_i
       call add_drag_diffusivity(h, u, v, tv, fluxes, visc, jstart, jend, njblock, TKE_to_Kd, &
                                 maxTKE, kb, rho_bot, G, GV, US, CS, Kd_lay_2d, Kd_int_2d, dd%Kd_BBL)
 
-    !$OMP parallel do default(shared) private( &
-    !$OMP                                     KT_extra,KS_extra,dissip,jj) &
-    !$OMP                             if(.not. CS%use_CVMix_ddiff)
-    do j=jstart,jend
-      jj = j - jstart + 1
-
-    ! This adds the diffusion sustained by the energy extracted from the flow by the bottom drag.
     if (CS%bottomdraglaw .and. (CS%BBL_effic > 0.0)) then
       if (CS%use_LOTW_BBL_diffusivity) then
-        call add_LOTW_BBL_diffusivity(h, u, v, tv, fluxes, visc, j, N2_int(:,:,jj), Rho_bot(:,jj), Kd_int_2d(:,:,jj), &
-                                      G, GV, US, CS, dd%Kd_BBL, Kd_lay_2d(:,:,jj), dz(:,:,jj))
+        do j=jstart,jend ; jj = j - jstart + 1
+          call add_LOTW_BBL_diffusivity(h, u, v, tv, fluxes, visc, j, N2_int(:,:,jj), Rho_bot(:,jj), &
+                                        Kd_int_2d(:,:,jj), G, GV, US, CS, dd%Kd_BBL, Kd_lay_2d(:,:,jj), dz(:,:,jj))
+        enddo
       endif
-      if (associated(VBF%Kd_BBL)) then ; do K=1,nz+1 ; do i=is,ie
-        VBF%Kd_BBL(i,j,K) = dd%Kd_BBL(i,j,K)
-      enddo ; enddo ; endif
+      if (associated(VBF%Kd_BBL)) then
+        do j=jstart,jend ; jj = j - jstart + 1
+          do K=1,nz+1 ; do i=is,ie
+            VBF%Kd_BBL(i,j,K) = dd%Kd_BBL(i,j,K)
+          enddo ; enddo
+        enddo
+      endif
     endif
 
     if (CS%limit_dissipation) then
@@ -728,27 +727,33 @@ subroutine set_diffusivity(u, v, h, u_h, v_h, tv, fluxes, optics, visc, dt, Kd_i
       !   1) a global constant,
       !   2) a dissipation proportional to N (aka Gargett) and
       !   3) dissipation corresponding to a (nearly) constant diffusivity.
-      do K=2,nz ; do i=is,ie
-        dissip = max( CS%dissip_min, &   ! Const. floor on dissip.
-                      CS%dissip_N0 + CS%dissip_N1 * sqrt(N2_int(i,K,jj)), & ! Floor aka Gargett
-                      CS%dissip_N2 * N2_int(i,K,jj)) ! Floor of Kd_min*rho0/F_Ri
-        Kd_int_2d(i,K,jj) = max(Kd_int_2d(i,K,jj) , &  ! Apply floor to Kd
-                            dissip * (CS%FluxRi_max / (GV%H_to_RZ * (N2_int(i,K,jj) + Omega2))))
-      enddo ; enddo
+      do j=jstart,jend ; jj = j - jstart + 1
+        do K=2,nz ; do i=is,ie
+          dissip = max( CS%dissip_min, &   ! Const. floor on dissip.
+                        CS%dissip_N0 + CS%dissip_N1 * sqrt(N2_int(i,K,jj)), & ! Floor aka Gargett
+                        CS%dissip_N2 * N2_int(i,K,jj)) ! Floor of Kd_min*rho0/F_Ri
+          Kd_int_2d(i,K,jj) = max(Kd_int_2d(i,K,jj) , &  ! Apply floor to Kd
+                              dissip * (CS%FluxRi_max / (GV%H_to_RZ * (N2_int(i,K,jj) + Omega2))))
+        enddo ; enddo
+      enddo
     endif
 
     ! Optionally add a uniform diffusivity at the interfaces.
     if (CS%Kd_add > 0.0) then
-      do K=1,nz+1 ; do i=is,ie
-        Kd_int_2d(i,K,jj) = Kd_int_2d(i,K,jj) + CS%Kd_add
-      enddo ; enddo
+      do j=jstart,jend ; jj = j - jstart + 1
+        do K=1,nz+1 ; do i=is,ie
+          Kd_int_2d(i,K,jj) = Kd_int_2d(i,K,jj) + CS%Kd_add
+        enddo ; enddo
+      enddo
       VBF%Kd_add = CS%Kd_add
     endif
 
     ! Copy the 2-d slices into the 3-d array that is exported.
-    do K=1,nz+1 ; do i=is,ie
-      Kd_int(i,j,K) = Kd_int_2d(i,K,jj)
-    enddo ; enddo
+    do j=jstart,jend ; jj = j - jstart + 1
+      do K=1,nz+1 ; do i=is,ie
+        Kd_int(i,j,K) = Kd_int_2d(i,K,jj)
+      enddo ; enddo
+    enddo
 
     if (CS%limit_dissipation) then
       ! This calculates the layer dissipation ONLY from Kd calculated in this routine
@@ -756,39 +761,50 @@ subroutine set_diffusivity(u, v, h, u_h, v_h, tv, fluxes, optics, visc, dt, Kd_i
       !   1) a global constant,
       !   2) a dissipation proportional to N (aka Gargett) and
       !   3) dissipation corresponding to a (nearly) constant diffusivity.
-      do k=2,nz-1 ; do i=is,ie
-        dissip = max( CS%dissip_min, &   ! Const. floor on dissip.
-                      CS%dissip_N0 + CS%dissip_N1 * sqrt(N2_lay(i,k,jj)), & ! Floor aka Gargett
-                      CS%dissip_N2 * N2_lay(i,k,jj)) ! Floor of Kd_min*rho0/F_Ri
-        Kd_lay_2d(i,k,jj) = max(Kd_lay_2d(i,k,jj) , &  ! Apply floor to Kd
-                            dissip * (CS%FluxRi_max / (GV%H_to_RZ * (N2_lay(i,k,jj) + Omega2))))
-      enddo ; enddo
+      do j=jstart,jend ; jj = j - jstart + 1
+        do k=2,nz-1 ; do i=is,ie
+          dissip = max( CS%dissip_min, &   ! Const. floor on dissip.
+                        CS%dissip_N0 + CS%dissip_N1 * sqrt(N2_lay(i,k,jj)), & ! Floor aka Gargett
+                        CS%dissip_N2 * N2_lay(i,k,jj)) ! Floor of Kd_min*rho0/F_Ri
+          Kd_lay_2d(i,k,jj) = max(Kd_lay_2d(i,k,jj) , &  ! Apply floor to Kd
+                              dissip * (CS%FluxRi_max / (GV%H_to_RZ * (N2_lay(i,k,jj) + Omega2))))
+        enddo ; enddo
+      enddo
     endif
 
     if (associated(dd%Kd_Work)) then
-      do k=1,nz ; do i=is,ie
-        dd%Kd_Work(i,j,k) = GV%H_to_RZ * Kd_lay_2d(i,k,jj) * N2_lay(i,k,jj) * dz(i,k,jj)  ! Watt m-2 = kg s-3
-      enddo ; enddo
+      do j=jstart,jend ; jj = j - jstart + 1
+        do k=1,nz ; do i=is,ie
+          dd%Kd_Work(i,j,k) = GV%H_to_RZ * Kd_lay_2d(i,k,jj) * N2_lay(i,k,jj) * dz(i,k,jj)  ! Watt m-2 = kg s-3
+        enddo ; enddo
+      enddo
     endif
 
     ! Optionally add a uniform diffusivity to the layers.
     if ((CS%Kd_add > 0.0) .and. (present(Kd_lay))) then
-      do k=1,nz ; do i=is,ie
-        Kd_lay_2d(i,k,jj) = Kd_lay_2d(i,k,jj) + CS%Kd_add
-      enddo ; enddo
+      do j=jstart,jend ; jj = j - jstart + 1
+        do k=1,nz ; do i=is,ie
+          Kd_lay_2d(i,k,jj) = Kd_lay_2d(i,k,jj) + CS%Kd_add
+        enddo ; enddo
+      enddo
     endif
 
     if (associated(dd%Kd_Work_added)) then
-      do k=1,nz ; do i=is,ie
-        dd%Kd_Work_added(i,j,k) = GV%H_to_RZ * CS%Kd_add * N2_lay(i,k,jj) * dz(i,k,jj)  ! Watt m-2 = kg s-3
-      enddo ; enddo
+      do j=jstart,jend ; jj = j - jstart + 1
+        do k=1,nz ; do i=is,ie
+          dd%Kd_Work_added(i,j,k) = GV%H_to_RZ * CS%Kd_add * N2_lay(i,k,jj) * dz(i,k,jj)  ! Watt m-2 = kg s-3
+        enddo ; enddo
+      enddo
     endif
 
     ! Copy the 2-d slices into the 3-d array that is exported; this was done above for Kd_int.
-    if (present(Kd_lay)) then ; do k=1,nz ; do i=is,ie
-      Kd_lay(i,j,k) = Kd_lay_2d(i,k,jj)
-    enddo ; enddo ; endif
-    enddo ! j-loop
+    if (present(Kd_lay)) then
+      do j=jstart,jend ; jj = j - jstart + 1
+        do k=1,nz ; do i=is,ie
+          Kd_lay(i,j,k) = Kd_lay_2d(i,k,jj)
+        enddo ; enddo
+      enddo
+    endif
   enddo ! jstart-loop
 
   if (CS%user_change_diff) then
