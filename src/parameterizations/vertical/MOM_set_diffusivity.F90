@@ -482,8 +482,12 @@ subroutine set_diffusivity(u, v, h, u_h, v_h, tv, fluxes, optics, visc, dt, Kd_i
   do jstart=js,je,njblock
     jend = min(jstart+njblock-1, je)
 
+    do j=jstart,jend ; jj = j - jstart + 1
+      call thickness_to_dz(h, tv, dz(:,:,jj), j, G, GV)
+    enddo
+
     ! Set up variables related to the stratification.
-    call find_N2(h, tv, T_f, S_f, fluxes, njblock, jstart, jend, G, GV, US, CS, dRho_int, N2_lay, N2_int, N2_bot, rho_bot, h_bot, k_bot)
+    call find_N2(h, tv, T_f, S_f, fluxes, njblock, jstart, jend, G, GV, US, CS, dRho_int, N2_lay, N2_int, N2_bot, rho_bot, h_bot, k_bot, dz)
 
     ! Add background mixing
     call calculate_bkgnd_mixing(h, tv, N2_lay, Kd_lay_2d, Kd_int_2d, Kv_bkgnd, jstart, jend, njblock, G, GV, US, CS%bkgnd_mixing_csp)
@@ -583,7 +587,7 @@ subroutine set_diffusivity(u, v, h, u_h, v_h, tv, fluxes, optics, visc, dt, Kd_i
 
     ! Calculate conversion ratios from TKE to layer diffusivities.
     if (TKE_to_Kd_used) then
-      call find_TKE_to_Kd(h, tv, dRho_int, N2_lay, jstart, jend, njblock, dt, G, GV, US, CS, TKE_to_Kd, maxTKE, kb)
+      call find_TKE_to_Kd(h, tv, dRho_int, N2_lay, jstart, jend, njblock, dt, G, GV, US, CS, TKE_to_Kd, maxTKE, kb, dz)
       if (associated(dd%maxTKE)) then
         do j=jstart,jend ; jj = j - jstart + 1 ; do k=1,nz ; do i=is,ie
           dd%maxTKE(i,j,k) = maxTKE(i,k,jj)
@@ -615,12 +619,6 @@ subroutine set_diffusivity(u, v, h, u_h, v_h, tv, fluxes, optics, visc, dt, Kd_i
       do j=jstart,jend ; jj = j - jstart + 1 ; do K=2,nz ; do i=is,ie
         Kd_int_2d(i,K,jj) = 0.5 * (Kd_lay_2d(i,k-1,jj) + Kd_lay_2d(i,k,jj))
       enddo ; enddo ; enddo
-    endif
-
-    if (CS%ML_radiation .or. CS%use_tidal_mixing .or. associated(dd%Kd_Work)) then
-      do j=jstart,jend ; jj = j - jstart + 1
-        call thickness_to_dz(h, tv, dz(:,:,jj), j, G, GV)
-      enddo
     endif
 
     !$OMP parallel do default(shared) private( &
@@ -706,7 +704,7 @@ subroutine set_diffusivity(u, v, h, u_h, v_h, tv, fluxes, optics, visc, dt, Kd_i
     if (CS%bottomdraglaw .and. (CS%BBL_effic > 0.0)) then
       if (CS%use_LOTW_BBL_diffusivity) then
         call add_LOTW_BBL_diffusivity(h, u, v, tv, fluxes, visc, j, N2_int(:,:,jj), Rho_bot(:,jj), Kd_int_2d(:,:,jj), &
-                                      G, GV, US, CS, dd%Kd_BBL, Kd_lay_2d(:,:,jj))
+                                      G, GV, US, CS, dd%Kd_BBL, Kd_lay_2d(:,:,jj), dz(:,:,jj))
       else
         call add_drag_diffusivity(h, u, v,  tv, fluxes, visc, j, TKE_to_Kd(:,:,jj), &
                                   maxTKE(:,:,jj), kb(:,jj), rho_bot(:,jj), G, GV, US, CS, Kd_lay_2d(:,:,jj), Kd_int_2d(:,:,jj), dd%Kd_BBL)
@@ -907,7 +905,7 @@ end subroutine set_diffusivity
 
 !> Convert turbulent kinetic energy to diffusivity
 subroutine find_TKE_to_Kd(h, tv, dRho_int, N2_lay, jstart, jend, nj, dt, G, GV, US, CS, &
-                          TKE_to_Kd, maxTKE, kb)
+                          TKE_to_Kd, maxTKE, kb, dz)
   type(ocean_grid_type),            intent(in)    :: G    !< The ocean's grid structure
   type(verticalGrid_type),          intent(in)    :: GV   !< The ocean's vertical grid structure
   type(unit_scale_type),            intent(in)    :: US   !< A dimensional unit scaling type
@@ -933,6 +931,7 @@ subroutine find_TKE_to_Kd(h, tv, dRho_int, N2_lay, jstart, jend, nj, dt, G, GV, 
                                                           !! maximum realizable thickness [H Z2 T-3 ~> m3 s-3 or W m-2]
   integer, dimension(SZI_(G),nj),   intent(out)   :: kb   !< Index of lightest layer denser than the buffer
                                                           !! layer, or -1 without a bulk mixed layer.
+  real, dimension(SZI_(G),SZK_(GV),nj), intent(in) :: dz  !< Height change across layers [Z ~> m]
   ! Local variables
   real, dimension(SZI_(G),SZK_(GV),nj) :: &
     ds_dsp1, &    ! coordinate variable (sigma-2) difference across an
@@ -942,7 +941,6 @@ subroutine find_TKE_to_Kd(h, tv, dRho_int, N2_lay, jstart, jend, nj, dt, G, GV, 
                   ! across an interface times the difference across the
                   ! interface above it [nondim]
     rho_0,   &    ! Layer potential densities relative to surface pressure [R ~> kg m-3]
-    dz,      &    ! Height change across layers [Z ~> m]
     maxEnt        ! maxEnt is the maximum value of entrainment from below (with
                   ! compensating entrainment from above to keep the layer
                   ! density from changing) that will not deplete all of the
@@ -983,10 +981,6 @@ subroutine find_TKE_to_Kd(h, tv, dRho_int, N2_lay, jstart, jend, nj, dt, G, GV, 
   else
     G_IRho0 = GV%H_to_Z*G_Rho0
   endif
-
-  do j=jstart,jend ; jj = j - jstart + 1
-    call thickness_to_dz(h, tv, dz(:,:,jj), j, G, GV)
-  enddo
 
   ! Simple but coordinate-independent estimate of Kd/TKE
   if (CS%simple_TKE_to_Kd) then
@@ -1144,7 +1138,7 @@ end subroutine find_TKE_to_Kd
 
 !> Calculate Brunt-Vaisala frequency, N^2.
 subroutine find_N2(h, tv, T_f, S_f, fluxes, nj, jstart, jend, G, GV, US, CS, dRho_int, &
-                   N2_lay, N2_int, N2_bot, Rho_bot, h_bot, k_bot)
+                   N2_lay, N2_int, N2_bot, Rho_bot, h_bot, k_bot, dz)
   type(ocean_grid_type),    intent(in)  :: G    !< The ocean's grid structure
   type(verticalGrid_type),  intent(in)  :: GV   !< The ocean's vertical grid structure
   type(unit_scale_type),    intent(in)  :: US   !< A dimensional unit scaling type
@@ -1174,6 +1168,7 @@ subroutine find_N2(h, tv, T_f, S_f, fluxes, nj, jstart, jend, G, GV, US, CS, dRh
   real, dimension(SZI_(G),nj), intent(out) :: Rho_bot !< Near-bottom density [R ~> kg m-3].
   real, dimension(SZI_(G),nj), intent(out) :: h_bot !< Bottom boundary layer thickness [H ~> m or kg m-2].
   integer, dimension(SZI_(G),nj), intent(out) :: k_bot !< Bottom boundary layer top layer index.
+  real, dimension(SZI_(G),SZK_(GV),nj), intent(in) :: dz !< Height change across layers [Z ~> m]
 
   ! Local variables
   real, dimension(SZI_(G),SZK_(GV)+1,nj) :: &
@@ -1181,8 +1176,6 @@ subroutine find_N2(h, tv, T_f, S_f, fluxes, nj, jstart, jend, G, GV, US, CS, dRh
     dRho_int_unfilt, & ! unfiltered density differences across interfaces [R ~> kg m-3]
     dRho_dT,         & ! partial derivative of density wrt temp [R C-1 ~> kg m-3 degC-1]
     dRho_dS            ! partial derivative of density wrt saln [R S-1 ~> kg m-3 ppt-1]
-  real, dimension(SZI_(G),SZK_(GV),nj) :: &
-    dz            ! Height change across layers [Z ~> m]
   real, dimension(SZI_(G),nj) :: &
     Temp_int,  &  ! temperature at each interface [C ~> degC]
     Salin_int, &  ! salinity at each interface [S ~> ppt]
@@ -1249,11 +1242,6 @@ subroutine find_N2(h, tv, T_f, S_f, fluxes, nj, jstart, jend, G, GV, US, CS, dRh
       enddo
     enddo
   endif
-
-  ! Find the vertical distances across layers.
-  do j=jstart,jend ; jj = j - jstart + 1
-    call thickness_to_dz(h, tv, dz(:,:,jj), j, G, GV)
-  enddo
 
   ! Set the buoyancy frequencies.
   do k=1,nz
@@ -1700,7 +1688,7 @@ end subroutine add_drag_diffusivity
 !! wall turbulent viscosity, up to a BBL height where the energy used for mixing has
 !! consumed the mechanical TKE input.
 subroutine add_LOTW_BBL_diffusivity(h, u, v, tv, fluxes, visc, j, N2_int, Rho_bot, Kd_int, &
-                                    G, GV, US, CS, Kd_BBL, Kd_lay)
+                                    G, GV, US, CS, Kd_BBL, Kd_lay, dz)
   type(ocean_grid_type),    intent(in)    :: G  !< Grid structure
   type(verticalGrid_type),  intent(in)    :: GV !< Vertical grid structure
   type(unit_scale_type),    intent(in)    :: US !< A dimensional unit scaling type
@@ -1725,10 +1713,10 @@ subroutine add_LOTW_BBL_diffusivity(h, u, v, tv, fluxes, visc, j, N2_int, Rho_bo
   type(set_diffusivity_CS), pointer       :: CS !< Diffusivity control structure
   real, dimension(:,:,:),   pointer       :: Kd_BBL !< Interface BBL diffusivity [H Z T-1 ~> m2 s-1 or kg m-1 s-1]
   real, dimension(SZI_(G),SZK_(GV)), &
-                  optional, intent(inout) :: Kd_lay !< Layer net diffusivity [H Z T-1 ~> m2 s-1 or kg m-1 s-1]
+                  optional, intent(inout) :: Kd_lay  !< Layer net diffusivity [H Z T-1 ~> m2 s-1 or kg m-1 s-1]
+  real, dimension(SZI_(G),SZK_(GV)), intent(in) :: dz !< Height change across layers [Z ~> m]
 
   ! Local variables
-  real :: dz(SZI_(G),SZK_(GV)) ! Height change across layers [Z ~> m]
   real :: dz_above(SZK_(GV)+1) ! Distance from each interface to the surface [Z ~> m]
   real :: TKE_column       ! net TKE input into the column [H Z2 T-3 ~> m3 s-3 or W m-2]
   real :: BBL_meanKE_dis   ! Sum of tidal and mean kinetic energy dissipation in the bottom boundary layer, which
@@ -1766,9 +1754,6 @@ subroutine add_LOTW_BBL_diffusivity(h, u, v, tv, fluxes, visc, j, N2_int, Rho_bo
   Rayleigh_drag = .false.
   if (allocated(visc%Ray_u) .and. allocated(visc%Ray_v)) Rayleigh_drag = .true.
   cdrag_sqrt = sqrt(CS%cdrag)
-
-  ! Find the vertical distances across layers.
-  call thickness_to_dz(h, tv, dz, j, G, GV)
 
   do i=G%isc,G%iec ! Developed in single-column mode
 
