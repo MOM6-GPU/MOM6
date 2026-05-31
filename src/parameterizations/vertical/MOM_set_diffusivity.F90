@@ -700,6 +700,11 @@ subroutine set_diffusivity(u, v, h, u_h, v_h, tv, fluxes, optics, visc, dt, Kd_i
       enddo
     endif
 
+    ! This adds the diffusion sustained by drag TKE.
+    if (CS%bottomdraglaw .and. (CS%BBL_effic > 0.0) .and. .not. CS%use_LOTW_BBL_diffusivity) &
+      call add_drag_diffusivity(h, u, v, tv, fluxes, visc, jstart, jend, njblock, TKE_to_Kd, &
+                                maxTKE, kb, rho_bot, G, GV, US, CS, Kd_lay_2d, Kd_int_2d, dd%Kd_BBL)
+
     !$OMP parallel do default(shared) private( &
     !$OMP                                     KT_extra,KS_extra,dissip,jj) &
     !$OMP                             if(.not. CS%use_CVMix_ddiff)
@@ -711,9 +716,6 @@ subroutine set_diffusivity(u, v, h, u_h, v_h, tv, fluxes, optics, visc, dt, Kd_i
       if (CS%use_LOTW_BBL_diffusivity) then
         call add_LOTW_BBL_diffusivity(h, u, v, tv, fluxes, visc, j, N2_int(:,:,jj), Rho_bot(:,jj), Kd_int_2d(:,:,jj), &
                                       G, GV, US, CS, dd%Kd_BBL, Kd_lay_2d(:,:,jj), dz(:,:,jj))
-      else
-        call add_drag_diffusivity(h, u, v,  tv, fluxes, visc, j, TKE_to_Kd(:,:,jj), &
-                                  maxTKE(:,:,jj), kb(:,jj), rho_bot(:,jj), G, GV, US, CS, Kd_lay_2d(:,:,jj), Kd_int_2d(:,:,jj), dd%Kd_BBL)
       endif
       if (associated(VBF%Kd_BBL)) then ; do K=1,nz+1 ; do i=is,ie
         VBF%Kd_BBL(i,j,K) = dd%Kd_BBL(i,j,K)
@@ -1451,7 +1453,7 @@ subroutine double_diffusion(tv, h, T_f, S_f, j, G, GV, US, CS, Kd_T_dd, Kd_S_dd)
 end subroutine double_diffusion
 
 !> This routine adds diffusion sustained by flow energy extracted by bottom drag.
-subroutine add_drag_diffusivity(h, u, v, tv, fluxes, visc, j, TKE_to_Kd, maxTKE, &
+subroutine add_drag_diffusivity(h, u, v, tv, fluxes, visc, jstart, jend, nj, TKE_to_Kd, maxTKE, &
                                 kb, rho_bot, G, GV, US, CS, Kd_lay, Kd_int, Kd_BBL)
   type(ocean_grid_type),            intent(in)    :: G    !< The ocean's grid structure
   type(verticalGrid_type),          intent(in)    :: GV   !< The ocean's vertical grid structure
@@ -1467,22 +1469,24 @@ subroutine add_drag_diffusivity(h, u, v, tv, fluxes, visc, j, TKE_to_Kd, maxTKE,
   type(forcing),                    intent(in)    :: fluxes !< A structure of thermodynamic surface fluxes
   type(vertvisc_type),              intent(in)    :: visc !< Structure containing vertical viscosities, bottom
                                                           !! boundary layer properties and related fields
-  integer,                          intent(in)    :: j    !< j-index of row to work on
-  real, dimension(SZI_(G),SZK_(GV)), intent(in)   :: TKE_to_Kd !< The conversion rate between the TKE
+  integer,                          intent(in)    :: jstart !< j-index of first row to work on
+  integer,                          intent(in)    :: jend   !< j-index of last row to work on
+  integer,                          intent(in)    :: nj     !< Number of j-rows in a j-block
+  real, dimension(SZI_(G),SZK_(GV),nj), intent(in) :: TKE_to_Kd !< The conversion rate between the TKE
                                                           !! TKE dissipated within a layer and the
                                                           !! diapycnal diffusivity within that layer,
                                                           !! usually (~Rho_0 / (G_Earth * dRho_lay))
                                                           !! [T2 Z-1 ~> s2 m-1]
-  real, dimension(SZI_(G),SZK_(GV)), intent(in)   :: maxTKE !< The energy required to for a layer to entrain to its
+  real, dimension(SZI_(G),SZK_(GV),nj), intent(in) :: maxTKE !< The energy required to for a layer to entrain to its
                                                           !! maximum-realizable thickness [H Z2 T-3 ~> m3 s-3 or W m-2]
-  integer, dimension(SZI_(G)),      intent(in)    :: kb   !< Index of lightest layer denser than the buffer
+  integer, dimension(SZI_(G),nj),   intent(in)    :: kb   !< Index of lightest layer denser than the buffer
                                                           !! layer, or -1 without a bulk mixed layer
-  real, dimension(SZI_(G)),         intent(in)    :: rho_bot !< In situ density averaged over a near-bottom
+  real, dimension(SZI_(G),nj),      intent(in)    :: rho_bot !< In situ density averaged over a near-bottom
                                                           !! region [R ~> kg m-3]
   type(set_diffusivity_CS),         pointer       :: CS   !< Diffusivity control structure
-  real, dimension(SZI_(G),SZK_(GV)), intent(inout) :: Kd_lay !< The diapycnal diffusivity in layers,
+  real, dimension(SZI_(G),SZK_(GV),nj), intent(inout) :: Kd_lay !< The diapycnal diffusivity in layers,
                                                             !! [H Z T-1 ~> m2 s-1 or kg m-1 s-1]
-  real, dimension(SZI_(G),SZK_(GV)+1), intent(inout) :: Kd_int !< The diapycnal diffusivity at interfaces,
+  real, dimension(SZI_(G),SZK_(GV)+1,nj), intent(inout) :: Kd_int !< The diapycnal diffusivity at interfaces,
                                                             !! [H Z T-1 ~> m2 s-1 or kg m-1 s-1]
   real, dimension(:,:,:),           pointer       :: Kd_BBL !< Interface BBL diffusivity
                                                             !! [H Z T-1 ~> m2 s-1 or kg m-1 s-1]
@@ -1491,7 +1495,7 @@ subroutine add_drag_diffusivity(h, u, v, tv, fluxes, visc, j, TKE_to_Kd, maxTKE,
 
   real, dimension(SZK_(GV)+1) :: &
     Rint          ! coordinate density of an interface [R ~> kg m-3]
-  real, dimension(SZI_(G)) :: &
+  real, dimension(SZI_(G),nj) :: &
     htot, &       ! total thickness above or below a layer, or the
                   ! integrated thickness in the BBL [H ~> m or kg m-2].
     rho_htot, &   ! running integral with depth of density [R H ~> kg m-2 or kg2 m-5]
@@ -1516,10 +1520,10 @@ subroutine add_drag_diffusivity(h, u, v, tv, fluxes, visc, j, TKE_to_Kd, maxTKE,
                             ! defined in visc, on the assumption that this
                             ! extracted energy also drives diapycnal mixing.
 
-  logical :: domore, do_i(SZI_(G))
+  logical :: domore, do_i(SZI_(G),nj)
   logical :: do_diag_Kd_BBL
 
-  integer :: i, k, is, ie, nz, i_rem, kb_min
+  integer :: i, j, k, is, ie, nz, i_rem, kb_min, jj
   is = G%isc ; ie = G%iec ; nz = GV%ke
 
   do_diag_Kd_BBL = associated(Kd_BBL)
@@ -1539,11 +1543,11 @@ subroutine add_drag_diffusivity(h, u, v, tv, fluxes, visc, j, TKE_to_Kd, maxTKE,
   ! The turbulence decay scale is 0.5*ustar/f from K&E & MOM_vertvisc.F90
   ! Any turbulence that makes it into the mixed layers is assumed
   ! to be relatively small and is discarded.
-  do i=is,ie
+  do j=jstart,jend ; jj = j - jstart + 1 ; do i=is,ie
     ustar_h = visc%ustar_BBL(i,j)
     if (associated(fluxes%ustar_tidal)) then
       if (allocated(tv%SpV_avg)) then
-        ustar_h = ustar_h + GV%RZ_to_H*rho_bot(i) * fluxes%ustar_tidal(i,j)
+        ustar_h = ustar_h + GV%RZ_to_H*rho_bot(i,jj) * fluxes%ustar_tidal(i,j)
       else
         ustar_h = ustar_h + GV%Z_to_H * fluxes%ustar_tidal(i,j)
       endif
@@ -1551,142 +1555,146 @@ subroutine add_drag_diffusivity(h, u, v, tv, fluxes, visc, j, TKE_to_Kd, maxTKE,
     absf = 0.25 * ((abs(G%CoriolisBu(I-1,J-1)) + abs(G%CoriolisBu(I,J))) + &
                    (abs(G%CoriolisBu(I-1,J)) + abs(G%CoriolisBu(I,J-1))))
     if ((ustar_h > 0.0) .and. (absf > 0.5*CS%IMax_decay*ustar_h))  then
-      I2decay(i) = absf / ustar_h
+      I2decay(i,jj) = absf / ustar_h
     else
       ! The maximum decay scale should be something of order 200 m.
       ! If ustar_h = 0, this is land so this value doesn't matter.
-      I2decay(i) = 0.5*CS%IMax_decay
+      I2decay(i,jj) = 0.5*CS%IMax_decay
     endif
     if (CS%drag_diff_answer_date <= 20250301) then
-      TKE(i) = ((CS%BBL_effic * cdrag_sqrt) * exp(-I2decay(i)*h(i,j,nz)) ) * visc%BBL_meanKE_loss_sqrtCd(i,j)
+      TKE(i,jj) = ((CS%BBL_effic * cdrag_sqrt) * exp(-I2decay(i,jj)*h(i,j,nz)) ) * visc%BBL_meanKE_loss_sqrtCd(i,j)
     else
-      TKE(i) = (CS%BBL_effic * exp(-I2decay(i)*h(i,j,nz)) ) * visc%BBL_meanKE_loss(i,j)
+      TKE(i,jj) = (CS%BBL_effic * exp(-I2decay(i,jj)*h(i,j,nz)) ) * visc%BBL_meanKE_loss(i,j)
     endif
 
     if (associated(fluxes%BBL_tidal_dis)) &
-      TKE(i) = TKE(i) + fluxes%BBL_tidal_dis(i,j) * GV%RZ_to_H * &
-           (CS%BBL_effic * exp(-I2decay(i)*h(i,j,nz)))
+      TKE(i,jj) = TKE(i,jj) + fluxes%BBL_tidal_dis(i,j) * GV%RZ_to_H * &
+           (CS%BBL_effic * exp(-I2decay(i,jj)*h(i,j,nz)))
 
     ! Distribute the work over a BBL of depth 20^2 ustar^2 / g' following
     ! Killworth & Edwards (1999) and Zilitikevich & Mironov (1996).
     ! Rho_top is determined by finding the density where
     ! integral(bottom, Z) (rho(z') - rho(Z)) dz' = rho_0 400 ustar^2 / g
 
-    gh_sum_top(i) = R0_g * 400.0 * ustar_h**2
+    gh_sum_top(i,jj) = R0_g * 400.0 * ustar_h**2
 
-    do_i(i) = (G%mask2dT(i,j) > 0.0)
-    htot(i) = h(i,j,nz)
-    rho_htot(i) = GV%Rlay(nz)*(h(i,j,nz))
-    Rho_top(i) = GV%Rlay(1)
-    if (CS%bulkmixedlayer .and. do_i(i)) Rho_top(i) = GV%Rlay(kb(i)-1)
+    do_i(i,jj) = (G%mask2dT(i,j) > 0.0)
+    htot(i,jj) = h(i,j,nz)
+    rho_htot(i,jj) = GV%Rlay(nz)*(h(i,j,nz))
+    Rho_top(i,jj) = GV%Rlay(1)
+    if (CS%bulkmixedlayer .and. do_i(i,jj)) Rho_top(i,jj) = GV%Rlay(kb(i,jj)-1)
+  enddo ; enddo
+
+  do j=jstart,jend ; jj = j - jstart + 1
+    do k=nz-1,2,-1 ; domore = .false.
+      do i=is,ie ; if (do_i(i,jj)) then
+        htot(i,jj) = htot(i,jj) + h(i,j,k)
+        rho_htot(i,jj) = rho_htot(i,jj) + GV%Rlay(k)*(h(i,j,k))
+        if (htot(i,jj)*GV%Rlay(k-1) <= (rho_htot(i,jj) - gh_sum_top(i,jj))) then
+          ! The top of the mixing is in the interface atop the current layer.
+          Rho_top(i,jj) = (rho_htot(i,jj) - gh_sum_top(i,jj)) / htot(i,jj)
+          do_i(i,jj) = .false.
+        elseif (k <= kb(i,jj)) then ; do_i(i,jj) = .false.
+        else ; domore = .true. ; endif
+      endif ; enddo
+      if (.not.domore) exit
+    enddo ! k-loop
   enddo
 
-  do k=nz-1,2,-1 ; domore = .false.
-    do i=is,ie ; if (do_i(i)) then
-      htot(i) = htot(i) + h(i,j,k)
-      rho_htot(i) = rho_htot(i) + GV%Rlay(k)*(h(i,j,k))
-      if (htot(i)*GV%Rlay(k-1) <= (rho_htot(i) - gh_sum_top(i))) then
-        ! The top of the mixing is in the interface atop the current layer.
-        Rho_top(i) = (rho_htot(i) - gh_sum_top(i)) / htot(i)
-        do_i(i) = .false.
-      elseif (k <= kb(i)) then ; do_i(i) = .false.
-      else ; domore = .true. ; endif
-    endif ; enddo
-    if (.not.domore) exit
-  enddo ! k-loop
+  do j=jstart,jend ; jj = j - jstart + 1
+    do i=is,ie ; do_i(i,jj) = (G%mask2dT(i,j) > 0.0) ; enddo
+    do k=nz-1,kb_min,-1
+      i_rem = 0
+      do i=is,ie ; if (do_i(i,jj)) then
+        if (k<kb(i,jj)) then ; do_i(i,jj) = .false. ; cycle ; endif
+        i_rem = i_rem + 1  ! Count the i-rows that are still being worked on.
+        !   Apply vertical decay of the turbulent energy.  This energy is
+        ! simply lost.
+        TKE(i,jj) = TKE(i,jj) * exp(-I2decay(i,jj) * (h(i,j,k) + h(i,j,k+1)))
 
-  do i=is,ie ; do_i(i) = (G%mask2dT(i,j) > 0.0) ; enddo
-  do k=nz-1,kb_min,-1
-    i_rem = 0
-    do i=is,ie ; if (do_i(i)) then
-      if (k<kb(i)) then ; do_i(i) = .false. ; cycle ; endif
-      i_rem = i_rem + 1  ! Count the i-rows that are still being worked on.
-      !   Apply vertical decay of the turbulent energy.  This energy is
-      ! simply lost.
-      TKE(i) = TKE(i) * exp(-I2decay(i) * (h(i,j,k) + h(i,j,k+1)))
+        if (maxTKE(i,k,jj) <= 0.0) cycle
 
-      if (maxTKE(i,k) <= 0.0) cycle
-
-  ! This is an analytic integral where diffusivity is a quadratic function of
-  ! rho that goes asymptotically to 0 at Rho_top (vaguely following KPP?).
-      if (TKE(i) > 0.0) then
-        if (Rint(K) <= Rho_top(i)) then
-          TKE_to_layer = TKE(i)
-        else
-          dRl = Rint(K+1) - Rint(K) ; dRbot = Rint(K+1) - Rho_top(i)
-          TKE_to_layer = TKE(i) * dRl * &
-              (3.0*dRbot*(Rint(K) - Rho_top(i)) + dRl**2) / (dRbot**3)
-        endif
-      else ; TKE_to_layer = 0.0 ; endif
-
-      ! TKE_Ray has been initialized to 0 above.
-      if (Rayleigh_drag) TKE_Ray = 0.5*CS%BBL_effic * G%IareaT(i,j) * &
-            (((G%areaCu(I-1,j) * visc%Ray_u(I-1,j,k) * u(I-1,j,k)**2) + &
-              (G%areaCu(I,j)   * visc%Ray_u(I,j,k)   * u(I,j,k)**2)) + &
-             ((G%areaCv(i,J-1) * visc%Ray_v(i,J-1,k) * v(i,J-1,k)**2) + &
-              (G%areaCv(i,J)   * visc%Ray_v(i,J,k)   * v(i,J,k)**2)))
-
-      if (TKE_to_layer + TKE_Ray > 0.0) then
-        if (CS%BBL_mixing_as_max) then
-          if (TKE_to_layer + TKE_Ray > maxTKE(i,k)) &
-              TKE_to_layer = maxTKE(i,k) - TKE_Ray
-
-          TKE(i) = TKE(i) - TKE_to_layer
-
-          if (Kd_lay(i,k) < (TKE_to_layer + TKE_Ray) * TKE_to_Kd(i,k)) then
-            delta_Kd = (TKE_to_layer + TKE_Ray) * TKE_to_Kd(i,k) - Kd_lay(i,k)
-            if ((CS%Kd_max >= 0.0) .and. (delta_Kd > CS%Kd_max)) then
-              delta_Kd = CS%Kd_max
-              Kd_lay(i,k) = Kd_lay(i,k) + delta_Kd
-            else
-              Kd_lay(i,k) =  (TKE_to_layer + TKE_Ray) * TKE_to_Kd(i,k)
-            endif
-            Kd_int(i,K)   = Kd_int(i,K)   + 0.5 * delta_Kd
-            Kd_int(i,K+1) = Kd_int(i,K+1) + 0.5 * delta_Kd
-            if (do_diag_Kd_BBL) then
-              Kd_BBL(i,j,K) = Kd_BBL(i,j,K) + 0.5 * delta_Kd
-              Kd_BBL(i,j,K+1) = Kd_BBL(i,j,K+1) + 0.5 * delta_Kd
-            endif
-          endif
-        else
-          if (Kd_lay(i,k) >= maxTKE(i,k) * TKE_to_Kd(i,k)) then
-            TKE_here = 0.0
-            TKE(i) = TKE(i) + TKE_Ray
-          elseif (Kd_lay(i,k) + (TKE_to_layer + TKE_Ray) * TKE_to_Kd(i,k) > &
-                  maxTKE(i,k) * TKE_to_Kd(i,k)) then
-            TKE_here = ((TKE_to_layer + TKE_Ray) + Kd_lay(i,k) / TKE_to_Kd(i,k)) - maxTKE(i,k)
-            TKE(i) = (TKE(i) - TKE_here) + TKE_Ray
+    ! This is an analytic integral where diffusivity is a quadratic function of
+    ! rho that goes asymptotically to 0 at Rho_top (vaguely following KPP?).
+        if (TKE(i,jj) > 0.0) then
+          if (Rint(K) <= Rho_top(i,jj)) then
+            TKE_to_layer = TKE(i,jj)
           else
-            TKE_here = TKE_to_layer + TKE_Ray
-            TKE(i) = TKE(i) - TKE_to_layer
+            dRl = Rint(K+1) - Rint(K) ; dRbot = Rint(K+1) - Rho_top(i,jj)
+            TKE_to_layer = TKE(i,jj) * dRl * &
+                (3.0*dRbot*(Rint(K) - Rho_top(i,jj)) + dRl**2) / (dRbot**3)
           endif
-          if (TKE(i) < 0.0) TKE(i) = 0.0 ! This should be unnecessary?
+        else ; TKE_to_layer = 0.0 ; endif
 
-          if (TKE_here > 0.0) then
-            delta_Kd = TKE_here * TKE_to_Kd(i,k)
-            if (CS%Kd_max >= 0.0) delta_Kd = min(delta_Kd, CS%Kd_max)
-            Kd_lay(i,k) = Kd_lay(i,k) + delta_Kd
-            Kd_int(i,K)   = Kd_int(i,K)   + 0.5 * delta_Kd
-            Kd_int(i,K+1) = Kd_int(i,K+1) + 0.5 * delta_Kd
-            if (do_diag_Kd_BBL) then
-              Kd_BBL(i,j,K) = Kd_BBL(i,j,K) + 0.5 * delta_Kd
-              Kd_BBL(i,j,K+1) = Kd_BBL(i,j,K+1) + 0.5 * delta_Kd
+        ! TKE_Ray has been initialized to 0 above.
+        if (Rayleigh_drag) TKE_Ray = 0.5*CS%BBL_effic * G%IareaT(i,j) * &
+              (((G%areaCu(I-1,j) * visc%Ray_u(I-1,j,k) * u(I-1,j,k)**2) + &
+                (G%areaCu(I,j)   * visc%Ray_u(I,j,k)   * u(I,j,k)**2)) + &
+               ((G%areaCv(i,J-1) * visc%Ray_v(i,J-1,k) * v(i,J-1,k)**2) + &
+                (G%areaCv(i,J)   * visc%Ray_v(i,J,k)   * v(i,J,k)**2)))
+
+        if (TKE_to_layer + TKE_Ray > 0.0) then
+          if (CS%BBL_mixing_as_max) then
+            if (TKE_to_layer + TKE_Ray > maxTKE(i,k,jj)) &
+                TKE_to_layer = maxTKE(i,k,jj) - TKE_Ray
+
+            TKE(i,jj) = TKE(i,jj) - TKE_to_layer
+
+            if (Kd_lay(i,k,jj) < (TKE_to_layer + TKE_Ray) * TKE_to_Kd(i,k,jj)) then
+              delta_Kd = (TKE_to_layer + TKE_Ray) * TKE_to_Kd(i,k,jj) - Kd_lay(i,k,jj)
+              if ((CS%Kd_max >= 0.0) .and. (delta_Kd > CS%Kd_max)) then
+                delta_Kd = CS%Kd_max
+                Kd_lay(i,k,jj) = Kd_lay(i,k,jj) + delta_Kd
+              else
+                Kd_lay(i,k,jj) =  (TKE_to_layer + TKE_Ray) * TKE_to_Kd(i,k,jj)
+              endif
+              Kd_int(i,K,jj)   = Kd_int(i,K,jj)   + 0.5 * delta_Kd
+              Kd_int(i,K+1,jj) = Kd_int(i,K+1,jj) + 0.5 * delta_Kd
+              if (do_diag_Kd_BBL) then
+                Kd_BBL(i,j,K) = Kd_BBL(i,j,K) + 0.5 * delta_Kd
+                Kd_BBL(i,j,K+1) = Kd_BBL(i,j,K+1) + 0.5 * delta_Kd
+              endif
+            endif
+          else
+            if (Kd_lay(i,k,jj) >= maxTKE(i,k,jj) * TKE_to_Kd(i,k,jj)) then
+              TKE_here = 0.0
+              TKE(i,jj) = TKE(i,jj) + TKE_Ray
+            elseif (Kd_lay(i,k,jj) + (TKE_to_layer + TKE_Ray) * TKE_to_Kd(i,k,jj) > &
+                    maxTKE(i,k,jj) * TKE_to_Kd(i,k,jj)) then
+              TKE_here = ((TKE_to_layer + TKE_Ray) + Kd_lay(i,k,jj) / TKE_to_Kd(i,k,jj)) - maxTKE(i,k,jj)
+              TKE(i,jj) = (TKE(i,jj) - TKE_here) + TKE_Ray
+            else
+              TKE_here = TKE_to_layer + TKE_Ray
+              TKE(i,jj) = TKE(i,jj) - TKE_to_layer
+            endif
+            if (TKE(i,jj) < 0.0) TKE(i,jj) = 0.0 ! This should be unnecessary?
+
+            if (TKE_here > 0.0) then
+              delta_Kd = TKE_here * TKE_to_Kd(i,k,jj)
+              if (CS%Kd_max >= 0.0) delta_Kd = min(delta_Kd, CS%Kd_max)
+              Kd_lay(i,k,jj) = Kd_lay(i,k,jj) + delta_Kd
+              Kd_int(i,K,jj)   = Kd_int(i,K,jj)   + 0.5 * delta_Kd
+              Kd_int(i,K+1,jj) = Kd_int(i,K+1,jj) + 0.5 * delta_Kd
+              if (do_diag_Kd_BBL) then
+                Kd_BBL(i,j,K) = Kd_BBL(i,j,K) + 0.5 * delta_Kd
+                Kd_BBL(i,j,K+1) = Kd_BBL(i,j,K+1) + 0.5 * delta_Kd
+              endif
             endif
           endif
         endif
-      endif
 
-      ! This may be risky - in the case that there are exactly zero
-      ! velocities at 4 neighboring points, but nonzero velocities
-      ! above the iterations would stop too soon. I don't see how this
-      ! could happen in practice. RWH
-      if ((TKE(i)<= 0.0) .and. (TKE_Ray == 0.0)) then
-        do_i(i) = .false. ; i_rem = i_rem - 1
-      endif
+        ! This may be risky - in the case that there are exactly zero
+        ! velocities at 4 neighboring points, but nonzero velocities
+        ! above the iterations would stop too soon. I don't see how this
+        ! could happen in practice. RWH
+        if ((TKE(i,jj)<= 0.0) .and. (TKE_Ray == 0.0)) then
+          do_i(i,jj) = .false. ; i_rem = i_rem - 1
+        endif
 
-    endif ; enddo
-    if (i_rem == 0) exit
-  enddo ! k-loop
+      endif ; enddo
+      if (i_rem == 0) exit
+    enddo ! k-loop
+  enddo
 
 end subroutine add_drag_diffusivity
 
