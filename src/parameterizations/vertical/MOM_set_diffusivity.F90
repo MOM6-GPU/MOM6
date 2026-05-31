@@ -481,14 +481,15 @@ subroutine set_diffusivity(u, v, h, u_h, v_h, tv, fluxes, optics, visc, dt, Kd_i
 
   do jstart=js,je,njblock
     jend = min(jstart+njblock-1, je)
+
+    ! Set up variables related to the stratification.
+    call find_N2(h, tv, T_f, S_f, fluxes, njblock, jstart, jend, G, GV, US, CS, dRho_int, N2_lay, N2_int, N2_bot, rho_bot, h_bot, k_bot)
+
     !$OMP parallel do default(shared) private(dz, &
     !$OMP                                     KT_extra,KS_extra,TKE_to_Kd,maxTKE,dissip,kb,jj) &
     !$OMP                             if(.not. CS%use_CVMix_ddiff)
     do j=jstart,jend
       jj = j - jstart + 1
-
-    ! Set up variables related to the stratification.
-    call find_N2(h, tv, T_f, S_f, fluxes, j, njblock, jstart, G, GV, US, CS, dRho_int, N2_lay, N2_int, N2_bot, rho_bot, h_bot, k_bot)
 
     if (associated(dd%N2_3d)) then
       do K=1,nz+1 ; do i=is,ie ; dd%N2_3d(i,j,K) = N2_int(i,K,jj) ; enddo ; enddo
@@ -1103,7 +1104,7 @@ subroutine find_TKE_to_Kd(h, tv, dRho_int, N2_lay, j, dt, G, GV, US, CS, &
 end subroutine find_TKE_to_Kd
 
 !> Calculate Brunt-Vaisala frequency, N^2.
-subroutine find_N2(h, tv, T_f, S_f, fluxes, j, nj, jstart, G, GV, US, CS, dRho_int, &
+subroutine find_N2(h, tv, T_f, S_f, fluxes, nj, jstart, jend, G, GV, US, CS, dRho_int, &
                    N2_lay, N2_int, N2_bot, Rho_bot, h_bot, k_bot)
   type(ocean_grid_type),    intent(in)  :: G    !< The ocean's grid structure
   type(verticalGrid_type),  intent(in)  :: GV   !< The ocean's vertical grid structure
@@ -1119,9 +1120,9 @@ subroutine find_N2(h, tv, T_f, S_f, fluxes, j, nj, jstart, G, GV, US, CS, dRho_i
                             intent(in)  :: S_f  !< Layer salinities with values in massless
                                                 !! layers filled vertically by diffusion [S ~> ppt].
   type(forcing),            intent(in)  :: fluxes !< A structure of thermodynamic surface fluxes
-  integer,                  intent(in)  :: j    !< j-index of row to work on
   integer,                  intent(in)  :: nj   !< Number of j-rows in this block
   integer,                  intent(in)  :: jstart !< Starting j-index of this block
+  integer,                  intent(in)  :: jend !< Ending j-index of this block
   type(set_diffusivity_CS), pointer     :: CS   !< Diffusivity control structure
   real, dimension(SZI_(G),SZK_(GV)+1,nj), &
                             intent(out) :: dRho_int !< Change in locally referenced potential density
@@ -1132,8 +1133,8 @@ subroutine find_N2(h, tv, T_f, S_f, fluxes, j, nj, jstart, G, GV, US, CS, dRho_i
                             intent(out) :: N2_lay !< The squared buoyancy frequency of the layers [T-2 ~> s-2].
   real, dimension(SZI_(G),nj), intent(out) :: N2_bot !< The near-bottom squared buoyancy frequency [T-2 ~> s-2].
   real, dimension(SZI_(G),nj), intent(out) :: Rho_bot !< Near-bottom density [R ~> kg m-3].
-  real, dimension(SZI_(G),nj), optional, intent(out) :: h_bot !< Bottom boundary layer thickness [H ~> m or kg m-2].
-  integer, dimension(SZI_(G),nj), optional, intent(out) :: k_bot !< Bottom boundary layer top layer index.
+  real, dimension(SZI_(G),nj), intent(out) :: h_bot !< Bottom boundary layer thickness [H ~> m or kg m-2].
+  integer, dimension(SZI_(G),nj), intent(out) :: k_bot !< Bottom boundary layer top layer index.
 
   ! Local variables
   real, dimension(SZI_(G),SZK_(GV)+1,nj) :: &
@@ -1150,9 +1151,7 @@ subroutine find_N2(h, tv, T_f, S_f, fluxes, j, nj, jstart, G, GV, US, CS, dRho_i
     h_amp,     &  ! The topographic roughness amplitude [Z ~> m].
     dz_BBL_avg, & ! The distance over which to average to find the near-bottom density [Z ~> m]
     hb,        &  ! The thickness of the bottom layer [H ~> m or kg m-2]
-    z_from_bot, & ! The height above the bottom [Z ~> m]
-    h_bot_tmp     ! temporary h_bot for passing to find_rho_bottom [H ~> m or kg m-2]
-  integer, dimension(SZI_(G),nj) :: k_bot_tmp ! temporary k_bot for passing to find_rho_bottom
+    z_from_bot    ! The height above the bottom [Z ~> m]
 
   real :: dz_int    ! Vertical distance associated with an interface [Z ~> m]
   real :: G_Rho0    ! Gravitational acceleration, perhaps divided by Boussinesq reference density,
@@ -1161,129 +1160,169 @@ subroutine find_N2(h, tv, T_f, S_f, fluxes, j, nj, jstart, G, GV, US, CS, dRho_i
 
   logical :: do_i(SZI_(G),nj), do_any
   integer, dimension(2) :: EOSdom ! The i-computational domain for the equation of state
-  integer :: i, k, is, ie, nz, jj
+  integer :: i, j, k, is, ie, nz, jj
 
   is = G%isc ; ie = G%iec ; nz = GV%ke
-  jj = j - jstart + 1
   G_Rho0    = GV%g_Earth_Z_T2 / GV%H_to_RZ
   H_neglect = GV%H_subroundoff
 
   ! Find the (limited) density jump across each interface.
-  do i=is,ie
-    dRho_int(i,1,jj) = 0.0 ; dRho_int(i,nz+1,jj) = 0.0
-    dRho_int_unfilt(i,1,jj) = 0.0 ; dRho_int_unfilt(i,nz+1,jj) = 0.0
+  do j=jstart,jend ; jj = j - jstart + 1
+    do i=is,ie
+      dRho_int(i,1,jj) = 0.0 ; dRho_int(i,nz+1,jj) = 0.0
+      dRho_int_unfilt(i,1,jj) = 0.0 ; dRho_int_unfilt(i,nz+1,jj) = 0.0
+    enddo
   enddo
   if (associated(tv%eqn_of_state)) then
     if (associated(fluxes%p_surf)) then
-      do i=is,ie ; pres(i,1,jj) = fluxes%p_surf(i,j) ; enddo
+      do j=jstart,jend ; jj = j - jstart + 1
+        do i=is,ie ; pres(i,1,jj) = fluxes%p_surf(i,j) ; enddo
+      enddo
     else
-      do i=is,ie ; pres(i,1,jj) = 0.0 ; enddo
+      do j=jstart,jend ; jj = j - jstart + 1
+        do i=is,ie ; pres(i,1,jj) = 0.0 ; enddo
+      enddo
     endif
     EOSdom(:) = EOS_domain(G%HI)
     do K=2,nz
-      do i=is,ie
-        pres(i,K,jj) = pres(i,K-1,jj) + (GV%g_Earth*GV%H_to_RZ)*h(i,j,k-1)
-        Temp_Int(i,jj) = 0.5 * (T_f(i,j,k) + T_f(i,j,k-1))
-        Salin_Int(i,jj) = 0.5 * (S_f(i,j,k) + S_f(i,j,k-1))
-      enddo
-      call calculate_density_derivs(Temp_int(:,jj), Salin_int(:,jj), pres(:,K,jj), dRho_dT(:,K,jj), dRho_dS(:,K,jj), &
-                                    tv%eqn_of_state, EOSdom)
-      do i=is,ie
-        dRho_int(i,K,jj) = max(dRho_dT(i,K,jj)*(T_f(i,j,k) - T_f(i,j,k-1)) + &
-                               dRho_dS(i,K,jj)*(S_f(i,j,k) - S_f(i,j,k-1)), 0.0)
-        dRho_int_unfilt(i,K,jj) = max(dRho_dT(i,K,jj)*(tv%T(i,j,k) - tv%T(i,j,k-1)) + &
-                                      dRho_dS(i,K,jj)*(tv%S(i,j,k) - tv%S(i,j,k-1)), 0.0)
+      do j=jstart,jend ; jj = j - jstart + 1
+        do i=is,ie
+          pres(i,K,jj) = pres(i,K-1,jj) + (GV%g_Earth*GV%H_to_RZ)*h(i,j,k-1)
+          Temp_Int(i,jj) = 0.5 * (T_f(i,j,k) + T_f(i,j,k-1))
+          Salin_Int(i,jj) = 0.5 * (S_f(i,j,k) + S_f(i,j,k-1))
+        enddo
+        call calculate_density_derivs(Temp_int(:,jj), Salin_int(:,jj), pres(:,K,jj), dRho_dT(:,K,jj), dRho_dS(:,K,jj), &
+                                      tv%eqn_of_state, EOSdom)
+        do i=is,ie
+          dRho_int(i,K,jj) = max(dRho_dT(i,K,jj)*(T_f(i,j,k) - T_f(i,j,k-1)) + &
+                                 dRho_dS(i,K,jj)*(S_f(i,j,k) - S_f(i,j,k-1)), 0.0)
+          dRho_int_unfilt(i,K,jj) = max(dRho_dT(i,K,jj)*(tv%T(i,j,k) - tv%T(i,j,k-1)) + &
+                                        dRho_dS(i,K,jj)*(tv%S(i,j,k) - tv%S(i,j,k-1)), 0.0)
+        enddo
       enddo
     enddo
   else
-    do K=2,nz ; do i=is,ie
-      dRho_int(i,K,jj) = GV%Rlay(k) - GV%Rlay(k-1)
-    enddo ; enddo
+    do j=jstart,jend ; jj = j - jstart + 1
+      do K=2,nz
+        do i=is,ie
+          dRho_int(i,K,jj) = GV%Rlay(k) - GV%Rlay(k-1)
+        enddo
+      enddo
+    enddo
   endif
 
   ! Find the vertical distances across layers.
-  call thickness_to_dz(h, tv, dz(:,:,jj), j, G, GV)
+  do j=jstart,jend ; jj = j - jstart + 1
+    call thickness_to_dz(h, tv, dz(:,:,jj), j, G, GV)
+  enddo
 
   ! Set the buoyancy frequencies.
-  do k=1,nz ; do i=is,ie
-    N2_lay(i,k,jj) = G_Rho0 * 0.5*(dRho_int(i,K,jj) + dRho_int(i,K+1,jj)) / &
-                     (h(i,j,k) + H_neglect)
-  enddo ; enddo
-  do i=is,ie ; N2_int(i,1,jj) = 0.0 ; N2_int(i,nz+1,jj) = 0.0 ; enddo
-  do K=2,nz ; do i=is,ie
-    N2_int(i,K,jj) = G_Rho0 * dRho_int(i,K,jj) / &
-                     (0.5*(h(i,j,k-1) + h(i,j,k) + H_neglect))
-  enddo ; enddo
+  do k=1,nz
+    do j=jstart,jend ; jj = j - jstart + 1
+      do i=is,ie
+        N2_lay(i,k,jj) = G_Rho0 * 0.5*(dRho_int(i,K,jj) + dRho_int(i,K+1,jj)) / &
+                         (h(i,j,k) + H_neglect)
+      enddo
+    enddo
+  enddo
+  do j=jstart,jend ; jj = j - jstart + 1
+    do i=is,ie ; N2_int(i,1,jj) = 0.0 ; N2_int(i,nz+1,jj) = 0.0 ; enddo
+  enddo
+  do K=2,nz
+    do j=jstart,jend ; jj = j - jstart + 1
+      do i=is,ie
+        N2_int(i,K,jj) = G_Rho0 * dRho_int(i,K,jj) / &
+                         (0.5*(h(i,j,k-1) + h(i,j,k) + H_neglect))
+      enddo
+    enddo
+  enddo
 
   ! Find the bottom boundary layer stratification, and use this in the deepest layers.
-  do i=is,ie
-    hb(i,jj) = 0.0 ; dRho_bot(i,jj) = 0.0 ; h_amp(i,jj) = 0.0
-    z_from_bot(i,jj) = 0.5*dz(i,nz,jj)
-    do_i(i,jj) = (G%mask2dT(i,j) > 0.0)
+  do j=jstart,jend ; jj = j - jstart + 1
+    do i=is,ie
+      hb(i,jj) = 0.0 ; dRho_bot(i,jj) = 0.0 ; h_amp(i,jj) = 0.0
+      z_from_bot(i,jj) = 0.5*dz(i,nz,jj)
+      do_i(i,jj) = (G%mask2dT(i,j) > 0.0)
+    enddo
   enddo
-  if (CS%use_tidal_mixing) call tidal_mixing_h_amp(h_amp(:,jj), G, j, CS%tidal_mixing)
+  if (CS%use_tidal_mixing) then
+    do j=jstart,jend ; jj = j - jstart + 1
+      call tidal_mixing_h_amp(h_amp(:,jj), G, j, CS%tidal_mixing)
+    enddo
+  endif
 
   do k=nz,2,-1
     do_any = .false.
-    do i=is,ie ; if (do_i(i,jj)) then
-      dz_int = 0.5*(dz(i,k,jj) + dz(i,k-1,jj))
-      z_from_bot(i,jj) = z_from_bot(i,jj) + dz_int ! middle of the layer above
+    do j=jstart,jend ; jj = j - jstart + 1
+      do i=is,ie ; if (do_i(i,jj)) then
+        dz_int = 0.5*(dz(i,k,jj) + dz(i,k-1,jj))
+        z_from_bot(i,jj) = z_from_bot(i,jj) + dz_int ! middle of the layer above
 
-      hb(i,jj) = hb(i,jj) + 0.5*(h(i,j,k) + h(i,j,k-1))
-      drho_bot(i,jj) = drho_bot(i,jj) + dRho_int(i,K,jj)
+        hb(i,jj) = hb(i,jj) + 0.5*(h(i,j,k) + h(i,j,k-1))
+        drho_bot(i,jj) = drho_bot(i,jj) + dRho_int(i,K,jj)
 
-      if (z_from_bot(i,jj) > h_amp(i,jj)) then
-        if (k>2) then
-          ! Always include at least one full layer.
-          hb(i,jj) = hb(i,jj) + 0.5*(h(i,j,k-1) + h(i,j,k-2))
-          drho_bot(i,jj) = drho_bot(i,jj) + dRho_int(i,K-1,jj)
+        if (z_from_bot(i,jj) > h_amp(i,jj)) then
+          if (k>2) then
+            ! Always include at least one full layer.
+            hb(i,jj) = hb(i,jj) + 0.5*(h(i,j,k-1) + h(i,j,k-2))
+            drho_bot(i,jj) = drho_bot(i,jj) + dRho_int(i,K-1,jj)
+          endif
+          do_i(i,jj) = .false.
+        else
+          do_any = .true.
         endif
-        do_i(i,jj) = .false.
-      else
-        do_any = .true.
-      endif
-    endif ; enddo
+      endif ; enddo
+    enddo
     if (.not.do_any) exit
   enddo
 
-  do i=is,ie
-    if (hb(i,jj) > 0.0) then
-      N2_bot(i,jj) = (G_Rho0 * drho_bot(i,jj)) / hb(i,jj)
-    else ;  N2_bot(i,jj) = 0.0 ; endif
-    z_from_bot(i,jj) = 0.5*dz(i,nz,jj)
-    do_i(i,jj) = (G%mask2dT(i,j) > 0.0)
+  do j=jstart,jend ; jj = j - jstart + 1
+    do i=is,ie
+      if (hb(i,jj) > 0.0) then
+        N2_bot(i,jj) = (G_Rho0 * drho_bot(i,jj)) / hb(i,jj)
+      else ;  N2_bot(i,jj) = 0.0 ; endif
+      z_from_bot(i,jj) = 0.5*dz(i,nz,jj)
+      do_i(i,jj) = (G%mask2dT(i,j) > 0.0)
+    enddo
   enddo
 
   do k=nz,2,-1
     do_any = .false.
-    do i=is,ie ; if (do_i(i,jj)) then
-      dz_int = 0.5*(dz(i,k,jj) + dz(i,k-1,jj))
-      z_from_bot(i,jj) = z_from_bot(i,jj) + dz_int ! middle of the layer above
+    do j=jstart,jend ; jj = j - jstart + 1
+      do i=is,ie ; if (do_i(i,jj)) then
+        dz_int = 0.5*(dz(i,k,jj) + dz(i,k-1,jj))
+        z_from_bot(i,jj) = z_from_bot(i,jj) + dz_int ! middle of the layer above
 
-      N2_int(i,K,jj) = N2_bot(i,jj)
-      if (k>2) N2_lay(i,k-1,jj) = N2_bot(i,jj)
+        N2_int(i,K,jj) = N2_bot(i,jj)
+        if (k>2) N2_lay(i,k-1,jj) = N2_bot(i,jj)
 
-      if (z_from_bot(i,jj) > h_amp(i,jj)) then
-        if (k>2) N2_int(i,K-1,jj) = N2_bot(i,jj)
-        do_i(i,jj) = .false.
-      else
-        do_any = .true.
-      endif
-    endif ; enddo
+        if (z_from_bot(i,jj) > h_amp(i,jj)) then
+          if (k>2) N2_int(i,K-1,jj) = N2_bot(i,jj)
+          do_i(i,jj) = .false.
+        else
+          do_any = .true.
+        endif
+      endif ; enddo
+    enddo
     if (.not.do_any) exit
   enddo
 
   if (associated(tv%eqn_of_state)) then
-    do K=1,nz+1 ; do i=is,ie
-      dRho_int(i,K,jj) = dRho_int_unfilt(i,K,jj)
-    enddo ; enddo
+    do K=1,nz+1
+      do j=jstart,jend ; jj = j - jstart + 1
+        do i=is,ie
+          dRho_int(i,K,jj) = dRho_int_unfilt(i,K,jj)
+        enddo
+      enddo
+    enddo
   endif
 
   ! Average over the larger of the envelope of the topography or a minimal distance.
-  do i=is,ie ; dz_BBL_avg(i,jj) = max(h_amp(i,jj), CS%dz_BBL_avg_min) ; enddo
-  call find_rho_bottom(G, GV, US, tv, h, dz(:,:,jj), pres(:,:,jj), dz_BBL_avg(:,jj), j, Rho_bot(:,jj), h_bot_tmp(:,jj), k_bot_tmp(:,jj))
-  if (present(h_bot)) h_bot(:,jj) = h_bot_tmp(:,jj)
-  if (present(k_bot)) k_bot(:,jj) = k_bot_tmp(:,jj)
+  do j=jstart,jend ; jj = j - jstart + 1
+    do i=is,ie ; dz_BBL_avg(i,jj) = max(h_amp(i,jj), CS%dz_BBL_avg_min) ; enddo
+  enddo
+
+  call find_rho_bottom(G, GV, US, tv, h, dz, pres, dz_BBL_avg, jstart, jend, nj, Rho_bot, h_bot, k_bot)
 
 end subroutine find_N2
 
