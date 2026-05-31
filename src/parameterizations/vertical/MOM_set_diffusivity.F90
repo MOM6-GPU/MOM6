@@ -621,84 +621,90 @@ subroutine set_diffusivity(u, v, h, u_h, v_h, tv, fluxes, optics, visc, dt, Kd_i
       enddo ; enddo ; enddo
     endif
 
+    ! Add the ML_Rad diffusivity.
+    if (CS%ML_radiation) then
+      do j=jstart,jend ; jj = j - jstart + 1
+        call add_MLrad_diffusivity(dz(:,:,jj), fluxes, tv, j, Kd_int_2d(:,:,jj), G, GV, US, CS, TKE_to_Kd(:,:,jj), Kd_lay_2d(:,:,jj))
+      enddo
+    endif
+
+    ! Add the Nikurashin and / or tidal bottom-driven mixing
+    if (CS%use_tidal_mixing) then
+      do j=jstart,jend ; jj = j - jstart + 1
+        call calculate_tidal_mixing(dz(:,:,jj), j, N2_bot(:,jj), rho_bot(:,jj), N2_lay(:,:,jj), N2_int(:,:,jj), TKE_to_Kd(:,:,jj), &
+                                    maxTKE(:,:,jj), G, GV, US, CS%tidal_mixing, &
+                                    CS%Kd_max, visc%Kv_slow, Kd_lay_2d(:,:,jj), Kd_int_2d(:,:,jj), VBF)
+      enddo
+    endif
+
+    ! Add diffusivity from internal tides ray tracing
+    if (CS%use_int_tides) then
+      do j=jstart,jend ; jj = j - jstart + 1
+        call get_lowmode_diffusivity(G, GV, h, tv, US, h_bot(:,jj), k_bot(:,jj), j, N2_lay(:,:,jj), N2_int(:,:,jj), TKE_to_Kd(:,:,jj), CS%Kd_max, &
+                                     CS%int_tide_CSp, Kd_leak_2d, Kd_quad_2d, Kd_itidal_2d, Kd_Froude_2d, Kd_slope_2d, &
+                                     Kd_lay_2d(:,:,jj), Kd_int_2d(:,:,jj), prof_leak_2d, prof_quad_2d, prof_itidal_2d, prof_froude_2d, &
+                                     prof_slope_2d)
+
+        if (CS%id_kbbl > 0) then ; do i=is,ie
+          dd%kbbl(i,j) = k_bot(i,jj)
+        enddo ; endif
+        if (CS%id_bbl_thick > 0) then ; do i=is,ie
+          dd%bbl_thick(i,j) = h_bot(i,jj)
+        enddo ; endif
+        if (CS%id_Kd_leak > 0) then ; do K=1,nz+1 ; do i=is,ie
+          dd%Kd_leak(i,j,K) = Kd_leak_2d(i,K)
+        enddo ; enddo ; endif
+        if (CS%id_Kd_quad > 0) then ; do K=1,nz+1 ; do i=is,ie
+          dd%Kd_quad(i,j,K) = Kd_quad_2d(i,K)
+        enddo ; enddo ; endif
+        if (CS%id_Kd_itidal > 0) then ; do K=1,nz+1 ; do i=is,ie
+          dd%Kd_itidal(i,j,K) = Kd_itidal_2d(i,K)
+        enddo ; enddo ; endif
+        if (CS%id_Kd_Froude > 0) then ; do K=1,nz+1 ; do i=is,ie
+          dd%Kd_Froude(i,j,K) = Kd_Froude_2d(i,K)
+        enddo ; enddo ; endif
+        if (CS%id_Kd_slope > 0) then ; do K=1,nz+1 ; do i=is,ie
+          dd%Kd_slope(i,j,K) = Kd_slope_2d(i,K)
+        enddo ; enddo ; endif
+        if (associated (VBF%Kd_leak)) then ; do K=1,nz+1 ; do i=is,ie
+          VBF%Kd_leak(i,j,K) = min(Kd_leak_2d(i,K), CS%Kd_max)
+        enddo ; enddo ; endif
+        if (associated (VBF%Kd_quad)) then ; do K=1,nz+1 ; do i=is,ie
+          VBF%Kd_quad(i,j,K) = min(Kd_quad_2d(i,K), CS%Kd_max)
+        enddo ; enddo ; endif
+        if (associated (VBF%Kd_itidal)) then ; do K=1,nz+1 ; do i=is,ie
+          VBF%Kd_itidal(i,j,K) = min(Kd_itidal_2d(i,K), CS%Kd_max)
+        enddo ; enddo ; endif
+        if (associated (VBF%Kd_Froude)) then ; do K=1,nz+1 ; do i=is,ie
+          VBF%Kd_Froude(i,j,K) = min(Kd_Froude_2d(i,K), CS%Kd_max)
+        enddo ; enddo ; endif
+        if (associated (VBF%Kd_slope)) then ; do K=1,nz+1 ; do i=is,ie
+          VBF%Kd_slope(i,j,K) = min(Kd_slope_2d(i,K), CS%Kd_max)
+        enddo ; enddo ; endif
+
+        if (CS%id_prof_leak > 0) then ; do k=1,nz ; do i=is,ie
+          dd%prof_leak(i,j,k) = prof_leak_2d(i,k)
+        enddo ; enddo ; endif
+        if (CS%id_prof_quad > 0) then ; do k=1,nz ; do i=is,ie
+          dd%prof_quad(i,j,k) = prof_quad_2d(i,k)
+        enddo ; enddo ; endif
+        if (CS%id_prof_itidal > 0) then ; do k=1,nz ; do i=is,ie
+          dd%prof_itidal(i,j,k) = prof_itidal_2d(i,k)
+        enddo ; enddo ; endif
+        if (CS%id_prof_Froude > 0) then ; do k=1,nz ; do i=is,ie
+          dd%prof_Froude(i,j,k) = prof_Froude_2d(i,k)
+        enddo ; enddo ; endif
+        if (CS%id_prof_slope > 0) then ; do k=1,nz ; do i=is,ie
+          dd%prof_slope(i,j,k) = prof_slope_2d(i,k)
+        enddo ; enddo ; endif
+      enddo
+    endif
+
     !$OMP parallel do default(shared) private( &
     !$OMP                                     KT_extra,KS_extra,dissip,jj) &
     !$OMP                             if(.not. CS%use_CVMix_ddiff)
     do j=jstart,jend
       jj = j - jstart + 1
-
-    ! Add the ML_Rad diffusivity.
-    if (CS%ML_radiation) then
-      call add_MLrad_diffusivity(dz(:,:,jj), fluxes, tv, j, Kd_int_2d(:,:,jj), G, GV, US, CS, TKE_to_Kd(:,:,jj), Kd_lay_2d(:,:,jj))
-    endif
-
-    ! Add the Nikurashin and / or tidal bottom-driven mixing
-    if (CS%use_tidal_mixing) &
-      call calculate_tidal_mixing(dz(:,:,jj), j, N2_bot(:,jj), rho_bot(:,jj), N2_lay(:,:,jj), N2_int(:,:,jj), TKE_to_Kd(:,:,jj), &
-                                  maxTKE(:,:,jj), G, GV, US, CS%tidal_mixing, &
-                                  CS%Kd_max, visc%Kv_slow, Kd_lay_2d(:,:,jj), Kd_int_2d(:,:,jj), VBF)
-
-    ! Add diffusivity from internal tides ray tracing
-    if (CS%use_int_tides) then
-
-      call get_lowmode_diffusivity(G, GV, h, tv, US, h_bot(:,jj), k_bot(:,jj), j, N2_lay(:,:,jj), N2_int(:,:,jj), TKE_to_Kd(:,:,jj), CS%Kd_max, &
-                                   CS%int_tide_CSp, Kd_leak_2d, Kd_quad_2d, Kd_itidal_2d, Kd_Froude_2d, Kd_slope_2d, &
-                                   Kd_lay_2d(:,:,jj), Kd_int_2d(:,:,jj), prof_leak_2d, prof_quad_2d, prof_itidal_2d, prof_froude_2d, &
-                                   prof_slope_2d)
-
-      if (CS%id_kbbl > 0) then ; do i=is,ie
-        dd%kbbl(i,j) = k_bot(i,jj)
-      enddo ; endif
-      if (CS%id_bbl_thick > 0) then ; do i=is,ie
-        dd%bbl_thick(i,j) = h_bot(i,jj)
-      enddo ; endif
-      if (CS%id_Kd_leak > 0) then ; do K=1,nz+1 ; do i=is,ie
-        dd%Kd_leak(i,j,K) = Kd_leak_2d(i,K)
-      enddo ; enddo ; endif
-      if (CS%id_Kd_quad > 0) then ; do K=1,nz+1 ; do i=is,ie
-        dd%Kd_quad(i,j,K) = Kd_quad_2d(i,K)
-      enddo ; enddo ; endif
-      if (CS%id_Kd_itidal > 0) then ; do K=1,nz+1 ; do i=is,ie
-        dd%Kd_itidal(i,j,K) = Kd_itidal_2d(i,K)
-      enddo ; enddo ; endif
-      if (CS%id_Kd_Froude > 0) then ; do K=1,nz+1 ; do i=is,ie
-        dd%Kd_Froude(i,j,K) = Kd_Froude_2d(i,K)
-      enddo ; enddo ; endif
-      if (CS%id_Kd_slope > 0) then ; do K=1,nz+1 ; do i=is,ie
-        dd%Kd_slope(i,j,K) = Kd_slope_2d(i,K)
-      enddo ; enddo ; endif
-      if (associated (VBF%Kd_leak)) then ; do K=1,nz+1 ; do i=is,ie
-        VBF%Kd_leak(i,j,K) = min(Kd_leak_2d(i,K), CS%Kd_max)
-      enddo ; enddo ; endif
-      if (associated (VBF%Kd_quad)) then ; do K=1,nz+1 ; do i=is,ie
-        VBF%Kd_quad(i,j,K) = min(Kd_quad_2d(i,K), CS%Kd_max)
-      enddo ; enddo ; endif
-      if (associated (VBF%Kd_itidal)) then ; do K=1,nz+1 ; do i=is,ie
-        VBF%Kd_itidal(i,j,K) = min(Kd_itidal_2d(i,K), CS%Kd_max)
-      enddo ; enddo ; endif
-      if (associated (VBF%Kd_Froude)) then ; do K=1,nz+1 ; do i=is,ie
-        VBF%Kd_Froude(i,j,K) = min(Kd_Froude_2d(i,K), CS%Kd_max)
-      enddo ; enddo ; endif
-      if (associated (VBF%Kd_slope)) then ; do K=1,nz+1 ; do i=is,ie
-        VBF%Kd_slope(i,j,K) = min(Kd_slope_2d(i,K), CS%Kd_max)
-      enddo ; enddo ; endif
-
-      if (CS%id_prof_leak > 0) then ; do k=1,nz ; do i=is,ie
-        dd%prof_leak(i,j,k) = prof_leak_2d(i,k)
-      enddo ; enddo ; endif
-      if (CS%id_prof_quad > 0) then ; do k=1,nz ; do i=is,ie
-        dd%prof_quad(i,j,k) = prof_quad_2d(i,k)
-      enddo ; enddo ; endif
-      if (CS%id_prof_itidal > 0) then ; do k=1,nz ; do i=is,ie
-        dd%prof_itidal(i,j,k) = prof_itidal_2d(i,k)
-      enddo ; enddo ; endif
-      if (CS%id_prof_Froude > 0) then ; do k=1,nz ; do i=is,ie
-        dd%prof_Froude(i,j,k) = prof_Froude_2d(i,k)
-      enddo ; enddo ; endif
-      if (CS%id_prof_slope > 0) then ; do k=1,nz ; do i=is,ie
-        dd%prof_slope(i,j,k) = prof_slope_2d(i,k)
-      enddo ; enddo ; endif
-    endif
 
     ! This adds the diffusion sustained by the energy extracted from the flow by the bottom drag.
     if (CS%bottomdraglaw .and. (CS%BBL_effic > 0.0)) then
