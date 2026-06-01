@@ -2289,9 +2289,9 @@ subroutine set_density_ratios(h, tv, kb, G, GV, US, CS, jstart, jend, nj, ds_dsp
   ! Local variables
   real :: g_R0                     ! g_R0 is a rescaled version of g/Rho [L2 Z-1 R-1 T-2 ~> m4 kg-1 s-2]
   real :: eps, tmp                 ! nondimensional temporary variables [nondim]
-  real :: a(SZK_(GV),nj), a_0(SZK_(GV),nj) ! nondimensional temporary variables [nondim]
+  real :: a(SZK_(GV)), a_0(SZK_(GV)) ! nondimensional temporary variables [nondim]
   real :: p_ref(SZI_(G),nj)        ! an array of tv%P_Ref pressures [R L2 T-2 ~> Pa]
-  real :: Rcv(SZI_(G),SZK_(GV),nj) ! coordinate density in the mixed and buffer layers [R ~> kg m-3]
+  real :: Rcv(SZI_(G),nj,SZK_(GV)) ! coordinate density in the mixed and buffer layers [R ~> kg m-3]
   real :: I_Drho                   ! The inverse of the coordinate density difference between
                                    ! layers [R-1 ~> m3 kg-1]
 
@@ -2319,8 +2319,8 @@ subroutine set_density_ratios(h, tv, kb, G, GV, US, CS, jstart, jend, nj, ds_dsp
     do j=jstart,jend ; jj = j - jstart + 1 ; do i=is,ie
       p_ref(i,jj) = tv%P_Ref
     enddo ; enddo
-    do j=jstart,jend ; jj = j - jstart + 1 ; do k=1,kmb
-      call calculate_density(tv%T(:,j,k), tv%S(:,j,k), p_ref(:,jj), Rcv(:,k,jj), tv%eqn_of_state, EOSdom)
+    do k=1,kmb ; do j=jstart,jend ; jj = j - jstart + 1
+      call calculate_density(tv%T(:,j,k), tv%S(:,j,k), p_ref(:,jj), Rcv(:,jj,k), tv%eqn_of_state, EOSdom)
     enddo ; enddo
     do j=jstart,jend ; jj = j - jstart + 1 ; do i=is,ie
       if (kb(i,jj) <= nz-1) then
@@ -2335,41 +2335,41 @@ subroutine set_density_ratios(h, tv, kb, G, GV, US, CS, jstart, jend, nj, ds_dsp
         endif
         ! The indexing convention for a is appropriate for the interfaces.
         do k3=1,kmb
-          a(k3+1,jj) = (GV%Rlay(k) - Rcv(i,k3,jj)) * I_Drho
+          a(k3+1) = (GV%Rlay(k) - Rcv(i,k3,jj)) * I_Drho
         enddo
-        if ((present(rho_0)) .and. (a(kmb+1,jj) < 2.0*eps*ds_dsp1(i,k,jj))) then
+        if ((present(rho_0)) .and. (a(kmb+1) < 2.0*eps*ds_dsp1(i,k,jj))) then
 !   If the buffer layer nearly matches the density of the layer below in the
 ! coordinate variable (sigma-2), use the sigma-0-based density ratio if it is
 ! greater (and stable).
           if ((rho_0(i,k,jj) > rho_0(i,kmb,jj)) .and. &
               (rho_0(i,k+1,jj) > rho_0(i,k,jj))) then
             I_Drho = 1.0 / (rho_0(i,k+1,jj)-rho_0(i,k,jj))
-            a_0(kmb+1,jj) = min((rho_0(i,k,jj)-rho_0(i,kmb,jj)) * I_Drho, ds_dsp1(i,k,jj))
-            if (a_0(kmb+1,jj) > a(kmb+1,jj)) then
+            a_0(kmb+1) = min((rho_0(i,k,jj)-rho_0(i,kmb,jj)) * I_Drho, ds_dsp1(i,k,jj))
+            if (a_0(kmb+1) > a(kmb+1)) then
               do k3=2,kmb
-                a_0(k3,jj) = a_0(kmb+1,jj) + (rho_0(i,kmb,jj)-rho_0(i,k3-1,jj)) * I_Drho
+                a_0(k3) = a_0(kmb+1) + (rho_0(i,kmb,jj)-rho_0(i,k3-1,jj)) * I_Drho
               enddo
-              if (a(kmb+1,jj) <= eps*ds_dsp1(i,k,jj)) then
-                do k3=2,kmb+1 ; a(k3,jj) = a_0(k3,jj) ; enddo
+              if (a(kmb+1) <= eps*ds_dsp1(i,k,jj)) then
+                do k3=2,kmb+1 ; a(k3) = a_0(k3) ; enddo
               else
 ! Alternative...  tmp = 0.5*(1.0 - cos(PI*(a(K2+1)/(eps*ds_dsp1(i,k,jj)) - 1.0)) )
-                tmp = a(kmb+1,jj)/(eps*ds_dsp1(i,k,jj)) - 1.0
-                do k3=2,kmb+1 ; a(k3,jj) = tmp*a(k3,jj) + (1.0-tmp)*a_0(k3,jj) ; enddo
+                tmp = a(kmb+1)/(eps*ds_dsp1(i,k,jj)) - 1.0
+                do k3=2,kmb+1 ; a(k3) = tmp*a(k3) + (1.0-tmp)*a_0(k3) ; enddo
               endif
             endif
           endif
         endif
 
-        ds_dsp1(i,k,jj) = MAX(a(kmb+1,jj),1e-5)
+        ds_dsp1(i,k,jj) = MAX(a(kmb+1),1e-5)
 
         do k3=2,kmb
-!           ds_dsp1(i,k3,jj) = MAX(a(k3,jj),1e-5)
+!           ds_dsp1(i,k3,jj) = MAX(a(k3),1e-5)
           ! Deliberately treat convective instabilities of the upper mixed
           ! and buffer layers with respect to the deepest buffer layer as
           ! though they don't exist.  They will be eliminated by the upcoming
           ! call to the mixedlayer code anyway.
           ! The indexing convention is appropriate for the interfaces.
-          ds_dsp1(i,k3,jj) = MAX(a(k3,jj),ds_dsp1(i,k,jj))
+          ds_dsp1(i,k3,jj) = MAX(a(k3),ds_dsp1(i,k,jj))
         enddo
       endif ! (kb(i,jj) <= nz-1)
     enddo ; enddo ! i-loop / j-loop
