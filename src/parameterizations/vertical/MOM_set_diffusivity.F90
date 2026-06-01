@@ -1195,7 +1195,7 @@ subroutine find_N2(h, tv, T_f, S_f, fluxes, nj, jstart, jend, G, GV, US, CS, dRh
   real, dimension(SZI_(G),SZK_(GV),nj), intent(in) :: dz !< Height change across layers [Z ~> m]
 
   ! Local variables
-  real, dimension(SZI_(G),SZK_(GV)+1,nj) :: &
+  real, dimension(SZI_(G),nj,SZK_(GV)+1) :: &
     pres,            & ! pressure at each interface [R L2 T-2 ~> Pa]
     dRho_int_unfilt, & ! unfiltered density differences across interfaces [R ~> kg m-3]
     dRho_dT,         & ! partial derivative of density wrt temp [R C-1 ~> kg m-3 degC-1]
@@ -1226,34 +1226,34 @@ subroutine find_N2(h, tv, T_f, S_f, fluxes, nj, jstart, jend, G, GV, US, CS, dRh
   do j=jstart,jend ; jj = j - jstart + 1
     do i=is,ie
       dRho_int(i,1,jj) = 0.0 ; dRho_int(i,nz+1,jj) = 0.0
-      dRho_int_unfilt(i,1,jj) = 0.0 ; dRho_int_unfilt(i,nz+1,jj) = 0.0
+      dRho_int_unfilt(i,jj,1) = 0.0 ; dRho_int_unfilt(i,jj,nz+1) = 0.0
     enddo
   enddo
   if (associated(tv%eqn_of_state)) then
     if (associated(fluxes%p_surf)) then
       do j=jstart,jend ; jj = j - jstart + 1
-        do i=is,ie ; pres(i,1,jj) = fluxes%p_surf(i,j) ; enddo
+        do i=is,ie ; pres(i,jj,1) = fluxes%p_surf(i,j) ; enddo
       enddo
     else
       do j=jstart,jend ; jj = j - jstart + 1
-        do i=is,ie ; pres(i,1,jj) = 0.0 ; enddo
+        do i=is,ie ; pres(i,jj,1) = 0.0 ; enddo
       enddo
     endif
     EOSdom(:) = EOS_domain(G%HI)
     do K=2,nz
       do j=jstart,jend ; jj = j - jstart + 1
         do i=is,ie
-          pres(i,K,jj) = pres(i,K-1,jj) + (GV%g_Earth*GV%H_to_RZ)*h(i,j,k-1)
+          pres(i,jj,K) = pres(i,jj,K-1) + (GV%g_Earth*GV%H_to_RZ)*h(i,j,k-1)
           Temp_Int(i,jj) = 0.5 * (T_f(i,j,k) + T_f(i,j,k-1))
           Salin_Int(i,jj) = 0.5 * (S_f(i,j,k) + S_f(i,j,k-1))
         enddo
-        call calculate_density_derivs(Temp_int(:,jj), Salin_int(:,jj), pres(:,K,jj), dRho_dT(:,K,jj), dRho_dS(:,K,jj), &
+        call calculate_density_derivs(Temp_int(:,jj), Salin_int(:,jj), pres(:,jj,K), dRho_dT(:,jj,K), dRho_dS(:,jj,K), &
                                       tv%eqn_of_state, EOSdom)
         do i=is,ie
-          dRho_int(i,K,jj) = max(dRho_dT(i,K,jj)*(T_f(i,j,k) - T_f(i,j,k-1)) + &
-                                 dRho_dS(i,K,jj)*(S_f(i,j,k) - S_f(i,j,k-1)), 0.0)
-          dRho_int_unfilt(i,K,jj) = max(dRho_dT(i,K,jj)*(tv%T(i,j,k) - tv%T(i,j,k-1)) + &
-                                        dRho_dS(i,K,jj)*(tv%S(i,j,k) - tv%S(i,j,k-1)), 0.0)
+          dRho_int(i,K,jj) = max(dRho_dT(i,jj,K)*(T_f(i,j,k) - T_f(i,j,k-1)) + &
+                                 dRho_dS(i,jj,K)*(S_f(i,j,k) - S_f(i,j,k-1)), 0.0)
+          dRho_int_unfilt(i,jj,K) = max(dRho_dT(i,jj,K)*(tv%T(i,j,k) - tv%T(i,j,k-1)) + &
+                                        dRho_dS(i,jj,K)*(tv%S(i,j,k) - tv%S(i,j,k-1)), 0.0)
         enddo
       enddo
     enddo
@@ -1362,7 +1362,7 @@ subroutine find_N2(h, tv, T_f, S_f, fluxes, nj, jstart, jend, G, GV, US, CS, dRh
     do K=1,nz+1
       do j=jstart,jend ; jj = j - jstart + 1
         do i=is,ie
-          dRho_int(i,K,jj) = dRho_int_unfilt(i,K,jj)
+          dRho_int(i,K,jj) = dRho_int_unfilt(i,jj,K)
         enddo
       enddo
     enddo
