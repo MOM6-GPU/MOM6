@@ -957,7 +957,7 @@ subroutine find_TKE_to_Kd(h, tv, dRho_int, N2_lay, jstart, jend, nj, dt, G, GV, 
                                                           !! layer, or -1 without a bulk mixed layer.
   real, dimension(SZI_(G),SZK_(GV),nj), intent(in) :: dz  !< Height change across layers [Z ~> m]
   ! Local variables
-  real, dimension(SZI_(G),SZK_(GV),nj) :: &
+  real, dimension(SZI_(G),nj,SZK_(GV)) :: &
     ds_dsp1, &    ! coordinate variable (sigma-2) difference across an
                   ! interface divided by the difference across the interface
                   ! below it [nondim]
@@ -1032,7 +1032,7 @@ subroutine find_TKE_to_Kd(h, tv, dRho_int, N2_lay, jstart, jend, nj, dt, G, GV, 
       p_0(i,jj) = 0.0 ; p_ref(i,jj) = tv%P_Ref
     enddo ; enddo
     do j=jstart,jend ; jj = j - jstart + 1 ; do k=1,nz
-      call calculate_density(tv%T(:,j,k), tv%S(:,j,k), p_0(:,jj), rho_0(:,k,jj), tv%eqn_of_state, EOSdom)
+      call calculate_density(tv%T(:,j,k), tv%S(:,j,k), p_0(:,jj), rho_0(:,jj,k), tv%eqn_of_state, EOSdom)
     enddo ; enddo
     do j=jstart,jend ; jj = j - jstart + 1
       call calculate_density(tv%T(:,j,kmb), tv%S(:,j,kmb), p_ref(:,jj), Rcv_kmb(:,jj), tv%eqn_of_state, EOSdom)
@@ -1046,7 +1046,7 @@ subroutine find_TKE_to_Kd(h, tv, dRho_int, N2_lay, jstart, jend, nj, dt, G, GV, 
     !   Backtrack, in case there are massive layers above that are stable
     ! in sigma-0.
       do k=kb(i,jj)-1,kmb+1,-1
-        if (rho_0(i,kmb,jj) > rho_0(i,k,jj)) exit
+        if (rho_0(i,jj,kmb) > rho_0(i,jj,k)) exit
         if (h(i,j,k)>2.0*GV%Angstrom_H) kb(i,jj) = k
       enddo
     enddo ; enddo
@@ -1061,11 +1061,11 @@ subroutine find_TKE_to_Kd(h, tv, dRho_int, N2_lay, jstart, jend, nj, dt, G, GV, 
 
   ! Determine maxEnt - the maximum permitted entrainment from below by each
   ! interior layer.
-  do j=jstart,jend ; jj = j - jstart + 1 ; do k=2,nz-1 ; do i=is,ie
-    dsp1_ds(i,k,jj) = 1.0 / ds_dsp1(i,k,jj)
+  do k=2,nz-1 ; do j=jstart,jend ; jj = j - jstart + 1 ; do i=is,ie
+    dsp1_ds(i,jj,k) = 1.0 / ds_dsp1(i,jj,k)
   enddo ; enddo ; enddo
   do j=jstart,jend ; jj = j - jstart + 1 ; do i=is,ie
-    dsp1_ds(i,nz,jj) = 0.0
+    dsp1_ds(i,jj,nz) = 0.0
   enddo ; enddo
 
   if (CS%bulkmixedlayer) then
@@ -1073,41 +1073,41 @@ subroutine find_TKE_to_Kd(h, tv, dRho_int, N2_lay, jstart, jend, nj, dt, G, GV, 
     do j=jstart,jend ; jj = j - jstart + 1 ; do i=is,ie
       htot(i,jj) = h(i,j,kmb)
       mFkb(i,jj) = 0.0
-      if (kb(i,jj) < nz) mFkb(i,jj) = ds_dsp1(i,kb(i,jj),jj) * (h(i,j,kmb) - GV%Angstrom_H)
+      if (kb(i,jj) < nz) mFkb(i,jj) = ds_dsp1(i,jj,kb(i,jj)) * (h(i,j,kmb) - GV%Angstrom_H)
     enddo ; enddo
-    do j=jstart,jend ; jj = j - jstart + 1 ; do k=1,kmb-1 ; do i=is,ie
+    do k=1,kmb-1 ; do j=jstart,jend ; jj = j - jstart + 1 ; do i=is,ie
       htot(i,jj) = htot(i,jj) + h(i,j,k)
-      mFkb(i,jj) = mFkb(i,jj) + ds_dsp1(i,k+1,jj)*(h(i,j,k) - GV%Angstrom_H)
+      mFkb(i,jj) = mFkb(i,jj) + ds_dsp1(i,jj,k+1)*(h(i,j,k) - GV%Angstrom_H)
     enddo ; enddo ; enddo
   else
     do j=jstart,jend ; jj = j - jstart + 1 ; do i=is,ie
-      maxEnt(i,1,jj) = 0.0 ; htot(i,jj) = h(i,j,1) - GV%Angstrom_H
+      maxEnt(i,jj,1) = 0.0 ; htot(i,jj) = h(i,j,1) - GV%Angstrom_H
     enddo ; enddo
   endif
-  do j=jstart,jend ; jj = j - jstart + 1 ; do k=kb_min,nz-1 ; do i=is,ie
+  do k=kb_min,nz-1 ; do j=jstart,jend ; jj = j - jstart + 1 ; do i=is,ie
     if (k == kb(i,jj)) then
-      maxEnt(i,kb(i,jj),jj) = mFkb(i,jj)
+      maxEnt(i,jj,kb(i,jj)) = mFkb(i,jj)
     elseif (k > kb(i,jj)) then
       if (CS%answer_date < 20190101) then
-        maxEnt(i,k,jj) = (1.0/dsp1_ds(i,k,jj))*(maxEnt(i,k-1,jj) + htot(i,jj))
+        maxEnt(i,jj,k) = (1.0/dsp1_ds(i,jj,k))*(maxEnt(i,jj,k-1) + htot(i,jj))
       else
-        maxEnt(i,k,jj) = ds_dsp1(i,k,jj)*(maxEnt(i,k-1,jj) + htot(i,jj))
+        maxEnt(i,jj,k) = ds_dsp1(i,jj,k)*(maxEnt(i,jj,k-1) + htot(i,jj))
       endif
       htot(i,jj) = htot(i,jj) + (h(i,j,k) - GV%Angstrom_H)
     endif
   enddo ; enddo ; enddo
 
   do j=jstart,jend ; jj = j - jstart + 1 ; do i=is,ie
-    htot(i,jj) = h(i,j,nz) - GV%Angstrom_H ; maxEnt(i,nz,jj) = 0.0
+    htot(i,jj) = h(i,j,nz) - GV%Angstrom_H ; maxEnt(i,jj,nz) = 0.0
     do_i(i,jj) = (G%mask2dT(i,j) > 0.0)
   enddo ; enddo
-  do j=jstart,jend ; jj = j - jstart + 1
-    do k=nz-1,kb_min,-1
+  do k=nz-1,kb_min,-1
+    do j=jstart,jend ; jj = j - jstart + 1
       i_rem = 0
       do i=is,ie ; if (do_i(i,jj)) then
         if (k<kb(i,jj)) then ; do_i(i,jj) = .false. ; cycle ; endif
         i_rem = i_rem + 1  ! Count the i-rows that are still being worked on.
-        maxEnt(i,k,jj) = MIN(maxEnt(i,k,jj), dsp1_ds(i,k+1,jj)*maxEnt(i,k+1,jj) + htot(i,jj))
+        maxEnt(i,jj,k) = MIN(maxEnt(i,jj,k), dsp1_ds(i,jj,k+1)*maxEnt(i,jj,k+1) + htot(i,jj))
         htot(i,jj) = htot(i,jj) + (h(i,j,k) - GV%Angstrom_H)
       endif ; enddo
       if (i_rem == 0) exit
@@ -1138,7 +1138,7 @@ subroutine find_TKE_to_Kd(h, tv, dRho_int, N2_lay, jstart, jend, nj, dt, G, GV, 
       !              G_IRho0*(h(i,j,k) + dh_max) / (G_Rho0*dRho_lay)
       !  maxTKE(i,k) = GV%g_Earth_Z_T2 * dRho_lay * kappa_max
       ! dRho_int should already be non-negative, so the max is redundant?
-      dh_max = maxEnt(i,k,jj) * (1.0 + dsp1_ds(i,k,jj))
+      dh_max = maxEnt(i,jj,k) * (1.0 + dsp1_ds(i,jj,k))
       dRho_lay = 0.5 * max(dRho_int(i,K,jj) + dRho_int(i,K+1,jj), 0.0)
 
       ! TKE_to_Kd should be rho_InSitu / G_Earth * (delta rho_InSitu)
@@ -1146,13 +1146,13 @@ subroutine find_TKE_to_Kd(h, tv, dRho_int, N2_lay, jstart, jend, nj, dt, G, GV, 
       ! mixing by a factor of N^2 / (N^2 + Omega^2), as proposed by Melet et al., 2013?
       if (allocated(tv%SpV_avg)) then
         maxTKE(i,k,jj) = I_dt * ((GV%H_to_RZ * grav * tv%SpV_avg(i,j,k)**2) * &
-            (0.5*max(dRho_int(i,K+1,jj) + dsp1_ds(i,k,jj)*dRho_int(i,K,jj), 0.0))) * &
-             ((h(i,j,k) + dh_max) * maxEnt(i,k,jj))
+            (0.5*max(dRho_int(i,K+1,jj) + dsp1_ds(i,jj,k)*dRho_int(i,K,jj), 0.0))) * &
+             ((h(i,j,k) + dh_max) * maxEnt(i,jj,k))
         TKE_to_Kd(i,k,jj) = 1.0 / (grav * tv%SpV_avg(i,j,k) * dRho_lay + CS%omega**2 * (dz(i,k,jj) + dz_neglect))
       else
         maxTKE(i,k,jj) = I_dt * (G_IRho0 * &
-            (0.5*max(dRho_int(i,K+1,jj) + dsp1_ds(i,k,jj)*dRho_int(i,K,jj), 0.0))) * &
-             ((h(i,j,k) + dh_max) * maxEnt(i,k,jj))
+            (0.5*max(dRho_int(i,K+1,jj) + dsp1_ds(i,jj,k)*dRho_int(i,K,jj), 0.0))) * &
+             ((h(i,j,k) + dh_max) * maxEnt(i,jj,k))
         TKE_to_Kd(i,k,jj) = 1.0 / (G_Rho0 * dRho_lay + CS%omega**2 * (dz(i,k,jj) + dz_neglect))
       endif
     endif
@@ -2278,11 +2278,11 @@ subroutine set_density_ratios(h, tv, kb, G, GV, US, CS, jstart, jend, nj, ds_dsp
   integer,                          intent(in)   :: jstart !< Start j-index of the j-block
   integer,                          intent(in)   :: jend   !< End j-index of the j-block
   integer,                          intent(in)   :: nj     !< Number of j-rows in the block
-  real, dimension(SZI_(G),SZK_(GV),nj), intent(out) :: ds_dsp1 !< Coordinate variable (sigma-2)
+  real, dimension(SZI_(G),nj,SZK_(GV)), intent(out) :: ds_dsp1 !< Coordinate variable (sigma-2)
                                                        !! difference across an interface divided by
                                                        !! the difference across the interface below
                                                        !! it [nondim]
-  real, dimension(SZI_(G),SZK_(GV),nj), &
+  real, dimension(SZI_(G),nj,SZK_(GV)), &
                           optional, intent(in)   :: rho_0 !< Layer potential densities relative to
                                                        !! surface press [R ~> kg m-3].
 
@@ -2302,12 +2302,12 @@ subroutine set_density_ratios(h, tv, kb, G, GV, US, CS, jstart, jend, nj, ds_dsp
   do j=jstart,jend ; jj = j - jstart + 1 ; do k=2,nz-1 ; do i=is,ie
     if (GV%g_prime(k+1) /= 0.0) then
       if (GV%Boussinesq .or. GV%Semi_Boussinesq) then
-        ds_dsp1(i,k,jj) = GV%g_prime(k) / GV%g_prime(k+1)
+        ds_dsp1(i,jj,k) = GV%g_prime(k) / GV%g_prime(k+1)
       else  ! Use a mathematically equivalent form that avoids any dependency on RHO_0.
-        ds_dsp1(i,k,jj) = (GV%Rlay(k) - GV%Rlay(k-1)) / (GV%Rlay(k+1) - GV%Rlay(k))
+        ds_dsp1(i,jj,k) = (GV%Rlay(k) - GV%Rlay(k-1)) / (GV%Rlay(k+1) - GV%Rlay(k))
       endif
     else
-      ds_dsp1(i,k,jj) = 1.
+      ds_dsp1(i,jj,k) = 1.
     endif
   enddo ; enddo ; enddo
 
@@ -2337,39 +2337,39 @@ subroutine set_density_ratios(h, tv, kb, G, GV, US, CS, jstart, jend, nj, ds_dsp
         do k3=1,kmb
           a(k3+1) = (GV%Rlay(k) - Rcv(i,k3,jj)) * I_Drho
         enddo
-        if ((present(rho_0)) .and. (a(kmb+1) < 2.0*eps*ds_dsp1(i,k,jj))) then
+        if ((present(rho_0)) .and. (a(kmb+1) < 2.0*eps*ds_dsp1(i,jj,k))) then
 !   If the buffer layer nearly matches the density of the layer below in the
 ! coordinate variable (sigma-2), use the sigma-0-based density ratio if it is
 ! greater (and stable).
-          if ((rho_0(i,k,jj) > rho_0(i,kmb,jj)) .and. &
-              (rho_0(i,k+1,jj) > rho_0(i,k,jj))) then
-            I_Drho = 1.0 / (rho_0(i,k+1,jj)-rho_0(i,k,jj))
-            a_0(kmb+1) = min((rho_0(i,k,jj)-rho_0(i,kmb,jj)) * I_Drho, ds_dsp1(i,k,jj))
+          if ((rho_0(i,jj,k) > rho_0(i,jj,kmb)) .and. &
+              (rho_0(i,jj,k+1) > rho_0(i,jj,k))) then
+            I_Drho = 1.0 / (rho_0(i,jj,k+1)-rho_0(i,jj,k))
+            a_0(kmb+1) = min((rho_0(i,jj,k)-rho_0(i,jj,kmb)) * I_Drho, ds_dsp1(i,jj,k))
             if (a_0(kmb+1) > a(kmb+1)) then
               do k3=2,kmb
-                a_0(k3) = a_0(kmb+1) + (rho_0(i,kmb,jj)-rho_0(i,k3-1,jj)) * I_Drho
+                a_0(k3) = a_0(kmb+1) + (rho_0(i,jj,kmb)-rho_0(i,jj,k3-1)) * I_Drho
               enddo
-              if (a(kmb+1) <= eps*ds_dsp1(i,k,jj)) then
+              if (a(kmb+1) <= eps*ds_dsp1(i,jj,k)) then
                 do k3=2,kmb+1 ; a(k3) = a_0(k3) ; enddo
               else
-! Alternative...  tmp = 0.5*(1.0 - cos(PI*(a(K2+1)/(eps*ds_dsp1(i,k,jj)) - 1.0)) )
-                tmp = a(kmb+1)/(eps*ds_dsp1(i,k,jj)) - 1.0
+! Alternative...  tmp = 0.5*(1.0 - cos(PI*(a(K2+1)/(eps*ds_dsp1(i,jj,k)) - 1.0)) )
+                tmp = a(kmb+1)/(eps*ds_dsp1(i,jj,k)) - 1.0
                 do k3=2,kmb+1 ; a(k3) = tmp*a(k3) + (1.0-tmp)*a_0(k3) ; enddo
               endif
             endif
           endif
         endif
 
-        ds_dsp1(i,k,jj) = MAX(a(kmb+1),1e-5)
+        ds_dsp1(i,jj,k) = MAX(a(kmb+1),1e-5)
 
         do k3=2,kmb
-!           ds_dsp1(i,k3,jj) = MAX(a(k3),1e-5)
+!           ds_dsp1(i,jj,k3) = MAX(a(k3),1e-5)
           ! Deliberately treat convective instabilities of the upper mixed
           ! and buffer layers with respect to the deepest buffer layer as
           ! though they don't exist.  They will be eliminated by the upcoming
           ! call to the mixedlayer code anyway.
           ! The indexing convention is appropriate for the interfaces.
-          ds_dsp1(i,k3,jj) = MAX(a(k3),ds_dsp1(i,k,jj))
+          ds_dsp1(i,jj,k3) = MAX(a(k3),ds_dsp1(i,jj,k))
         enddo
       endif ! (kb(i,jj) <= nz-1)
     enddo ; enddo ! i-loop / j-loop
