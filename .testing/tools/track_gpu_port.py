@@ -15,13 +15,6 @@ compute directives inside it are). `!$omp target enter/exit data` and
 `!$omp target update` are single-statement data-movement directives, counted
 separately from compute regions.
 
-For code with no directive at all (e.g. pure/elemental helpers invoked from
-device code), wrap it manually:
-
-    ! @gpu-ported-start
-    ...
-    ! @gpu-ported-end
-
 Executed-but-unported lines are further split into "portable" and
 "not portable" so the completion metric isn't diluted by code that will
 never move to the GPU:
@@ -50,6 +43,11 @@ overridden by hand in either direction:
     !@end toport            device. Added to "portable" even though it
                             doesn't match the structural heuristic.
 
+A trailing line comment is allowed after the keyword (`!@start noport ! reason`),
+but nothing else — bare trailing text does not match, leaving room for
+multi-word markers later (`!@start noport potato` is not a marker at all,
+just an ordinary comment).
+
 If `!@start noport`/`!@start toport` is immediately followed by a do-loop
 (nothing but comments/blank lines in between), it attaches to that loop and
 needs no matching `!@end` at all — the loop's own `end do` closes it, same
@@ -67,8 +65,11 @@ after a marker that already auto-attached to a loop is an error (it's
 orphaned — the loop already closed it).
 
 `noport` always wins over both the structural heuristic and `toport` if
-they overlap. Markers nest like `@gpu-ported-start`/`-end` and must be
-balanced within a file.
+they overlap. Unlike `!$omp` directives, `noport`/`toport` markers do not
+nest: at most one may be open at a time (whether still pending attachment
+to a loop, or awaiting an explicit `!@end`), and opening a new `!@start`
+while one is already open — or writing an `!@end` with none open — is a
+structural error.
 
 Usage:
     track_gpu_port.py --src-root <dir> --gcov-dir <dir> [--out-md FILE] [--out-json FILE]
@@ -98,12 +99,12 @@ DO_CONCURRENT_RE = re.compile(r'^\s*(?:\w+\s*:\s*)?do\s+concurrent\b', re.IGNORE
 END_DO_RE = re.compile(r'^\s*end\s*do\b', re.IGNORECASE)
 
 OMP_RE = re.compile(r'^\s*!\$omp\s+(.*)$', re.IGNORECASE)
-TAG_START_RE = re.compile(r'^\s*!\s*@gpu-ported-start\s*$', re.IGNORECASE)
-TAG_END_RE = re.compile(r'^\s*!\s*@gpu-ported-end\s*$', re.IGNORECASE)
-NOPORT_START_RE = re.compile(r'^\s*!\s*@start\s+noport\s*$', re.IGNORECASE)
-NOPORT_END_RE = re.compile(r'^\s*!\s*@end\s+noport\s*$', re.IGNORECASE)
-TOPORT_START_RE = re.compile(r'^\s*!\s*@start\s+toport\s*$', re.IGNORECASE)
-TOPORT_END_RE = re.compile(r'^\s*!\s*@end\s+toport\s*$', re.IGNORECASE)
+# Trailing content after the keyword must be a "! comment" (or nothing) to match — bare
+# trailing text (e.g. a future multi-word marker) is deliberately left unmatched.
+NOPORT_START_RE = re.compile(r'^\s*!\s*@start\s+noport\s*(?:!.*)?$', re.IGNORECASE)
+NOPORT_END_RE = re.compile(r'^\s*!\s*@end\s+noport\s*(?:!.*)?$', re.IGNORECASE)
+TOPORT_START_RE = re.compile(r'^\s*!\s*@start\s+toport\s*(?:!.*)?$', re.IGNORECASE)
+TOPORT_END_RE = re.compile(r'^\s*!\s*@end\s+toport\s*(?:!.*)?$', re.IGNORECASE)
 
 SUBPROG_START_RE = re.compile(
     r'^\s*(?:recursive\s+)?(?:pure\s+)?(?:elemental\s+)?(?:module\s+)?'
@@ -139,7 +140,6 @@ ARRAY_ASSIGN_RE = re.compile(r'^\s*[A-Za-z_]\w*\s*\([^=()]*:[^=()]*\)\s*=[^=]')
 class FileRegions:
     ported: set = field(default_factory=set)
     directive: set = field(default_factory=set)
-    manual: set = field(default_factory=set)
     loop: set = field(default_factory=set)          # any do-loop body, ported or not
     array_syntax: set = field(default_factory=set)  # whole-array assignment lines
     nonportable: set = field(default_factory=set)   # allocate/deallocate/IO override
@@ -259,23 +259,23 @@ def parse_ported_regions(path):
         lines = lines[:-1]
 
     fr = FileRegions()
-    manual_regions = []
     noport_regions = []
     toport_regions = []
 
     do_stack = []       # entries: {'concurrent', 'start', 'parent_start', 'combined_start',
                          #           'noport_start', 'toport_start'}
     region_stack = []   # entries: (kind, start_line) for target/teams/data blocks
-    tag_stack = []       # entries: start_line for manual tags
-    noport_stack = []    # entries: start_line for "!@start noport" not yet closed/attached
-    toport_stack = []    # entries: start_line for "!@start toport" not yet closed/attached
+    # The currently open noport/toport region, or None. At most one may be open at a
+    # time — noport/toport markers do not nest — so this is a single slot, not a stack:
+    # (kind, start_line), still open either pending attachment to a loop or awaiting an
+    # explicit "!@end".
+    open_marker = None
+    # Sub-state of open_marker: set right after "!@start <kind>", cleared as soon as the
+    # next real line is seen. If that line opens a do-loop, the marker attaches to it
+    # (closed implicitly by "end do", mirroring "!$omp loop"); otherwise it falls back to
+    # requiring an explicit "!@end <kind>" and open_marker stays set until then.
+    pending_marker = None
     pending_combined_start = None
-    # If "!@start noport"/"!@start toport" is immediately followed by a do-loop, it attaches
-    # to that loop (closed implicitly by "end do") and needs no matching "!@end" — mirrors how
-    # "!$omp loop" attaches to the following loop. Otherwise it falls back to requiring an
-    # explicit "!@end noport"/"!@end toport" (tracked via noport_stack/toport_stack above).
-    pending_noport_start = None
-    pending_toport_start = None
     # Every closed do-loop's (start, end, parent_start), used to exclude nested loops from a
     # noport/toport marking — the marker should cover the loop(s) it directly names, not loops
     # nested inside them (those keep their own independent classification).
@@ -302,42 +302,43 @@ def parse_ported_regions(path):
         stripped = text_joined.strip()
         if not stripped or stripped.startswith('!') and not OMP_RE.match(stripped):
             if stripped.startswith('!') and not OMP_RE.match(stripped):
-                # comment-only line; still check for manual tags
-                if TAG_START_RE.match(stripped):
-                    tag_stack.append(start)
-                elif TAG_END_RE.match(stripped):
-                    if not tag_stack:
+                # comment-only line; still check for noport/toport markers
+                if NOPORT_START_RE.match(stripped):
+                    if open_marker is not None:
                         raise StructuralError(
-                            f'{path}:{start}: @gpu-ported-end with no matching -start')
-                    tstart = tag_stack.pop()
-                    mark(tstart, end, fr.manual)
-                    manual_regions.append((tstart, end))
-                elif NOPORT_START_RE.match(stripped):
-                    noport_stack.append(start)
-                    pending_noport_start = start
+                            f'{path}:{start}: "!@start noport" is nested inside an already-'
+                            f'open "!@start {open_marker[0]}" at line {open_marker[1]} '
+                            f'(noport/toport regions cannot nest)')
+                    open_marker = ('noport', start)
+                    pending_marker = open_marker
                 elif NOPORT_END_RE.match(stripped):
-                    if not noport_stack:
+                    if open_marker is None or open_marker[0] != 'noport':
                         raise StructuralError(
                             f'{path}:{start}: "!@end noport" with no matching "!@start noport"')
-                    nstart = noport_stack.pop()
+                    nstart = open_marker[1]
                     span = shallow_span(nstart, end)
                     fr.manual_noport.update(span)
                     noport_regions.append((nstart, end, span))
-                    if pending_noport_start == nstart:
-                        pending_noport_start = None
+                    open_marker = None
+                    pending_marker = None
                 elif TOPORT_START_RE.match(stripped):
-                    toport_stack.append(start)
-                    pending_toport_start = start
+                    if open_marker is not None:
+                        raise StructuralError(
+                            f'{path}:{start}: "!@start toport" is nested inside an already-'
+                            f'open "!@start {open_marker[0]}" at line {open_marker[1]} '
+                            f'(noport/toport regions cannot nest)')
+                    open_marker = ('toport', start)
+                    pending_marker = open_marker
                 elif TOPORT_END_RE.match(stripped):
-                    if not toport_stack:
+                    if open_marker is None or open_marker[0] != 'toport':
                         raise StructuralError(
                             f'{path}:{start}: "!@end toport" with no matching "!@start toport"')
-                    tpstart = toport_stack.pop()
+                    tpstart = open_marker[1]
                     span = shallow_span(tpstart, end)
                     fr.manual_toport.update(span)
                     toport_regions.append((tpstart, end, span))
-                    if pending_toport_start == tpstart:
-                        pending_toport_start = None
+                    open_marker = None
+                    pending_marker = None
             continue
 
         omp_m = OMP_RE.match(text_joined)
@@ -400,31 +401,27 @@ def parse_ported_regions(path):
                     span = shallow_span(entry['noport_start'], end)
                     fr.manual_noport.update(span)
                     noport_regions.append((entry['noport_start'], end, span))
+                    open_marker = None
                 if entry['toport_start'] is not None:
                     span = shallow_span(entry['toport_start'], end)
                     fr.manual_toport.update(span)
                     toport_regions.append((entry['toport_start'], end, span))
+                    open_marker = None
             elif DO_OPEN_RE.match(s):
                 do_stack.append({
                     'concurrent': bool(DO_CONCURRENT_RE.match(s)),
                     'start': start,
                     'parent_start': do_stack[-1]['start'] if do_stack else None,
                     'combined_start': pending_combined_start,
-                    'noport_start': pending_noport_start,
-                    'toport_start': pending_toport_start,
+                    'noport_start': pending_marker[1] if pending_marker and pending_marker[0] == 'noport' else None,
+                    'toport_start': pending_marker[1] if pending_marker and pending_marker[0] == 'toport' else None,
                 })
                 pending_combined_start = None
-                if pending_noport_start is not None:
-                    noport_stack.pop()  # attached to this loop; no "!@end noport" required
-                    pending_noport_start = None
-                if pending_toport_start is not None:
-                    toport_stack.pop()  # attached to this loop; no "!@end toport" required
-                    pending_toport_start = None
+                pending_marker = None  # attached to this loop; no explicit "!@end" required
             else:
                 # marker(s) weren't immediately followed by a loop; fall back to requiring
-                # an explicit "!@end noport"/"!@end toport" (still open on the stack)
-                pending_noport_start = None
-                pending_toport_start = None
+                # an explicit "!@end noport"/"!@end toport" (open_marker stays open)
+                pending_marker = None
                 if (ALLOC_RE.match(s) or IO_RE.match(s) or PRINT_RE.match(s)
                         or IF_THEN_RE.match(s) or ELSEIF_RE.match(s)
                         or ELSE_RE.match(s) or ENDIF_RE.match(s) or CALL_RE.match(s)):
@@ -435,23 +432,12 @@ def parse_ported_regions(path):
     if region_stack:
         kinds = ', '.join(f'{k}@{ln}' for k, ln in region_stack)
         raise StructuralError(f'{path}: unclosed omp target region(s): {kinds}')
-    if tag_stack:
-        raise StructuralError(f'{path}: unclosed @gpu-ported-start at line(s) {tag_stack}')
-    if noport_stack:
-        raise StructuralError(f'{path}: unclosed "!@start noport" at line(s) {noport_stack}')
-    if toport_stack:
-        raise StructuralError(f'{path}: unclosed "!@start toport" at line(s) {toport_stack}')
+    if open_marker is not None:
+        raise StructuralError(
+            f'{path}: unclosed "!@start {open_marker[0]}" at line {open_marker[1]}')
     if do_stack:
         fr.warnings.append(
             f'{path}: {len(do_stack)} unbalanced "do" opener(s) at EOF (parser limitation)')
-
-    # Flag manual tags that are already fully covered by automatic detection.
-    for tstart, tend in manual_regions:
-        span = set(range(tstart + 1, tend))
-        if span and span.issubset(fr.ported):
-            fr.warnings.append(
-                f'{path}:{tstart}-{tend}: @gpu-ported tag is redundant '
-                f'(region already detected automatically)')
 
     # Flag "noport" regions that contradict already-ported code, and "toport"
     # regions that are redundant with the structural heuristic. Both checks use the
@@ -618,7 +604,7 @@ def render_file_html(rel_path, resolved, counts, fr):
         lines = resolved.read_text(errors='replace').splitlines()
     except OSError:
         lines = []
-    ported_all = fr.ported | fr.manual
+    ported_all = fr.ported
     portable = fr.portable
     rows = []
     for lineno, text in enumerate(lines, start=1):
@@ -743,7 +729,6 @@ def main():
             print(f'WARNING: {w}', file=sys.stderr)
         total_ported = sum(len(fr.ported) for fr in ported_by_file.values())
         total_directive = sum(len(fr.directive) for fr in ported_by_file.values())
-        total_manual = sum(len(fr.manual) for fr in ported_by_file.values())
         total_portable = sum(len(fr.portable) for fr in ported_by_file.values())
         total_nonportable = sum(len(fr.nonportable) for fr in ported_by_file.values())
         total_noport = sum(len(fr.manual_noport) for fr in ported_by_file.values())
@@ -751,7 +736,6 @@ def main():
         print(f'Parsed {len(ported_by_file)} files: '
               f'{total_ported} auto-ported compute lines, '
               f'{total_directive} data-movement directive lines, '
-              f'{total_manual} manually tagged lines, '
               f'{total_portable} portable-structure lines (loop bodies / array syntax), '
               f'{total_nonportable} allocate/IO override lines, '
               f'{total_noport} manually excluded (noport) lines, '
@@ -784,7 +768,7 @@ def main():
 
     def split_executed(executed, fr):
         """Partition a file's executed lines into (ported, portable-remaining, not-portable)."""
-        ported_all = fr.ported | fr.manual
+        ported_all = fr.ported
         executed_ported = executed & ported_all
         executed_portable_remaining = (executed & fr.portable) - executed_ported
         executed_not_portable = executed - executed_ported - executed_portable_remaining
@@ -838,7 +822,7 @@ def main():
             rexec = {ln for ln in executed if rstart <= ln <= rend}
             if not rexec:
                 continue
-            rported = rexec & (fr.ported | fr.manual)
+            rported = rexec & fr.ported
             rportable = (rexec & fr.portable) - rported
             rtotal = len(rported) + len(rportable)
             routine_rows.append({
