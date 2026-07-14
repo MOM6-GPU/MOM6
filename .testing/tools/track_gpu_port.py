@@ -48,27 +48,17 @@ but nothing else — bare trailing text does not match, leaving room for
 multi-word markers later (`!@start noport potato` is not a marker at all,
 just an ordinary comment).
 
-If `!@start noport`/`!@start toport` is immediately followed by a do-loop
-(nothing but comments/blank lines in between), it attaches to that loop and
-needs no matching `!@end` at all — the loop's own `end do` closes it, same
-as how `!$omp loop` attaches to the following loop with no closing
-directive of its own:
-
-    !@start noport
-    do i = 1, n
-      ...
-    enddo
-
-Anything else (not immediately followed by a loop) falls back to requiring
-an explicit, balanced `!@end noport`/`!@end toport`. Writing an explicit end
-after a marker that already auto-attached to a loop is an error (it's
-orphaned — the loop already closed it).
+Every `!@start noport`/`!@start toport` requires a matching, explicit
+`!@end noport`/`!@end toport` — including when the region is just a single
+loop. There is no shorthand that auto-closes at the next `end do`: a marker
+immediately before a loop cannot be distinguished from one that means to
+span several statements or loops after it, so guessing which was meant is
+not attempted.
 
 `noport` always wins over both the structural heuristic and `toport` if
 they overlap. Unlike `!$omp` directives, `noport`/`toport` markers do not
-nest: at most one may be open at a time (whether still pending attachment
-to a loop, or awaiting an explicit `!@end`), and opening a new `!@start`
-while one is already open — or writing an `!@end` with none open — is a
+nest: at most one may be open at a time, and opening a new `!@start` while
+one is already open — or writing an `!@end` with none open — is a
 structural error.
 
 Usage:
@@ -262,19 +252,12 @@ def parse_ported_regions(path):
     noport_regions = []
     toport_regions = []
 
-    do_stack = []       # entries: {'concurrent', 'start', 'parent_start', 'combined_start',
-                         #           'noport_start', 'toport_start'}
+    do_stack = []       # entries: {'concurrent', 'start', 'parent_start', 'combined_start'}
     region_stack = []   # entries: (kind, start_line) for target/teams/data blocks
     # The currently open noport/toport region, or None. At most one may be open at a
     # time — noport/toport markers do not nest — so this is a single slot, not a stack:
-    # (kind, start_line), still open either pending attachment to a loop or awaiting an
-    # explicit "!@end".
+    # (kind, start_line), awaiting an explicit "!@end".
     open_marker = None
-    # Sub-state of open_marker: set right after "!@start <kind>", cleared as soon as the
-    # next real line is seen. If that line opens a do-loop, the marker attaches to it
-    # (closed implicitly by "end do", mirroring "!$omp loop"); otherwise it falls back to
-    # requiring an explicit "!@end <kind>" and open_marker stays set until then.
-    pending_marker = None
     pending_combined_start = None
     # Every closed do-loop's (start, end, parent_start), used to exclude nested loops from a
     # noport/toport marking — the marker should cover the loop(s) it directly names, not loops
@@ -310,7 +293,6 @@ def parse_ported_regions(path):
                             f'open "!@start {open_marker[0]}" at line {open_marker[1]} '
                             f'(noport/toport regions cannot nest)')
                     open_marker = ('noport', start)
-                    pending_marker = open_marker
                 elif NOPORT_END_RE.match(stripped):
                     if open_marker is None or open_marker[0] != 'noport':
                         raise StructuralError(
@@ -320,7 +302,6 @@ def parse_ported_regions(path):
                     fr.manual_noport.update(span)
                     noport_regions.append((nstart, end, span))
                     open_marker = None
-                    pending_marker = None
                 elif TOPORT_START_RE.match(stripped):
                     if open_marker is not None:
                         raise StructuralError(
@@ -328,7 +309,6 @@ def parse_ported_regions(path):
                             f'open "!@start {open_marker[0]}" at line {open_marker[1]} '
                             f'(noport/toport regions cannot nest)')
                     open_marker = ('toport', start)
-                    pending_marker = open_marker
                 elif TOPORT_END_RE.match(stripped):
                     if open_marker is None or open_marker[0] != 'toport':
                         raise StructuralError(
@@ -338,7 +318,6 @@ def parse_ported_regions(path):
                     fr.manual_toport.update(span)
                     toport_regions.append((tpstart, end, span))
                     open_marker = None
-                    pending_marker = None
             continue
 
         omp_m = OMP_RE.match(text_joined)
@@ -397,31 +376,15 @@ def parse_ported_regions(path):
                     mark(entry['combined_start'], end, fr.ported)
                 all_loop_records.append({
                     'start': entry['start'], 'end': end, 'parent_start': entry['parent_start']})
-                if entry['noport_start'] is not None:
-                    span = shallow_span(entry['noport_start'], end)
-                    fr.manual_noport.update(span)
-                    noport_regions.append((entry['noport_start'], end, span))
-                    open_marker = None
-                if entry['toport_start'] is not None:
-                    span = shallow_span(entry['toport_start'], end)
-                    fr.manual_toport.update(span)
-                    toport_regions.append((entry['toport_start'], end, span))
-                    open_marker = None
             elif DO_OPEN_RE.match(s):
                 do_stack.append({
                     'concurrent': bool(DO_CONCURRENT_RE.match(s)),
                     'start': start,
                     'parent_start': do_stack[-1]['start'] if do_stack else None,
                     'combined_start': pending_combined_start,
-                    'noport_start': pending_marker[1] if pending_marker and pending_marker[0] == 'noport' else None,
-                    'toport_start': pending_marker[1] if pending_marker and pending_marker[0] == 'toport' else None,
                 })
                 pending_combined_start = None
-                pending_marker = None  # attached to this loop; no explicit "!@end" required
             else:
-                # marker(s) weren't immediately followed by a loop; fall back to requiring
-                # an explicit "!@end noport"/"!@end toport" (open_marker stays open)
-                pending_marker = None
                 if (ALLOC_RE.match(s) or IO_RE.match(s) or PRINT_RE.match(s)
                         or IF_THEN_RE.match(s) or ELSEIF_RE.match(s)
                         or ELSE_RE.match(s) or ENDIF_RE.match(s) or CALL_RE.match(s)):
