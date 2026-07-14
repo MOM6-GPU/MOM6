@@ -252,34 +252,17 @@ def parse_ported_regions(path):
     noport_regions = []
     toport_regions = []
 
-    do_stack = []       # entries: {'concurrent', 'start', 'parent_start', 'combined_start'}
+    do_stack = []       # entries: {'concurrent', 'start', 'combined_start'}
     region_stack = []   # entries: (kind, start_line) for target/teams/data blocks
     # The currently open noport/toport region, or None. At most one may be open at a
     # time — noport/toport markers do not nest — so this is a single slot, not a stack:
     # (kind, start_line), awaiting an explicit "!@end".
     open_marker = None
     pending_combined_start = None
-    # Every closed do-loop's (start, end, parent_start), used to exclude nested loops from a
-    # noport/toport marking — the marker should cover the loop(s) it directly names, not loops
-    # nested inside them (those keep their own independent classification).
-    all_loop_records = []
 
     def mark(lo, hi, dest):
         for ln in range(lo, hi + 1):
             dest.add(ln)
-
-    def shallow_span(lo, hi):
-        """[lo, hi] minus lines belonging to any loop nested inside another loop that is
-        itself within [lo, hi] — i.e. keep the loop(s) directly named by the marker, drop
-        loops nested inside those."""
-        excluded = set()
-        for rec in all_loop_records:
-            s, e, ps = rec['start'], rec['end'], rec['parent_start']
-            if s < lo or e > hi:
-                continue
-            if ps is not None and ps >= lo:
-                excluded.update(range(s, e + 1))
-        return set(range(lo, hi + 1)) - excluded
 
     for start, end, text_joined in iter_logical_lines(lines):
         stripped = text_joined.strip()
@@ -298,7 +281,7 @@ def parse_ported_regions(path):
                         raise StructuralError(
                             f'{path}:{start}: "!@end noport" with no matching "!@start noport"')
                     nstart = open_marker[1]
-                    span = shallow_span(nstart, end)
+                    span = set(range(nstart, end + 1))
                     fr.manual_noport.update(span)
                     noport_regions.append((nstart, end, span))
                     open_marker = None
@@ -314,7 +297,7 @@ def parse_ported_regions(path):
                         raise StructuralError(
                             f'{path}:{start}: "!@end toport" with no matching "!@start toport"')
                     tpstart = open_marker[1]
-                    span = shallow_span(tpstart, end)
+                    span = set(range(tpstart, end + 1))
                     fr.manual_toport.update(span)
                     toport_regions.append((tpstart, end, span))
                     open_marker = None
@@ -374,13 +357,10 @@ def parse_ported_regions(path):
                     mark(entry['start'], end, fr.ported)
                 if entry['combined_start'] is not None:
                     mark(entry['combined_start'], end, fr.ported)
-                all_loop_records.append({
-                    'start': entry['start'], 'end': end, 'parent_start': entry['parent_start']})
             elif DO_OPEN_RE.match(s):
                 do_stack.append({
                     'concurrent': bool(DO_CONCURRENT_RE.match(s)),
                     'start': start,
-                    'parent_start': do_stack[-1]['start'] if do_stack else None,
                     'combined_start': pending_combined_start,
                 })
                 pending_combined_start = None
