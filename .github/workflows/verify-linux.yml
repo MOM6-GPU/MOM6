@@ -646,9 +646,32 @@ jobs:
 
       # Only the benchmark_ALE inputs are needed here — no MOM6/FMS build,
       # since the coverage-instrumented binary from build-coverage is reused
-      # as-is.
+      # as-is. A plain `git clone` would also pull down every other case's
+      # input/restart files (several NetCDF files each), so this fetches
+      # just the one directory instead.
       - name: Clone MOM6-gpu/MOM6-examples for the benchmark_ALE case
-        run: git clone --depth 1 https://github.com/MOM6-gpu/MOM6-examples.git MOM6-examples
+        run: |
+          # --depth 1: only fetch the latest commit, not the repo's full
+          #   history.
+          # --filter=blob:none: a "partial clone" — fetch commit and
+          #   directory-tree metadata for everything, but not file
+          #   contents (blobs); those are downloaded on demand the first
+          #   time something asks for them (below).
+          # --no-checkout: don't populate a working tree yet (which would
+          #   need every blob in the latest commit) — .git metadata only,
+          #   deferring the on-demand blob fetch above until the git
+          #   archive step explicitly asks for one directory.
+          git clone --depth 1 --filter=blob:none --no-checkout \
+            https://github.com/MOM6-gpu/MOM6-examples.git MOM6-examples
+          cd MOM6-examples
+          # `git archive` packs a directory (here, just
+          # ocean_only/benchmark_ALE) from a given commit (HEAD) into a
+          # tar stream. This is what triggers the on-demand blob fetch
+          # from above — only for files under this path — and `tar -x`
+          # unpacks that stream straight into the working directory, so
+          # the net effect is "check out just this one directory" without
+          # ever downloading the other cases' data files.
+          git archive HEAD -- ocean_only/benchmark_ALE | tar -x
 
       # Force a single-rank layout and a short run: this is a coverage smoke
       # run, not a scaling test, and the runner may have far fewer cores
