@@ -49,6 +49,7 @@ public calculate_density_elem
 public calculate_density
 public calculate_density_derivs
 public calculate_density_derivs_elem_loc
+public get_EOS_form_and_scaling
 public calculate_density_second_derivs
 public calculate_spec_vol
 public calculate_specific_vol_derivs
@@ -1021,6 +1022,26 @@ subroutine calculate_density_derivs_elem_loc(form_of_EOS, T, S, pressure, drho_d
   end select
 
 end subroutine calculate_density_derivs_elem_loc
+
+!> Return the equation-of-state form id and the unit-rescaling factors held in an EOS_type.
+!! Lets a caller (e.g. a whole-column GPU kernel) reproduce, host-side, the unit conversion
+!! and rescaling that calculate_density_derivs_1d applies around the mks _loc kernels, without
+!! needing access to the private components of EOS_type.
+subroutine get_EOS_form_and_scaling(EOS, form_of_EOS, kg_m3_to_R, C_to_degC, S_to_ppt, RL2_T2_to_Pa)
+  type(EOS_type), intent(in)  :: EOS          !< Equation of state structure
+  integer,        intent(out) :: form_of_EOS  !< The equation of state form id (EOS_ROQUET_RHO, ...)
+  real,           intent(out) :: kg_m3_to_R   !< Factor converting kg m-3 to the internal density unit R [R m3 kg-1 ~> 1]
+  real,           intent(out) :: C_to_degC    !< Factor converting the temperature unit to degC [degC C-1 ~> 1]
+  real,           intent(out) :: S_to_ppt     !< Factor converting the salinity unit to ppt [ppt S-1 ~> 1]
+  real,           intent(out) :: RL2_T2_to_Pa !< Factor converting the pressure unit to Pa [Pa T2 R-1 L-2 ~> 1]
+
+  form_of_EOS  = EOS%form_of_EOS
+  kg_m3_to_R   = EOS%kg_m3_to_R
+  C_to_degC    = EOS%C_to_degC
+  S_to_ppt     = EOS%S_to_ppt
+  RL2_T2_to_Pa = EOS%RL2_T2_to_Pa
+
+end subroutine get_EOS_form_and_scaling
 
 
 !> Calls the appropriate subroutine to calculate density derivatives for 1-D array inputs.
