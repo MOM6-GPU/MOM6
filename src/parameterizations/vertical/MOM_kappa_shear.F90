@@ -135,6 +135,13 @@ end type Kappa_shear_CS
 ! can run inside a target region (GPU port increment 3).
 !$omp declare target(kappa_shear_column, find_kappa_tke, calculate_projected_state)
 
+!> A compile-time ceiling on the number of layers in GPU builds, used to give the
+!! device-executed column routines and the driver's per-column private scratch fixed-size
+!! (stack) arrays instead of per-call device-heap automatic allocations, which exhaust the
+!! default device heap and serialize on the device allocator.  Checked against GV%ke in
+!! kappa_shear_init.  Unused in CPU builds, where the declarations keep their exact sizes.
+integer, parameter :: GPU_nk_max = 128
+
 contains
 
 !> Subroutine for calculating shear-driven diffusivity and TKE in tracer columns
@@ -504,7 +511,14 @@ subroutine Calc_kappa_shear_vertex(u_in, v_in, h, T_in, S_in, tv, p_surf, kappa_
     tke_3d      ! Device staging array for the columns' TKE [Z2 T-2 ~> m2 s-2].
   real, dimension(SZIB_(G),SZJB_(G)) :: &
     surface_pres_2d ! The surface pressure interpolated to vertices [R L2 T-2 ~> Pa].
+  ! In GPU builds the per-column private scratch has compile-time-constant sizes so each
+  ! device thread gets stack ("local memory") arrays; runtime-sized privates are device-heap
+  ! allocated per column, which exhausts the default heap and serializes on the allocator.
+#ifdef __NVCOMPILER_OPENMP_GPU
+  real, dimension(GPU_nk_max) :: &
+#else
   real, dimension(SZK_(GV)) :: &
+#endif
     Idz, &      ! The inverse of the thickness of the merged layers [H-1 ~> m2 kg-1].
     h_lay, &    ! The layer thickness [H ~> m or kg m-2]
     dz_lay, &   ! The geometric layer thickness in height units [Z ~> m]
@@ -512,7 +526,11 @@ subroutine Calc_kappa_shear_vertex(u_in, v_in, h, T_in, S_in, tv, p_surf, kappa_
     v0xdz, &    ! The initial meridional velocity times dz [H L T-1 ~> m2 s-1 or kg m-1 s-1]
     T0xdz, &    ! The initial temperature times dz [C H ~> degC m or degC kg m-2]
     S0xdz       ! The initial salinity times dz [S H ~> ppt m or ppt kg m-2]
+#ifdef __NVCOMPILER_OPENMP_GPU
+  real, dimension(GPU_nk_max+1) :: &
+#else
   real, dimension(SZK_(GV)+1) :: &
+#endif
     kappa, &    ! The shear-driven diapycnal diffusivity at an interface [H Z T-1 ~> m2 s-1 or Pa s]
     tke, &      ! The Turbulent Kinetic Energy per unit mass at an interface [Z2 T-2 ~> m2 s-2].
     kappa_avg, & ! The time-weighted average of kappa [H Z T-1 ~> m2 s-1 or Pa s]
@@ -533,10 +551,18 @@ subroutine Calc_kappa_shear_vertex(u_in, v_in, h, T_in, S_in, tv, p_surf, kappa_
   logical :: use_temperature  !  If true, temperature and salinity have been
                         ! allocated and are being used as state variables.
 
+#ifdef __NVCOMPILER_OPENMP_GPU
+  integer, dimension(GPU_nk_max+1) :: kc ! The index map between the original
+#else
   integer, dimension(SZK_(GV)+1) :: kc ! The index map between the original
+#endif
                         ! interfaces and the interfaces with massless layers
                         ! merged into nearby massive layers.
+#ifdef __NVCOMPILER_OPENMP_GPU
+  real, dimension(GPU_nk_max+1) :: kf ! The fractional weight of interface kc+1 for
+#else
   real, dimension(SZK_(GV)+1) :: kf ! The fractional weight of interface kc+1 for
+#endif
                         ! interpolating back to the original index space [nondim].
   real :: h_SW, h_SE, h_NW, h_NE ! Thicknesses at adjacent vertices [H ~> m or kg m-2]
   real :: mks_to_HZ_T   ! A factor used to restore dimensional scaling after the geometric mean
@@ -1041,7 +1067,14 @@ subroutine kappa_shear_column(kappa, tke, dt, nzc, f2, surface_pres, hlay, dz_la
                                            !! read of the tv%T pointer).
 
   ! Local variables
+  ! In GPU builds these locals have compile-time-constant sizes so each device call uses
+  ! stack ("local memory") arrays; runtime-sized automatics are device-heap allocated per
+  ! call, which exhausts the default heap and serializes on the device allocator.
+#ifdef __NVCOMPILER_OPENMP_GPU
+  real, dimension(GPU_nk_max) :: &
+#else
   real, dimension(nzc) :: &
+#endif
     u, &        ! The zonal velocity after a timestep of mixing [L T-1 ~> m s-1].
     v, &        ! The meridional velocity after a timestep of mixing [L T-1 ~> m s-1].
     Idz, &      ! The inverse of the distance between TKE points [Z-1 ~> m-1].
@@ -1050,7 +1083,11 @@ subroutine kappa_shear_column(kappa, tke, dt, nzc, f2, surface_pres, hlay, dz_la
     u_test, v_test, & ! Temporary velocities [L T-1 ~> m s-1].
     T_test, S_test ! Temporary temperatures [C ~> degC] and salinities [S ~> ppt].
 
+#ifdef __NVCOMPILER_OPENMP_GPU
+  real, dimension(GPU_nk_max+1) :: &
+#else
   real, dimension(nzc+1) :: &
+#endif
     N2, &       ! The squared buoyancy frequency at an interface [T-2 ~> s-2].
     h_Int, &    ! The extent of a finite-volume space surrounding an interface,
                 ! as used in calculating kappa and TKE [H ~> m or kg m-2]
@@ -1574,7 +1611,11 @@ subroutine calculate_projected_state(kappa, u0, v0, T0, S0, dt, nz, dz, I_dz_int
                                               !! diffusivity.
 
   ! Local variables
+#ifdef __NVCOMPILER_OPENMP_GPU
+  real, dimension(GPU_nk_max+1) :: c1 ! A tridiagonal variable [nondim]
+#else
   real, dimension(nz+1) :: c1 ! A tridiagonal variable [nondim]
+#endif
   real :: a_a, a_b   ! Tridiagonal coupling coefficients [H ~> m or kg m-2]
   real :: b1, b1nz_0 ! Tridiagonal variables [H-1 ~> m-1 or m2 kg-1]
   real :: bd1        ! A term in the denominator of b1 [H ~> m or kg m-2]
@@ -1707,10 +1748,18 @@ subroutine find_kappa_tke(N2, S2, kappa_in, Idz, h_Int, dz_Int, dz_h_Int, I_L2_b
   ! This subroutine calculates new, consistent estimates of TKE and kappa.
 
   ! Local variables
+#ifdef __NVCOMPILER_OPENMP_GPU
+  real, dimension(GPU_nk_max) :: &
+#else
   real, dimension(nz) :: &
+#endif
     aQ, &       ! aQ is the coupling between adjacent interfaces in the TKE equations [H T-1 ~> m s-1 or kg m-2 s-1]
     dQdz        ! Half the partial derivative of TKE with depth [Z T-2 ~> m s-2].
+#ifdef __NVCOMPILER_OPENMP_GPU
+  real, dimension(GPU_nk_max+1) :: &
+#else
   real, dimension(nz+1) :: &
+#endif
     dK, &         ! The change in kappa [H Z T-1 ~> m2 s-1 or Pa s].
     dQ, &         ! The change in TKE [Z2 T-2 ~> m2 s-2].
     cQ, cK, &     ! cQ and cK are the upward influences in the tridiagonal and
@@ -1788,7 +1837,11 @@ subroutine find_kappa_tke(N2, S2, kappa_in, Idz, h_Int, dz_Int, dz_h_Int, I_L2_b
   logical, parameter :: debug_soln = .false.
   real :: K_err_lin ! The imbalance in the K equation [H T-1 ~> m s-1 or kg m-2 s-1]
   real :: Q_err_lin ! The imbalance in the Q equation [H Z T-3 ~> m2 s-3 or kg m-1 s-3]
+#ifdef __NVCOMPILER_OPENMP_GPU
+  real, dimension(GPU_nk_max+1) :: &
+#else
   real, dimension(nz+1) :: &
+#endif
     I_Ld2_debug, & ! A separate version of I_Ld2 for debugging [H-1 Z-1 ~> m-2 or m kg-1].
     kappa_prev, & ! The value of kappa at the start of the current iteration [H Z T-1 ~> m2 s-1 or Pa s]
     TKE_prev   ! The value of TKE at the start of the current iteration [Z2 T-2 ~> m2 s-2].
@@ -2494,6 +2547,13 @@ function kappa_shear_init(Time, G, GV, US, param_file, diag, CS)
          'Interface stratification at horizontal tracer points, averaged ove timestep in kappa-shear', &
          's-2', conversion=US%s_to_T**2)
   endif
+
+#ifdef __NVCOMPILER_OPENMP_GPU
+  ! The device-executed column routines use fixed-size local arrays in GPU builds.
+  if (kappa_shear_init .and. (GV%ke > GPU_nk_max)) call MOM_error(FATAL, &
+    "kappa_shear_init: GPU builds of kappa_shear require GV%ke <= GPU_nk_max; "//&
+    "increase GPU_nk_max in MOM_kappa_shear.F90.")
+#endif
 
 end function kappa_shear_init
 
