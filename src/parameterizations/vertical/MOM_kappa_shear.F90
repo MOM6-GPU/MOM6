@@ -131,6 +131,10 @@ end type Kappa_shear_CS
 
 ! integer :: id_clock_project, id_clock_KQ, id_clock_avg, id_clock_setup
 
+! The per-column solver and its helpers are device-callable so the driver column loop
+! can run inside a target region (GPU port increment 3).
+!$omp declare target(kappa_shear_column, find_kappa_tke, calculate_projected_state)
+
 contains
 
 !> Subroutine for calculating shear-driven diffusivity and TKE in tracer columns
@@ -349,7 +353,8 @@ subroutine Calculate_kappa_shear(u_in, v_in, h, tv, p_surf, kappa_io, tke_io, &
                               h_lay, dz_lay, u0xdz, v0xdz, T0xdz, S0xdz, kappa_avg, &
                               tke_avg, N2_init, S2_init, N2_mean, S2_mean, &
                               tv, CS, GV, US, &
-                              eos_form, eos_kg_m3_to_R, eos_C_to_degC, eos_S_to_ppt, eos_RL2_T2_to_Pa)
+                              eos_form, eos_kg_m3_to_R, eos_C_to_degC, eos_S_to_ppt, eos_RL2_T2_to_Pa, &
+                              use_temperature)
 
     ! call cpu_clock_begin(id_clock_setup)
     ! Extrapolate from the vertically reduced grid back to the original layers.
@@ -749,7 +754,8 @@ subroutine Calc_kappa_shear_vertex(u_in, v_in, h, T_in, S_in, tv, p_surf, kappa_
       call kappa_shear_column(kappa, tke, dt, nzc, f2, surface_pres, &
                               h_lay, dz_lay, u0xdz, v0xdz, T0xdz, S0xdz, kappa_avg, &
                               tke_avg, N2_init, S2_init, N2_mean, S2_mean, tv, CS, GV, US, &
-                              eos_form, eos_kg_m3_to_R, eos_C_to_degC, eos_S_to_ppt, eos_RL2_T2_to_Pa)
+                              eos_form, eos_kg_m3_to_R, eos_C_to_degC, eos_S_to_ppt, eos_RL2_T2_to_Pa, &
+                              use_temperature)
     ! call cpu_clock_begin(Id_clock_setup)
     ! Extrapolate from the vertically reduced grid back to the original layers.
       if (nz == nzc) then
@@ -918,7 +924,8 @@ end subroutine Calc_kappa_shear_vertex
 subroutine kappa_shear_column(kappa, tke, dt, nzc, f2, surface_pres, hlay, dz_lay, &
                               u0xdz, v0xdz, T0xdz, S0xdz, kappa_avg, tke_avg, N2_init, S2_init, &
                               N2_mean, S2_mean, tv, CS, GV, US, &
-                              eos_form, eos_kg_m3_to_R, eos_C_to_degC, eos_S_to_ppt, eos_RL2_T2_to_Pa )
+                              eos_form, eos_kg_m3_to_R, eos_C_to_degC, eos_S_to_ppt, eos_RL2_T2_to_Pa, &
+                              use_temperature )
   type(verticalGrid_type), intent(in)    :: GV !< The ocean's vertical grid structure.
   real, dimension(SZK_(GV)+1), &
                      intent(inout) :: kappa !< The time-weighted average of kappa [H Z T-1 ~> m2 s-1 or Pa s]
@@ -957,8 +964,9 @@ subroutine kappa_shear_column(kappa, tke, dt, nzc, f2, surface_pres, hlay, dz_la
   type(thermo_var_ptrs),   intent(in)    :: tv !< A structure containing pointers to any
                                                !! available thermodynamic fields. Absent fields
                                                !! have NULL ptrs.
-  type(Kappa_shear_CS),    pointer       :: CS !< The control structure returned by a previous
-                                               !! call to kappa_shear_init.
+  type(Kappa_shear_CS),    intent(in)    :: CS !< The control structure returned by a previous
+                                               !! call to kappa_shear_init. Plain (not pointer) so
+                                               !! the routine is device-callable.
   type(unit_scale_type),   intent(in)    :: US !< A dimensional unit scaling type
   integer,                 intent(in)    :: eos_form !< The equation-of-state form id, resolved
                                            !! host-side for the device-callable EOS derivs path.
@@ -966,6 +974,9 @@ subroutine kappa_shear_column(kappa, tke, dt, nzc, f2, surface_pres, hlay, dz_la
   real,                    intent(in)    :: eos_C_to_degC !< EOS factor converting temperature to degC [degC C-1 ~> 1]
   real,                    intent(in)    :: eos_S_to_ppt !< EOS factor converting salinity to ppt [ppt S-1 ~> 1]
   real,                    intent(in)    :: eos_RL2_T2_to_Pa !< EOS factor converting pressure to Pa [Pa T2 R-1 L-2 ~> 1]
+  logical,                 intent(in)    :: use_temperature !< If true, temperature and salinity are
+                                           !! state variables (resolved host-side to avoid a device
+                                           !! read of the tv%T pointer).
 
   ! Local variables
   real, dimension(nzc) :: &
@@ -1055,8 +1066,6 @@ subroutine kappa_shear_column(kappa, tke, dt, nzc, f2, surface_pres, hlay, dz_la
   real :: k0dt          ! The background diffusivity times the timestep [H Z ~> m2 or kg m-1].
   real :: I_lz_rescale_sqr ! The inverse of a rescaling factor for L2_bdry (Lz) squared [nondim].
   logical :: valid_dt   ! If true, all levels so far exhibit acceptably small changes in k_src.
-  logical :: use_temperature  !  If true, temperature and salinity have been
-                        ! allocated and are being used as state variables.
   integer :: ks_kappa, ke_kappa  ! The k-range with nonzero kappas.
   integer :: dt_refinements ! The number of 2-fold refinements that will be used
                            ! to estimate the maximum permitted time step.  I.e.,
@@ -1083,7 +1092,6 @@ subroutine kappa_shear_column(kappa, tke, dt, nzc, f2, surface_pres, hlay, dz_la
   endif
   tol2 = 2.0*CS%kappa_tol_err
   dt_refinements = 5 ! Selected so that 1/2^dt_refinements < 1-tol_dksrc_low
-  use_temperature = .false. ; if (associated(tv%T)) use_temperature = .true.
 
 
   ! Set up Idz as the inverse of layer thicknesses.
@@ -1224,6 +1232,7 @@ subroutine kappa_shear_column(kappa, tke, dt, nzc, f2, surface_pres, hlay, dz_la
                                     tv%eqn_of_state, (/2,nzc/), scale=-g_R0 )
 #endif
     else
+#ifndef __NVCOMPILER_OPENMP_GPU
       ! These should perhaps be combined into a single call to calculate the thermal expansion
       ! and haline contraction coefficients?
       call calculate_specific_vol_derivs(T_int, Sal_int, pressure, dSpV_dT, dSpV_dS, &
@@ -1233,6 +1242,11 @@ subroutine kappa_shear_column(kappa, tke, dt, nzc, f2, surface_pres, hlay, dz_la
         dbuoy_dT(K) = GV%g_Earth_Z_T2 * (rho_int(K) * dSpV_dT(K))
         dbuoy_dS(K) = GV%g_Earth_Z_T2 * (rho_int(K) * dSpV_dS(K))
       enddo
+#else
+      ! The non-Boussinesq density-derivs path uses the polymorphic EOS interface, which is not
+      ! device-callable, and is excluded from device compilation. It is unreachable on GPU builds:
+      ! the driver FATALs on non-Boussinesq before the column solver runs.
+#endif
     endif
   elseif (GV%Boussinesq .or. GV%semi_Boussinesq) then
     do K=1,nzc+1 ; dbuoy_dT(K) = -g_R0 ; dbuoy_dS(K) = 0.0 ; enddo
@@ -1612,7 +1626,8 @@ subroutine find_kappa_tke(N2, S2, kappa_in, Idz, h_Int, dz_Int, dz_h_Int, I_L2_b
                                               !! boundaries [H-1 Z-1 ~> m-2 or m kg-1].
   real, dimension(nz),   intent(in)    :: Idz !< The inverse grid spacing of layers [Z-1 ~> m-1].
   real,                  intent(in)    :: f2  !< The squared Coriolis parameter [T-2 ~> s-2].
-  type(Kappa_shear_CS),  pointer       :: CS  !< A pointer to this module's control structure.
+  type(Kappa_shear_CS),  intent(in)    :: CS  !< This module's control structure (plain, not pointer,
+                                              !! so the routine is device-callable).
   type(verticalGrid_type), intent(in)  :: GV  !< The ocean's vertical grid structure.
   type(unit_scale_type), intent(in)    :: US  !< A dimensional unit scaling type
   real, dimension(nz+1), intent(inout) :: K_Q !< The shear-driven diapycnal diffusivity divided by
