@@ -19,6 +19,8 @@ use MOM_variables,         only : thermo_var_ptrs
 use MOM_verticalGrid,      only : verticalGrid_type
 use MOM_EOS,               only : calculate_density_derivs
 use MOM_EOS,               only : calculate_density, calculate_specific_vol_derivs
+use MOM_EOS,               only : calculate_density_derivs_elem_loc, get_EOS_form_and_scaling
+use MOM_EOS,               only : EOS_ROQUET_RHO, EOS_WRIGHT
 
 implicit none ; private
 
@@ -978,6 +980,12 @@ subroutine kappa_shear_column(kappa, tke, dt, nzc, f2, surface_pres, hlay, dz_la
   real :: gR0           ! A conversion factor from H to pressure, Rho_0 times g in Boussinesq
                         ! mode, or just g when non-Boussinesq [R L2 T-2 H-1 ~> kg m-2 s-2 or m s-2].
   real :: g_R0          ! g_R0 is a rescaled version of g/Rho [Z R-1 T-2 ~> m4 kg-1 s-2].
+#ifdef __NVCOMPILER_OPENMP_GPU
+  ! Locals for the device-callable EOS derivs path (reproduces calculate_density_derivs_1d).
+  integer :: eos_form   ! The equation-of-state form id.
+  real :: eos_kg_m3_to_R, eos_C_to_degC, eos_S_to_ppt, eos_RL2_T2_to_Pa ! EOS unit-rescaling factors.
+  real :: eos_rho_scale, dRdT_scale, dRdS_scale ! Output rescaling factors [various].
+#endif
   real :: Norm          ! A factor that normalizes two weights to 1 [H-2 ~> m-2 or m4 kg-2].
   real :: tol_dksrc     ! Tolerance for the change in the kappa source within an iteration
                         ! relative to the local source [nondim].  This must be greater than 1.
@@ -1141,8 +1149,40 @@ subroutine kappa_shear_column(kappa, tke, dt, nzc, f2, surface_pres, hlay, dz_la
       Sal_int(K) = 0.5*(Sal(k-1) + Sal(k))
     enddo
     if (GV%Boussinesq .or. GV%semi_Boussinesq) then
+#ifdef __NVCOMPILER_OPENMP_GPU
+      ! Device-callable EOS path: dispatch density derivatives by form id (host-resolved
+      ! scaling), reproducing calculate_density_derivs_1d(..., dom=(/2,nzc/), scale=-g_R0)
+      ! bit-for-bit. Needed because the polymorphic calculate_density_derivs interface is
+      ! not callable from inside the (soon-to-be-offloaded) column device region.
+      call get_EOS_form_and_scaling(tv%eqn_of_state, eos_form, eos_kg_m3_to_R, &
+                                    eos_C_to_degC, eos_S_to_ppt, eos_RL2_T2_to_Pa)
+      if ((eos_form /= EOS_ROQUET_RHO) .and. (eos_form /= EOS_WRIGHT)) call MOM_error(FATAL, &
+        "kappa_shear GPU build: EQN_OF_STATE has no device-callable density-derivs kernel "// &
+        "(only ROQUET_RHO and WRIGHT are supported); use a CPU build or add a _loc kernel.")
+      if ((eos_RL2_T2_to_Pa == 1.0) .and. (eos_C_to_degC == 1.0) .and. (eos_S_to_ppt == 1.0)) then
+        do K=2,nzc
+          call calculate_density_derivs_elem_loc(eos_form, T_int(K), Sal_int(K), pressure(K), &
+                                                 dbuoy_dT(K), dbuoy_dS(K))
+        enddo
+      else
+        do K=2,nzc
+          call calculate_density_derivs_elem_loc(eos_form, eos_C_to_degC*T_int(K), &
+                     eos_S_to_ppt*Sal_int(K), eos_RL2_T2_to_Pa*pressure(K), dbuoy_dT(K), dbuoy_dS(K))
+        enddo
+      endif
+      eos_rho_scale = eos_kg_m3_to_R * (-g_R0)
+      dRdT_scale = eos_rho_scale * eos_C_to_degC
+      dRdS_scale = eos_rho_scale * eos_S_to_ppt
+      if ((dRdT_scale /= 1.0) .or. (dRdS_scale /= 1.0)) then
+        do K=2,nzc
+          dbuoy_dT(K) = dRdT_scale * dbuoy_dT(K)
+          dbuoy_dS(K) = dRdS_scale * dbuoy_dS(K)
+        enddo
+      endif
+#else
       call calculate_density_derivs(T_int, Sal_int, pressure, dbuoy_dT, dbuoy_dS, &
                                     tv%eqn_of_state, (/2,nzc/), scale=-g_R0 )
+#endif
     else
       ! These should perhaps be combined into a single call to calculate the thermal expansion
       ! and haline contraction coefficients?
