@@ -665,13 +665,14 @@ subroutine Calc_kappa_shear_vertex(u_in, v_in, h, T_in, S_in, tv, p_surf, kappa_
   ! the device in one pass over J before the column loop.  The loop bodies are verbatim from the
   ! former per-J loops, except that I_hwt is inlined as a reciprocal multiply (bitwise-identical)
   ! and the temperature/salinity branch is hoisted out of the loop so each body is purely
-  ! elementwise.  u_in/v_in (the dycore u,v) and T_in/S_in (tv%T, tv%S) are already device-
-  ! resident but host-authoritative at this point in the (host-only) diabatic stack, so they
-  ! need an explicit refresh — a map(to:) on an already-present object does NOT copy.  dz_3d is
-  ! a fresh local each call, so its map(to:) does copy.  h_at_u/h_at_v are consumed on the
-  ! device here, so increment 1's copy-back is no longer needed.
+  ! elementwise.  u_in/v_in (the dycore u,v) are already device-resident but host-
+  ! authoritative at this point in the (host-only) diabatic stack, so they need an explicit
+  ! refresh — a map(to:) on an already-present object does NOT copy.  T_in/S_in (the caller's
+  ! convection-filtered T_f/S_f) and dz_3d are fresh host locals each call, so their map(to:)
+  ! does copy.  h_at_u/h_at_v are consumed on the device here, so increment 1's copy-back is
+  ! no longer needed.
   !$omp target enter data map(to: u_in, v_in, T_in, S_in, dz_3d)
-  !$omp target update to(u_in, v_in, T_in, S_in)
+  !$omp target update to(u_in, v_in)
   !$omp target enter data map(alloc: u_slab, v_slab, T_slab, S_slab, h_slab, dz_slab, rho_slab)
 
   ! Interpolate the various quantities to the corners, using masks.
@@ -728,6 +729,13 @@ subroutine Calc_kappa_shear_vertex(u_in, v_in, h, T_in, S_in, tv, p_surf, kappa_
   !$omp target enter data map(to: CS)
   !$omp target enter data map(to: surface_pres_2d)
   !$omp target enter data map(to: kappa_vertex, tke_io, kv_io)
+  ! kv_io's actual argument (visc%Kv_shear_Bu) is already persistently device-resident
+  ! (mapped in set_visc_init BEFORE the restart-reproducibility pass_var halo update), so the
+  ! map(to:) above does not copy it; without this refresh, the full-array update from below
+  ! would overwrite the corrected host halos with stale device values after a restart in
+  ! non-symmetric mode.  tke_io is not currently mapped elsewhere, but is refreshed too so
+  ! this routine does not silently depend on that staying true.
+  !$omp target update to(tke_io, kv_io)
   !$omp target enter data map(to: diag_N2_init, diag_S2_init, diag_N2_mean, diag_S2_mean)
   !$omp target enter data map(alloc: kappa_3d, tke_3d)
 
@@ -2551,8 +2559,10 @@ function kappa_shear_init(Time, G, GV, US, param_file, diag, CS)
 #ifdef __NVCOMPILER_OPENMP_GPU
   ! The device-executed column routines use fixed-size local arrays in GPU builds.
   if (kappa_shear_init .and. (GV%ke > GPU_nk_max)) call MOM_error(FATAL, &
-    "kappa_shear_init: GPU builds of kappa_shear require GV%ke <= GPU_nk_max; "//&
-    "increase GPU_nk_max in MOM_kappa_shear.F90.")
+    "kappa_shear_init: GPU builds of kappa_shear require GV%ke <= GPU_nk_max because the "//&
+    "column routines use fixed-size local arrays on the device (this applies to the "//&
+    "tracer-point scheme too, which shares those routines); increase GPU_nk_max in "//&
+    "MOM_kappa_shear.F90 or use a CPU build.")
 #endif
 
 end function kappa_shear_init
