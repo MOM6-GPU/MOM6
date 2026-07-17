@@ -494,11 +494,11 @@ subroutine Calc_kappa_shear_vertex(u_in, v_in, h, T_in, S_in, tv, p_surf, kappa_
     h_at_u          ! A mask-weighted thickness interpolated to u-points [H ~> m or kg m-2]
   real, dimension(SZI_(G),SZJB_(G),SZK_(GV)) :: &
     h_at_v          ! A mask-weighted thickness interpolated to v-points [H ~> m or kg m-2]
-  real, dimension(SZIB_(G),SZK_(GV)) :: &
-    h_2d, &             ! A 2-D version of h interpolated to vertices [H ~> m or kg m-2].
-    dz_2d, &            ! Vertical distance between interface heights [Z ~> m].
-    u_2d, v_2d, &       ! 2-D versions of u_in and v_in, converted to [L T-1 ~> m s-1].
-    T_2d, S_2d, rho_2d  ! 2-D versions of T [C ~> degC], S [S ~> ppt], and rho [R ~> kg m-3].
+  real, dimension(SZIB_(G),SZJB_(G),SZK_(GV)) :: &
+    h_slab, &           ! A version of h interpolated to vertices [H ~> m or kg m-2].
+    dz_slab, &          ! Vertical distance between interface heights at vertices [Z ~> m].
+    u_slab, v_slab, &   ! Versions of u_in and v_in interpolated to vertices [L T-1 ~> m s-1].
+    T_slab, S_slab, rho_slab ! Vertex versions of T [C ~> degC], S [S ~> ppt], and rho [R ~> kg m-3].
   real, dimension(SZIB_(G),SZK_(GV)+1) :: &
     kappa_2d    ! 2-D slice of kappa_vert [H Z T-1 ~> m2 s-1 or Pa s]
   real, dimension(SZIB_(G),SZK_(GV)+1) :: &
@@ -587,7 +587,7 @@ subroutine Calc_kappa_shear_vertex(u_in, v_in, h, T_in, S_in, tv, p_surf, kappa_
   ! --- GPU port increment 1: h_at_u/h_at_v interpolation offloaded to device.
   ! h is host-authoritative in the (host-only) diabatic stack; refresh the device copy.
   ! G%mask2dCu/Cv/T are already device-resident (mapped in initialize_MOM). h_at_u/h_at_v
-  ! are device workspace, copied back for the (still host) per-column loop below.
+  ! are device workspace, consumed on the device by the slab interpolation below.
   !$omp target enter data map(to: h)
   !$omp target update to(h)
   !$omp target enter data map(alloc: h_at_u, h_at_v)
@@ -613,51 +613,71 @@ subroutine Calc_kappa_shear_vertex(u_in, v_in, h, T_in, S_in, tv, p_surf, kappa_
     enddo
   endif
 
-  !$omp target update from(h_at_u, h_at_v)
+  ! --- GPU port increment 2: the per-J 2-D vertex slabs are promoted to 3-D arrays computed on
+  ! the device in one pass over J before the column loop.  The loop bodies are verbatim from the
+  ! former per-J loops, except that I_hwt is inlined as a reciprocal multiply (bitwise-identical)
+  ! and the temperature/salinity branch is hoisted out of the loop so each body is purely
+  ! elementwise.  u_in/v_in (the dycore u,v) and T_in/S_in (tv%T, tv%S) are already device-
+  ! resident but host-authoritative at this point in the (host-only) diabatic stack, so they
+  ! need an explicit refresh — a map(to:) on an already-present object does NOT copy.  dz_3d is
+  ! a fresh local each call, so its map(to:) does copy.  h_at_u/h_at_v are consumed on the
+  ! device here, so increment 1's copy-back is no longer needed.
+  !$omp target enter data map(to: u_in, v_in, T_in, S_in, dz_3d)
+  !$omp target update to(u_in, v_in, T_in, S_in)
+  !$omp target enter data map(alloc: u_slab, v_slab, T_slab, S_slab, h_slab, dz_slab, rho_slab)
 
+  ! Interpolate the various quantities to the corners, using masks.
+  do concurrent (k=1:nz, J=JsB:JeB, I=IsB:IeB)
+    u_slab(I,J,k) = ( (u_in(I,j,k) * h_at_u(I,j,k)) + (u_in(I,j+1,k) * h_at_u(I,j+1,k)) ) / &
+                    ( (h_at_u(I,j,k) + h_at_u(I,j+1,k)) + H_tiny )
+    v_slab(I,J,k) = ( (v_in(i,J,k) * h_at_v(i,J,k)) + (v_in(i+1,J,k) * h_at_v(i+1,J,k)) ) / &
+                    ( (h_at_v(i,J,k) + h_at_v(i+1,J,k)) + H_tiny )
+
+    h_slab(I,J,k) = ((G%mask2dT(i,j) * h(i,j,k) + G%mask2dT(i+1,j+1) * h(i+1,j+1,k)) + &
+                     (G%mask2dT(i+1,j) * h(i+1,j,k) + G%mask2dT(i,j+1) * h(i,j+1,k)) ) / &
+                    ((G%mask2dT(i,j) + G%mask2dT(i+1,j+1)) + &
+                     (G%mask2dT(i+1,j) + G%mask2dT(i,j+1)) + 1.0e-36 )
+    dz_slab(I,J,k) = ((G%mask2dT(i,j) * dz_3d(i,j,k) + G%mask2dT(i+1,j+1) * dz_3d(i+1,j+1,k)) + &
+                      (G%mask2dT(i+1,j) * dz_3d(i+1,j,k) + G%mask2dT(i,j+1) * dz_3d(i,j+1,k)) ) / &
+                     ((G%mask2dT(i,j) + G%mask2dT(i+1,j+1)) + &
+                      (G%mask2dT(i+1,j) + G%mask2dT(i,j+1)) + 1.0e-36 )
+!    h_slab(I,J,k) = 0.25*((h(i,j,k) + h(i+1,j+1,k)) + (h(i+1,j,k) + h(i,j+1,k)))
+!    h_slab(I,J,k) = (((h(i,j,k)**2) + (h(i+1,j+1,k)**2)) + &
+!                     ((h(i+1,j,k)**2) + (h(i,j+1,k)**2))) * I_hwt
+  enddo
+  if (use_temperature) then
+    do concurrent (k=1:nz, J=JsB:JeB, I=IsB:IeB)
+      T_slab(I,J,k) = ( (G%mask2dT(i,j) * (h(i,j,k) * T_in(i,j,k)) + &
+                         G%mask2dT(i+1,j+1) * (h(i+1,j+1,k) * T_in(i+1,j+1,k))) + &
+                        (G%mask2dT(i+1,j) * (h(i+1,j,k) * T_in(i+1,j,k)) + &
+                         G%mask2dT(i,j+1) * (h(i,j+1,k) * T_in(i,j+1,k))) ) * &
+                      (1.0 / (((G%mask2dT(i,j) * h(i,j,k) + G%mask2dT(i+1,j+1) * h(i+1,j+1,k)) + &
+                               (G%mask2dT(i+1,j) * h(i+1,j,k) + G%mask2dT(i,j+1) * h(i,j+1,k))) + &
+                              GV%H_subroundoff))
+      S_slab(I,J,k) = ( (G%mask2dT(i,j) * (h(i,j,k) * S_in(i,j,k)) + &
+                         G%mask2dT(i+1,j+1) * (h(i+1,j+1,k) * S_in(i+1,j+1,k))) + &
+                        (G%mask2dT(i+1,j) * (h(i+1,j,k) * S_in(i+1,j,k)) + &
+                         G%mask2dT(i,j+1) * (h(i,j+1,k) * S_in(i,j+1,k))) ) * &
+                      (1.0 / (((G%mask2dT(i,j) * h(i,j,k) + G%mask2dT(i+1,j+1) * h(i+1,j+1,k)) + &
+                               (G%mask2dT(i+1,j) * h(i+1,j,k) + G%mask2dT(i,j+1) * h(i,j+1,k))) + &
+                              GV%H_subroundoff))
+    enddo
+  else
+    do concurrent (k=1:nz, J=JsB:JeB, I=IsB:IeB)
+      rho_slab(I,J,k) = GV%Rlay(k)
+    enddo
+  endif
+
+  ! The slabs feed the (still host) per-column loop below; copy them back.
+  !$omp target update from(u_slab, v_slab, T_slab, S_slab, h_slab, dz_slab, rho_slab)
 
   !$OMP parallel do default(private) shared(jsB,jeB,isB,ieB,nz,h,u_in,v_in,T_in,S_in,h_at_u,h_at_v,dz_3d,H_tiny, &
   !$OMP                                     use_temperature,tv,G,GV,US,CS,kappa_io, &
+  !$OMP                                     u_slab,v_slab,T_slab,S_slab,h_slab,dz_slab,rho_slab, &
   !$OMP                                     dz_massless,k0dt,p_surf,dt,tke_io,kv_io,kappa_vertex,h_vert,I_Prandtl, &
   !$OMP                                     eos_form,eos_kg_m3_to_R,eos_C_to_degC,eos_S_to_ppt,eos_RL2_T2_to_Pa, &
   !$OMP                                     diag_N2_init,diag_S2_init,diag_N2_mean,diag_S2_mean)
   do J=JsB,JeB
-
-    ! Interpolate the various quantities to the corners, using masks.
-    do k=1,nz ; do I=IsB,IeB
-      u_2d(I,k) = ( (u_in(I,j,k) * h_at_u(I,j,k)) + (u_in(I,j+1,k) * h_at_u(I,j+1,k)) ) / &
-                  ( (h_at_u(I,j,k) + h_at_u(I,j+1,k)) + H_tiny )
-      v_2d(I,k) = ( (v_in(i,J,k) * h_at_v(i,J,k)) + (v_in(i+1,J,k) * h_at_v(i+1,J,k)) ) / &
-                  ( (h_at_v(i,J,k) + h_at_v(i+1,J,k)) + H_tiny )
-
-      I_hwt = 1.0 / (((G%mask2dT(i,j) * h(i,j,k) + G%mask2dT(i+1,j+1) * h(i+1,j+1,k)) + &
-                      (G%mask2dT(i+1,j) * h(i+1,j,k) + G%mask2dT(i,j+1) * h(i,j+1,k))) + &
-                     GV%H_subroundoff)
-      if (use_temperature) then
-        T_2d(I,k) = ( (G%mask2dT(i,j) * (h(i,j,k) * T_in(i,j,k)) + &
-                       G%mask2dT(i+1,j+1) * (h(i+1,j+1,k) * T_in(i+1,j+1,k))) + &
-                      (G%mask2dT(i+1,j) * (h(i+1,j,k) * T_in(i+1,j,k)) + &
-                       G%mask2dT(i,j+1) * (h(i,j+1,k) * T_in(i,j+1,k))) ) * I_hwt
-        S_2d(I,k) = ( (G%mask2dT(i,j) * (h(i,j,k) * S_in(i,j,k)) + &
-                       G%mask2dT(i+1,j+1) * (h(i+1,j+1,k) * S_in(i+1,j+1,k))) + &
-                      (G%mask2dT(i+1,j) * (h(i+1,j,k) * S_in(i+1,j,k)) + &
-                       G%mask2dT(i,j+1) * (h(i,j+1,k) * S_in(i,j+1,k))) ) * I_hwt
-      endif
-      h_2d(I,k) = ((G%mask2dT(i,j) * h(i,j,k) + G%mask2dT(i+1,j+1) * h(i+1,j+1,k)) + &
-                   (G%mask2dT(i+1,j) * h(i+1,j,k) + G%mask2dT(i,j+1) * h(i,j+1,k)) ) / &
-                  ((G%mask2dT(i,j) + G%mask2dT(i+1,j+1)) + &
-                   (G%mask2dT(i+1,j) + G%mask2dT(i,j+1)) + 1.0e-36 )
-      dz_2d(I,k) = ((G%mask2dT(i,j) * dz_3d(i,j,k) + G%mask2dT(i+1,j+1) * dz_3d(i+1,j+1,k)) + &
-                    (G%mask2dT(i+1,j) * dz_3d(i+1,j,k) + G%mask2dT(i,j+1) * dz_3d(i,j+1,k)) ) / &
-                   ((G%mask2dT(i,j) + G%mask2dT(i+1,j+1)) + &
-                    (G%mask2dT(i+1,j) + G%mask2dT(i,j+1)) + 1.0e-36 )
-!      h_2d(I,k) = 0.25*((h(i,j,k) + h(i+1,j+1,k)) + (h(i+1,j,k) + h(i,j+1,k)))
-!      h_2d(I,k) = (((h(i,j,k)**2) + (h(i+1,j+1,k)**2)) + &
-!                   ((h(i+1,j,k)**2) + (h(i,j+1,k)**2))) * I_hwt
-    enddo ; enddo
-    if (.not.use_temperature) then ; do k=1,nz ; do I=IsB,IeB
-      rho_2d(I,k) = GV%Rlay(k)
-    enddo ; enddo ; endif
 
 !---------------------------------------
 ! Work on each column.
@@ -675,25 +695,25 @@ subroutine Calc_kappa_shear_vertex(u_in, v_in, h, T_in, S_in, tv, p_surf, kappa_
           T0xdz(k) = 0.0 ; S0xdz(k) = 0.0
 
           ! Add a new layer if this one has mass.
-!          if ((h_lay(nzc) > 0.0) .and. (h_2d(I,k) > dz_massless)) nzc = nzc+1
+!          if ((h_lay(nzc) > 0.0) .and. (h_slab(I,J,k) > dz_massless)) nzc = nzc+1
           if ((k>CS%nkml) .and. (h_lay(nzc) > 0.0) .and. &
-              (h_2d(I,k) > dz_massless)) nzc = nzc+1
+              (h_slab(I,J,k) > dz_massless)) nzc = nzc+1
 
           ! Only merge clusters of massless layers.
 !         if ((h_lay(nzc) > dz_massless) .or. &
-!             ((h_lay(nzc) > 0.0) .and. (h_2d(I,k) > dz_massless))) nzc = nzc+1
+!             ((h_lay(nzc) > 0.0) .and. (h_slab(I,J,k) > dz_massless))) nzc = nzc+1
 
           kc(k) = nzc
-          h_lay(nzc) = h_lay(nzc) + h_2d(I,k)
-          dz_lay(nzc) = dz_lay(nzc) + dz_2d(I,k)
-          u0xdz(nzc) = u0xdz(nzc) + u_2d(I,k)*h_2d(I,k)
-          v0xdz(nzc) = v0xdz(nzc) + v_2d(I,k)*h_2d(I,k)
+          h_lay(nzc) = h_lay(nzc) + h_slab(I,J,k)
+          dz_lay(nzc) = dz_lay(nzc) + dz_slab(I,J,k)
+          u0xdz(nzc) = u0xdz(nzc) + u_slab(I,J,k)*h_slab(I,J,k)
+          v0xdz(nzc) = v0xdz(nzc) + v_slab(I,J,k)*h_slab(I,J,k)
           if (use_temperature) then
-            T0xdz(nzc) = T0xdz(nzc) + T_2d(I,k)*h_2d(I,k)
-            S0xdz(nzc) = S0xdz(nzc) + S_2d(I,k)*h_2d(I,k)
+            T0xdz(nzc) = T0xdz(nzc) + T_slab(I,J,k)*h_slab(I,J,k)
+            S0xdz(nzc) = S0xdz(nzc) + S_slab(I,J,k)*h_slab(I,J,k)
           else
-            T0xdz(nzc) = T0xdz(nzc) + rho_2d(I,k)*h_2d(I,k)
-            S0xdz(nzc) = S0xdz(nzc) + rho_2d(I,k)*h_2d(I,k)
+            T0xdz(nzc) = T0xdz(nzc) + rho_slab(I,J,k)*h_slab(I,J,k)
+            S0xdz(nzc) = S0xdz(nzc) + rho_slab(I,J,k)*h_slab(I,J,k)
           endif
         enddo
         kc(nz+1) = nzc+1
@@ -703,28 +723,28 @@ subroutine Calc_kappa_shear_vertex(u_in, v_in, h, T_in, S_in, tv, p_surf, kappa_
 
         !   Now determine kf, the fractional weight of interface kc when
         ! interpolating between interfaces kc and kc+1.
-        kf(1) = 0.0 ; dz_in_lay = h_2d(I,1)
+        kf(1) = 0.0 ; dz_in_lay = h_slab(I,J,1)
         do k=2,nz
           if (kc(k) > kc(k-1)) then
-            kf(k) = 0.0 ; dz_in_lay = h_2d(I,k)
+            kf(k) = 0.0 ; dz_in_lay = h_slab(I,J,k)
           else
-            kf(k) = dz_in_lay*Idz(kc(k)) ; dz_in_lay = dz_in_lay + h_2d(I,k)
+            kf(k) = dz_in_lay*Idz(kc(k)) ; dz_in_lay = dz_in_lay + h_slab(I,J,k)
           endif
         enddo
         kf(nz+1) = 0.0
       else
         do k=1,nz
-          h_lay(k) = h_2d(I,k)
-          dz_lay(k) = dz_2d(I,k)
-          u0xdz(k) = u_2d(I,k)*h_lay(k) ; v0xdz(k) = v_2d(I,k)*h_lay(k)
+          h_lay(k) = h_slab(I,J,k)
+          dz_lay(k) = dz_slab(I,J,k)
+          u0xdz(k) = u_slab(I,J,k)*h_lay(k) ; v0xdz(k) = v_slab(I,J,k)*h_lay(k)
         enddo
         if (use_temperature) then
           do k=1,nz
-            T0xdz(k) = T_2d(I,k)*h_lay(k) ; S0xdz(k) = S_2d(I,k)*h_lay(k)
+            T0xdz(k) = T_slab(I,J,k)*h_lay(k) ; S0xdz(k) = S_slab(I,J,k)*h_lay(k)
           enddo
         else
           do k=1,nz
-            T0xdz(k) = rho_2d(I,k)*h_lay(k) ; S0xdz(k) = rho_2d(I,k)*h_lay(k)
+            T0xdz(k) = rho_slab(I,J,k)*h_lay(k) ; S0xdz(k) = rho_slab(I,J,k)*h_lay(k)
           enddo
         endif
         nzc = nz
@@ -817,7 +837,7 @@ subroutine Calc_kappa_shear_vertex(u_in, v_in, h, T_in, S_in, tv, p_surf, kappa_
     ! Store the 2-d slices back in the 3-d arrays for restarts or interpolation back to tracer points.
     if (CS%VS_ThicknessMean) then
       do K=1,nz+1 ; do I=IsB,IeB
-        h_vert(I,J,k) = h_2d(I,k)
+        h_vert(I,J,k) = h_slab(I,J,k)
       enddo ; enddo
     endif
     if (CS%VS_viscosity_bug) then
@@ -913,7 +933,9 @@ subroutine Calc_kappa_shear_vertex(u_in, v_in, h, T_in, S_in, tv, p_surf, kappa_
   if (CS%id_N2_mean > 0) call post_data(CS%id_N2_mean, diag_N2_mean, CS%diag)
   if (CS%id_S2_mean > 0) call post_data(CS%id_S2_mean, diag_S2_mean, CS%diag)
 
-  ! --- GPU port increment 1: mirror the enter-data above (balance discipline).
+  ! --- GPU port increments 1+2: mirror the enter-data above (balance discipline).
+  !$omp target exit data map(release: u_slab, v_slab, T_slab, S_slab, h_slab, dz_slab, rho_slab)
+  !$omp target exit data map(release: u_in, v_in, T_in, S_in, dz_3d)
   !$omp target exit data map(release: h_at_u, h_at_v)
   !$omp target exit data map(release: h)
 
