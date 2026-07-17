@@ -214,10 +214,28 @@ subroutine Calculate_kappa_shear(u_in, v_in, h, tv, p_surf, kappa_io, tke_io, &
   real, dimension(SZK_(GV)+1) :: kf ! The fractional weight of interface kc+1 for
                         ! interpolating back to the original index space [nondim].
   integer :: is, ie, js, je, i, j, k, nz, nzc
+  integer :: eos_form   ! The equation-of-state form id, resolved host-side for the GPU EOS path.
+  real :: eos_kg_m3_to_R, eos_C_to_degC, eos_S_to_ppt, eos_RL2_T2_to_Pa ! EOS unit-rescaling factors.
 
   is = G%isc ; ie = G%iec ; js = G%jsc ; je = G%jec ; nz = GV%ke
 
   use_temperature = associated(tv%T)
+
+  ! GPU port increment 3a: resolve the EOS form + unit scaling once on the host (the accessor
+  ! and MOM_error are not device-callable) so they can be passed into the column solver.
+  eos_form = -1
+  eos_kg_m3_to_R = 1.0 ; eos_C_to_degC = 1.0 ; eos_S_to_ppt = 1.0 ; eos_RL2_T2_to_Pa = 1.0
+  if (use_temperature) then
+    call get_EOS_form_and_scaling(tv%eqn_of_state, eos_form, eos_kg_m3_to_R, &
+                                  eos_C_to_degC, eos_S_to_ppt, eos_RL2_T2_to_Pa)
+#ifdef __NVCOMPILER_OPENMP_GPU
+    if ((eos_form /= EOS_ROQUET_RHO) .and. (eos_form /= EOS_WRIGHT)) call MOM_error(FATAL, &
+      "kappa_shear GPU build: EQN_OF_STATE has no device-callable density-derivs kernel "// &
+      "(only ROQUET_RHO and WRIGHT are supported); use a CPU build or add a _loc kernel.")
+    if (.not. (GV%Boussinesq .or. GV%semi_Boussinesq)) call MOM_error(FATAL, &
+      "kappa_shear GPU build: the non-Boussinesq density-derivs path is not device-callable.")
+#endif
+  endif
 
   k0dt = dt*CS%kappa_0
   dz_massless = 0.1*sqrt((US%Z_to_m*GV%m_to_H)*k0dt)
@@ -229,6 +247,7 @@ subroutine Calculate_kappa_shear(u_in, v_in, h, tv, p_surf, kappa_io, tke_io, &
 
   !$OMP parallel do default(private) shared(js,je,is,ie,nz,h,u_in,v_in,use_temperature,tv,G,GV,US, &
   !$OMP                                     CS,kappa_io,dz_massless,k0dt,p_surf,dt,tke_io,kv_io, &
+  !$OMP                                     eos_form,eos_kg_m3_to_R,eos_C_to_degC,eos_S_to_ppt,eos_RL2_T2_to_Pa, &
   !$OMP                                     diag_N2_init,diag_S2_init,diag_N2_mean,diag_S2_mean)
   do j=js,je
 
@@ -329,7 +348,8 @@ subroutine Calculate_kappa_shear(u_in, v_in, h, tv, p_surf, kappa_io, tke_io, &
       call kappa_shear_column(kappa, tke, dt, nzc, f2, surface_pres, &
                               h_lay, dz_lay, u0xdz, v0xdz, T0xdz, S0xdz, kappa_avg, &
                               tke_avg, N2_init, S2_init, N2_mean, S2_mean, &
-                              tv, CS, GV, US)
+                              tv, CS, GV, US, &
+                              eos_form, eos_kg_m3_to_R, eos_C_to_degC, eos_S_to_ppt, eos_RL2_T2_to_Pa)
 
     ! call cpu_clock_begin(id_clock_setup)
     ! Extrapolate from the vertically reduced grid back to the original layers.
@@ -520,6 +540,8 @@ subroutine Calc_kappa_shear_vertex(u_in, v_in, h, T_in, S_in, tv, p_surf, kappa_
   real :: H_tiny        ! A sub-roundoff thickness to use in the denominator when calculating
                         ! thickness-weighted averages [H ~> m or kg m-2]
   integer :: IsB, IeB, JsB, JeB, i, j, k, nz, nzc
+  integer :: eos_form   ! The equation-of-state form id, resolved host-side for the GPU EOS path.
+  real :: eos_kg_m3_to_R, eos_C_to_degC, eos_S_to_ppt, eos_RL2_T2_to_Pa ! EOS unit-rescaling factors.
 
   ! Diagnostics that should be deleted?
   isB = G%isc-1 ; ieB = G%iecB ; jsB = G%jsc-1 ; jeB = G%jecB ; nz = GV%ke
@@ -531,6 +553,23 @@ subroutine Calc_kappa_shear_vertex(u_in, v_in, h, T_in, S_in, tv, p_surf, kappa_
   kappa_vertex(:,:,:) = 0.0
 
   use_temperature = associated(tv%T)
+
+  ! GPU port increment 3a: resolve the EOS form + unit scaling once on the host (the accessor
+  ! and MOM_error are not device-callable) so they can be passed into the column solver, which
+  ! will run inside a device region.
+  eos_form = -1
+  eos_kg_m3_to_R = 1.0 ; eos_C_to_degC = 1.0 ; eos_S_to_ppt = 1.0 ; eos_RL2_T2_to_Pa = 1.0
+  if (use_temperature) then
+    call get_EOS_form_and_scaling(tv%eqn_of_state, eos_form, eos_kg_m3_to_R, &
+                                  eos_C_to_degC, eos_S_to_ppt, eos_RL2_T2_to_Pa)
+#ifdef __NVCOMPILER_OPENMP_GPU
+    if ((eos_form /= EOS_ROQUET_RHO) .and. (eos_form /= EOS_WRIGHT)) call MOM_error(FATAL, &
+      "kappa_shear GPU build: EQN_OF_STATE has no device-callable density-derivs kernel "// &
+      "(only ROQUET_RHO and WRIGHT are supported); use a CPU build or add a _loc kernel.")
+    if (.not. (GV%Boussinesq .or. GV%semi_Boussinesq)) call MOM_error(FATAL, &
+      "kappa_shear GPU build: the non-Boussinesq density-derivs path is not device-callable.")
+#endif
+  endif
 
   k0dt =  dt*CS%kappa_0
   dz_massless = 0.1*sqrt((US%Z_to_m*GV%m_to_H)*k0dt)
@@ -575,6 +614,7 @@ subroutine Calc_kappa_shear_vertex(u_in, v_in, h, T_in, S_in, tv, p_surf, kappa_
   !$OMP parallel do default(private) shared(jsB,jeB,isB,ieB,nz,h,u_in,v_in,T_in,S_in,h_at_u,h_at_v,dz_3d,H_tiny, &
   !$OMP                                     use_temperature,tv,G,GV,US,CS,kappa_io, &
   !$OMP                                     dz_massless,k0dt,p_surf,dt,tke_io,kv_io,kappa_vertex,h_vert,I_Prandtl, &
+  !$OMP                                     eos_form,eos_kg_m3_to_R,eos_C_to_degC,eos_S_to_ppt,eos_RL2_T2_to_Pa, &
   !$OMP                                     diag_N2_init,diag_S2_init,diag_N2_mean,diag_S2_mean)
   do J=JsB,JeB
 
@@ -708,7 +748,8 @@ subroutine Calc_kappa_shear_vertex(u_in, v_in, h, T_in, S_in, tv, p_surf, kappa_
 
       call kappa_shear_column(kappa, tke, dt, nzc, f2, surface_pres, &
                               h_lay, dz_lay, u0xdz, v0xdz, T0xdz, S0xdz, kappa_avg, &
-                              tke_avg, N2_init, S2_init, N2_mean, S2_mean, tv, CS, GV, US)
+                              tke_avg, N2_init, S2_init, N2_mean, S2_mean, tv, CS, GV, US, &
+                              eos_form, eos_kg_m3_to_R, eos_C_to_degC, eos_S_to_ppt, eos_RL2_T2_to_Pa)
     ! call cpu_clock_begin(Id_clock_setup)
     ! Extrapolate from the vertically reduced grid back to the original layers.
       if (nz == nzc) then
@@ -876,7 +917,8 @@ end subroutine Calc_kappa_shear_vertex
 !> This subroutine calculates shear-driven diffusivity and TKE in a single column
 subroutine kappa_shear_column(kappa, tke, dt, nzc, f2, surface_pres, hlay, dz_lay, &
                               u0xdz, v0xdz, T0xdz, S0xdz, kappa_avg, tke_avg, N2_init, S2_init, &
-                              N2_mean, S2_mean, tv, CS, GV, US )
+                              N2_mean, S2_mean, tv, CS, GV, US, &
+                              eos_form, eos_kg_m3_to_R, eos_C_to_degC, eos_S_to_ppt, eos_RL2_T2_to_Pa )
   type(verticalGrid_type), intent(in)    :: GV !< The ocean's vertical grid structure.
   real, dimension(SZK_(GV)+1), &
                      intent(inout) :: kappa !< The time-weighted average of kappa [H Z T-1 ~> m2 s-1 or Pa s]
@@ -918,6 +960,12 @@ subroutine kappa_shear_column(kappa, tke, dt, nzc, f2, surface_pres, hlay, dz_la
   type(Kappa_shear_CS),    pointer       :: CS !< The control structure returned by a previous
                                                !! call to kappa_shear_init.
   type(unit_scale_type),   intent(in)    :: US !< A dimensional unit scaling type
+  integer,                 intent(in)    :: eos_form !< The equation-of-state form id, resolved
+                                           !! host-side for the device-callable EOS derivs path.
+  real,                    intent(in)    :: eos_kg_m3_to_R !< EOS factor converting kg m-3 to R [R m3 kg-1 ~> 1]
+  real,                    intent(in)    :: eos_C_to_degC !< EOS factor converting temperature to degC [degC C-1 ~> 1]
+  real,                    intent(in)    :: eos_S_to_ppt !< EOS factor converting salinity to ppt [ppt S-1 ~> 1]
+  real,                    intent(in)    :: eos_RL2_T2_to_Pa !< EOS factor converting pressure to Pa [Pa T2 R-1 L-2 ~> 1]
 
   ! Local variables
   real, dimension(nzc) :: &
@@ -981,9 +1029,7 @@ subroutine kappa_shear_column(kappa, tke, dt, nzc, f2, surface_pres, hlay, dz_la
                         ! mode, or just g when non-Boussinesq [R L2 T-2 H-1 ~> kg m-2 s-2 or m s-2].
   real :: g_R0          ! g_R0 is a rescaled version of g/Rho [Z R-1 T-2 ~> m4 kg-1 s-2].
 #ifdef __NVCOMPILER_OPENMP_GPU
-  ! Locals for the device-callable EOS derivs path (reproduces calculate_density_derivs_1d).
-  integer :: eos_form   ! The equation-of-state form id.
-  real :: eos_kg_m3_to_R, eos_C_to_degC, eos_S_to_ppt, eos_RL2_T2_to_Pa ! EOS unit-rescaling factors.
+  ! Locals for the device-callable EOS derivs path (form + scaling are passed in as arguments).
   real :: eos_rho_scale, dRdT_scale, dRdS_scale ! Output rescaling factors [various].
 #endif
   real :: Norm          ! A factor that normalizes two weights to 1 [H-2 ~> m-2 or m4 kg-2].
@@ -1150,15 +1196,9 @@ subroutine kappa_shear_column(kappa, tke, dt, nzc, f2, surface_pres, hlay, dz_la
     enddo
     if (GV%Boussinesq .or. GV%semi_Boussinesq) then
 #ifdef __NVCOMPILER_OPENMP_GPU
-      ! Device-callable EOS path: dispatch density derivatives by form id (host-resolved
-      ! scaling), reproducing calculate_density_derivs_1d(..., dom=(/2,nzc/), scale=-g_R0)
-      ! bit-for-bit. Needed because the polymorphic calculate_density_derivs interface is
-      ! not callable from inside the (soon-to-be-offloaded) column device region.
-      call get_EOS_form_and_scaling(tv%eqn_of_state, eos_form, eos_kg_m3_to_R, &
-                                    eos_C_to_degC, eos_S_to_ppt, eos_RL2_T2_to_Pa)
-      if ((eos_form /= EOS_ROQUET_RHO) .and. (eos_form /= EOS_WRIGHT)) call MOM_error(FATAL, &
-        "kappa_shear GPU build: EQN_OF_STATE has no device-callable density-derivs kernel "// &
-        "(only ROQUET_RHO and WRIGHT are supported); use a CPU build or add a _loc kernel.")
+      ! Device-callable EOS path: dispatch density derivatives by form id (form + unit scaling
+      ! resolved host-side in the driver and passed in), reproducing
+      ! calculate_density_derivs_1d(..., dom=(/2,nzc/), scale=-g_R0) bit-for-bit.
       if ((eos_RL2_T2_to_Pa == 1.0) .and. (eos_C_to_degC == 1.0) .and. (eos_S_to_ppt == 1.0)) then
         do K=2,nzc
           call calculate_density_derivs_elem_loc(eos_form, T_int(K), Sal_int(K), pressure(K), &
