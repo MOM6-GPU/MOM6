@@ -538,32 +538,36 @@ subroutine Calc_kappa_shear_vertex(u_in, v_in, h, T_in, S_in, tv, p_surf, kappa_
   ! Convert layer thicknesses into geometric thickness in height units.
   call thickness_to_dz(h, tv, dz_3d, G, GV, US, halo_size=1)
 
+  ! --- GPU port increment 1: h_at_u/h_at_v interpolation offloaded to device.
+  ! h is host-authoritative in the (host-only) diabatic stack; refresh the device copy.
+  ! G%mask2dCu/Cv/T are already device-resident (mapped in initialize_MOM). h_at_u/h_at_v
+  ! are device workspace, copied back for the (still host) per-column loop below.
+  !$omp target enter data map(to: h)
+  !$omp target update to(h)
+  !$omp target enter data map(alloc: h_at_u, h_at_v)
+
   if (CS%vertex_shear_OBC_bug) then
-    !$OMP parallel do default(shared)
-    do k=1,nz
-      do j=JsB,JeB+1 ; do I=IsB,IeB
-        h_at_u(I,j,k) = G%mask2dCu(I,j) * (h(i,j,k) + h(i+1,j,k)) * 0.5
-      enddo ; enddo
-      do J=JsB,JeB ; do i=IsB,IeB+1
-        h_at_v(i,J,k) = G%mask2dCv(i,J) * (h(i,j,k) + h(i,j+1,k)) * 0.5
-      enddo ; enddo
+    do concurrent (k=1:nz, j=JsB:JeB+1, I=IsB:IeB)
+      h_at_u(I,j,k) = G%mask2dCu(I,j) * (h(i,j,k) + h(i+1,j,k)) * 0.5
+    enddo
+    do concurrent (k=1:nz, J=JsB:JeB, i=IsB:IeB+1)
+      h_at_v(i,J,k) = G%mask2dCv(i,J) * (h(i,j,k) + h(i,j+1,k)) * 0.5
     enddo
   else
     ! Because G%mask2dCu(I,j) is zero if either G%mask2dT(i,j) or G%mask2dT(i+1,j) except at OBC
     ! faces, the following form give equivalent answers to those above unless OBCs are in use,
     ! although the former is clearly less complicated and costly.
-    !$OMP parallel do default(shared)
-    do k=1,nz
-      do j=JsB,JeB+1 ; do I=IsB,IeB
-        h_at_u(I,j,k) = G%mask2dCu(I,j) * (G%mask2dT(i,j) * h(i,j,k) + G%mask2dT(i+1,j) * h(i+1,j,k)) / &
-                                          (G%mask2dT(i,j) + G%mask2dT(i+1,j) + 1.0e-36)
-      enddo ; enddo
-      do J=JsB,JeB ; do i=IsB,IeB+1
-        h_at_v(i,J,k) = G%mask2dCv(i,J) * (G%mask2dT(i,j) * h(i,j,k) + G%mask2dT(i,j+1) * h(i,j+1,k)) / &
-                                          (G%mask2dT(i,j) + G%mask2dT(i,j+1) + 1.0e-36)
-      enddo ; enddo
+    do concurrent (k=1:nz, j=JsB:JeB+1, I=IsB:IeB)
+      h_at_u(I,j,k) = G%mask2dCu(I,j) * (G%mask2dT(i,j) * h(i,j,k) + G%mask2dT(i+1,j) * h(i+1,j,k)) / &
+                                        (G%mask2dT(i,j) + G%mask2dT(i+1,j) + 1.0e-36)
+    enddo
+    do concurrent (k=1:nz, J=JsB:JeB, i=IsB:IeB+1)
+      h_at_v(i,J,k) = G%mask2dCv(i,J) * (G%mask2dT(i,j) * h(i,j,k) + G%mask2dT(i,j+1) * h(i,j+1,k)) / &
+                                        (G%mask2dT(i,j) + G%mask2dT(i,j+1) + 1.0e-36)
     enddo
   endif
+
+  !$omp target update from(h_at_u, h_at_v)
 
 
   !$OMP parallel do default(private) shared(jsB,jeB,isB,ieB,nz,h,u_in,v_in,T_in,S_in,h_at_u,h_at_v,dz_3d,H_tiny, &
@@ -859,6 +863,10 @@ subroutine Calc_kappa_shear_vertex(u_in, v_in, h, T_in, S_in, tv, p_surf, kappa_
   if (CS%id_S2_init > 0) call post_data(CS%id_S2_init, diag_S2_init, CS%diag)
   if (CS%id_N2_mean > 0) call post_data(CS%id_N2_mean, diag_N2_mean, CS%diag)
   if (CS%id_S2_mean > 0) call post_data(CS%id_S2_mean, diag_S2_mean, CS%diag)
+
+  ! --- GPU port increment 1: mirror the enter-data above (balance discipline).
+  !$omp target exit data map(release: h_at_u, h_at_v)
+  !$omp target exit data map(release: h)
 
 end subroutine Calc_kappa_shear_vertex
 
