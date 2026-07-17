@@ -541,27 +541,35 @@ def html_slug(rel_path):
     return re.sub(r'[^A-Za-z0-9_.-]', '_', str(rel_path).replace('/', '__')) + '.html'
 
 
+def classify_line(lineno, count, fr):
+    """One source line's port/coverage status: (state, count_marker).
+
+    `state` is one of 'nodata' (not executable / no coverage data), 'nothit'
+    (executable, not exercised by this run), 'ported', 'portable' (portable,
+    not yet ported), or 'executed' (executed, not portable). Shared by the
+    HTML renderer and the TUI so the two can't silently drift apart on what
+    each state means.
+    """
+    if count is None:
+        return 'nodata', ''
+    if count == 0:
+        return 'nothit', '0'
+    if lineno in fr.ported:
+        return 'ported', str(count)
+    if lineno in fr.portable:
+        return 'portable', str(count)
+    return 'executed', str(count)
+
+
 def render_file_html(rel_path, resolved, counts, fr):
     """Render one source file as an lcov-style line-by-line coverage/port-status page."""
     try:
         lines = resolved.read_text(errors='replace').splitlines()
     except OSError:
         lines = []
-    ported_all = fr.ported
-    portable = fr.portable
     rows = []
     for lineno, text in enumerate(lines, start=1):
-        count = counts.get(lineno)
-        if count is None:
-            cls, marker = 'nodata', ''
-        elif count == 0:
-            cls, marker = 'nothit', '0'
-        elif lineno in ported_all:
-            cls, marker = 'ported', str(count)
-        elif lineno in portable:
-            cls, marker = 'portable', str(count)
-        else:
-            cls, marker = 'executed', str(count)
+        cls, marker = classify_line(lineno, counts.get(lineno), fr)
         rows.append(f'<tr class="{cls}"><td class="ln">{lineno}</td><td class="cnt">{marker}</td>'
                      f'<td class="src">{html.escape(text)}</td></tr>')
     title = html.escape(str(rel_path))
