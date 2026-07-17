@@ -9,6 +9,7 @@ use MOM_EOS_base_type, only : EOS_base
 use MOM_EOS_linear, only : linear_EOS, avg_spec_vol_linear
 use MOM_EOS_linear, only : int_density_dz_linear, int_spec_vol_dp_linear
 use MOM_EOS_Wright, only : buggy_Wright_EOS, avg_spec_vol_buggy_Wright
+use MOM_EOS_Wright, only : calculate_density_derivs_elem_buggy_Wright_loc
 use MOM_EOS_Wright, only : int_density_dz_wright, int_spec_vol_dp_wright
 use MOM_EOS_Wright_full, only : Wright_full_EOS, avg_spec_vol_Wright_full
 use MOM_EOS_Wright_full, only : int_density_dz_wright_full, int_spec_vol_dp_wright_full
@@ -17,6 +18,7 @@ use MOM_EOS_Wright_red,  only : int_density_dz_wright_red, int_spec_vol_dp_wrigh
 use MOM_EOS_Jackett06, only : Jackett06_EOS
 use MOM_EOS_UNESCO, only : UNESCO_EOS
 use MOM_EOS_Roquet_rho, only : Roquet_rho_EOS
+use MOM_EOS_Roquet_rho, only : calculate_density_derivs_elem_Roquet_rho_loc
 use MOM_EOS_Roquet_SpV, only : Roquet_SpV_EOS
 use MOM_EOS_TEOS10, only : TEOS10_EOS
 use MOM_EOS_TEOS10, only : gsw_sp_from_sr, gsw_pt_from_ct, gsw_sr_from_sp, gsw_ct_from_pt
@@ -46,6 +48,7 @@ public calculate_compress
 public calculate_density_elem
 public calculate_density
 public calculate_density_derivs
+public calculate_density_derivs_elem_loc
 public calculate_density_second_derivs
 public calculate_spec_vol
 public calculate_specific_vol_derivs
@@ -892,6 +895,33 @@ subroutine calculate_density_derivs_1d(T, S, pressure, drho_dT, drho_dS, EOS, do
   enddo ; endif
 
 end subroutine calculate_density_derivs_1d
+
+!> Device-callable dispatcher for density derivatives at a single point, in mks units,
+!! selecting the equation-of-state form at runtime by integer id (no polymorphic dispatch)
+!! so it can be called from inside a do concurrent / target region by whole-column GPU
+!! kernels. Unit rescaling (EOS%*_to_* factors) and any `scale` factor are the caller's
+!! responsibility, exactly as in calculate_density_derivs_1d. Forms without a device-callable
+!! _loc kernel are not handled here; a device-using module must FATAL at init on a GPU build
+!! before reaching this with an unsupported form.
+subroutine calculate_density_derivs_elem_loc(form_of_EOS, T, S, pressure, drho_dT, drho_dS)
+  integer, intent(in)  :: form_of_EOS !< The equation of state form (EOS_ROQUET_RHO, EOS_WRIGHT, ...)
+  real,    intent(in)  :: T           !< Temperature in the EOS kernel's mks units [degC]
+  real,    intent(in)  :: S           !< Salinity in the EOS kernel's mks units [ppt or g kg-1]
+  real,    intent(in)  :: pressure    !< Pressure [Pa]
+  real,    intent(out) :: drho_dT     !< Partial derivative of density wrt temperature [kg m-3 degC-1]
+  real,    intent(out) :: drho_dS     !< Partial derivative of density wrt salinity [kg m-3 ppt-1]
+  !$omp declare target
+
+  select case (form_of_EOS)
+    case (EOS_ROQUET_RHO)
+      call calculate_density_derivs_elem_Roquet_rho_loc(T, S, pressure, drho_dT, drho_dS)
+    case (EOS_WRIGHT)
+      call calculate_density_derivs_elem_buggy_Wright_loc(T, S, pressure, drho_dT, drho_dS)
+    case default
+      drho_dT = 0.0 ; drho_dS = 0.0
+  end select
+
+end subroutine calculate_density_derivs_elem_loc
 
 
 !> Calls the appropriate subroutine to calculate density derivatives for 1-D array inputs.
