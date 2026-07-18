@@ -541,10 +541,14 @@ subroutine int_density_dz_generic_plm(k, tv, T_t, T_b, S_t, S_b, e, rho_ref, &
                         ! fast path of calculate_density_1d.
   logical :: do_intz    ! present(intz_dpa), hoisted host-side for use inside the device region.
   logical :: offload_phase1 ! True on GPU builds when phase 1 (vertical integrals) runs on device.
+  logical :: offload_phase2, offload_phase3 ! True on GPU builds when phases 2/3 (x/y integrals) run on device.
   integer :: n15        ! A subgrid-point loop index over the 15 q-point slots in a column.
   real :: T5l(5), S5l(5), p5l(5), r5l(5) ! Per-(i,j) size-5 quadrature locals for the device phase-1
                         ! kernel (compile-time sized to avoid device auto-allocation).
   real :: dz_l          ! A per-(i,j) layer thickness for the device phase-1 kernel [Z ~> m].
+  real :: T15l(15), S15l(15), p15l(15), r15l(15) ! Per-(I,j)/(J,i) size-15 q-point locals for the
+                        ! device phase-2/3 kernels (compile-time sized).
+  real :: dz_x_l(5), dz_y_l(5) ! Per-cell subgrid layer thicknesses for the device x/y kernels [Z ~> m].
   integer :: Isq, Ieq, Jsq, Jeq, i, j, m, n, pos
 
   Isq = HI%IscB ; Ieq = HI%IecB ; Jsq = HI%JscB ; Jeq = HI%JecB
@@ -597,9 +601,11 @@ subroutine int_density_dz_generic_plm(k, tv, T_t, T_b, S_t, S_b, e, rho_ref, &
   do_intz = present(intz_dpa)  ! Hoisted host-side so the device phase-1 region needs no present().
   ! Phase 1 runs on device only on GPU builds and only for the device-supported configuration
   ! (non-Stanley, unscaled EOS units, accurate anomaly form); everything else keeps the host path.
-  offload_phase1 = .false.
+  offload_phase1 = .false. ; offload_phase2 = .false. ; offload_phase3 = .false.
 #ifdef __NVCOMPILER_OPENMP_GPU
   offload_phase1 = (.not. use_stanley_eos) .and. eos_unity .and. use_rho_ref
+  offload_phase2 = offload_phase1  ! (settable independently for x-only failure bisection)
+  offload_phase3 = offload_phase1
   ! On GPU builds the non-Stanley density integrals below are evaluated with the device-callable
   ! dispatcher, which only covers ROQUET_RHO (in-situ density and anomaly) and buggy_Wright
   ! (in-situ density only). FATAL host-side, before any device region, on an unsupported config.
@@ -629,13 +635,17 @@ subroutine int_density_dz_generic_plm(k, tv, T_t, T_b, S_t, S_b, e, rho_ref, &
   EOSdom_q15(1) = 1 ; EOSdom_q15(2) = 15*(Ieq-Isq+1)
   EOSdom_h15(1) = 1 ; EOSdom_h15(2) = 15*(HI%iec-HI%isc+1)
 
+  ! z0pres is read by all offloaded phases (1-3); map it once here and release it after phase 3.
+  if (offload_phase1) then
+    !$omp target enter data map(to: z0pres)
+  endif
+
   ! 1. Compute vertical integrals
   if (offload_phase1) then
     ! Offload phase 1 (vertical integrals -> dpa, intz_dpa). Per-(i,j) size-5 quadrature locals
     ! reproduce the host loop below point-for-point; dpa/intz_dpa are independent across (i,j).
     ! Residency: e, dpa, intz_dpa are already device-resident (mapped by the caller); S_t/S_b/T_t/T_b
-    ! are mapped by the caller before the k-loop; z0pres (a host-computed local) is mapped here.
-    !$omp target enter data map(to: z0pres)
+    ! are mapped by the caller before the k-loop; z0pres is mapped just above (bracketing phases 1-3).
     !$omp target teams loop collapse(2) &
     !$omp   private(T5l, S5l, p5l, r5l, rho_anom, dz_l, n) &
     !$omp   firstprivate(GxRho, G_e, rho_ref, use_rho_ref, do_intz, k, eos_form, wt_t, wt_b)
@@ -655,14 +665,8 @@ subroutine int_density_dz_generic_plm(k, tv, T_t, T_b, S_t, S_b, e, rho_ref, &
       if (do_intz) intz_dpa(i,j) = 0.5*G_e*dz_l**2 * &
               (rho_anom - C1_90*(16.0*(r5l(4)-r5l(2)) + 7.0*(r5l(5)-r5l(1))) )
     enddo ; enddo
-    ! Pull the device-computed results back to the host: phases 2 & 3 below (still host) read dpa,
-    ! and the caller's kept "update to(dpa,...)" would otherwise overwrite the device values with a
-    ! stale host copy. This intermediate copy-back is removed once phases 2/3 also run on device.
-    !$omp target update from(dpa)
-    if (do_intz) then
-      !$omp target update from(intz_dpa)
-    endif
-    !$omp target exit data map(release: z0pres)
+    ! dpa/intz_dpa stay on the device; phases 2 & 3 (also offloaded) read dpa there, and a single
+    ! consolidated copy-back to the host happens after phase 3.
   else
   do j=Jsq,Jeq+1
     do i = Isq,Ieq+1
@@ -738,7 +742,73 @@ subroutine int_density_dz_generic_plm(k, tv, T_t, T_b, S_t, S_b, e, rho_ref, &
   endif ! offload_phase1
 
   ! 2. Compute horizontal integrals in the x direction
-  if (present(intx_dpa)) then ; do j=HI%jsc,HI%jec
+  if (present(intx_dpa)) then
+   if (offload_phase2) then
+    ! Offload phase 2 (x-integrals -> intx_dpa). Per-(I,j) size-15 q-point locals reproduce the host
+    ! loop below point-for-point; intx_dpa is independent across (I,j). dpa was written on the device
+    ! by phase 1 and is read here without a host round-trip. Both hWght branches are carried verbatim.
+    !$omp target teams loop collapse(2) &
+    !$omp   private(T15l, S15l, p15l, r15l, dz_x_l, intz, hWght, hWghtTop, hL, hR, iDenom, &
+    !$omp           Ttl, Ttr, Tbl, Tbr, Stl, Str, Sbl, Sbr, w_left, w_right, m, n, n15, pos) &
+    !$omp   firstprivate(GxRho, G_e, rho_ref, use_rho_ref, k, eos_form, massWeightToggle, &
+    !$omp                TopWeightToggle, massWeightNVonlyToggle, h_nonvanished, dz_subroundoff, wt_t, wt_b)
+    do j=HI%jsc,HI%jec ; do I=Isq,Ieq
+      hWght = massWeightToggle * &
+              max(0., -bathyT(i,j)-e(i+1,j,K), -bathyT(i+1,j)-e(i,j,K))
+      hWghtTop = TopWeightToggle * &
+              max(0., e(i+1,j,K+1)-e(i,j,1), e(i,j,K+1)-e(i+1,j,1))
+      hWght = max(hWght, hWghtTop)
+      if (((e(i,j,K) - e(i,j,K+1)) > h_nonvanished) .and. ((e(i+1,j,K) - e(i+1,j,K+1)) > h_nonvanished)) then
+        hWght = massWeightNVonlyToggle * hWght
+      endif
+      if (hWght > 0.) then
+        hL = (e(i,j,K) - e(i,j,K+1)) + dz_subroundoff
+        hR = (e(i+1,j,K) - e(i+1,j,K+1)) + dz_subroundoff
+        hWght = hWght * ( (hL-hR)/(hL+hR) )**2
+        iDenom = 1./( hWght*(hR + hL) + hL*hR )
+        Ttl = ( (hWght*hR)*T_t(i+1,j,k) + (hWght*hL + hR*hL)*T_t(i,j,k) ) * iDenom
+        Ttr = ( (hWght*hL)*T_t(i,j,k) + (hWght*hR + hR*hL)*T_t(i+1,j,k) ) * iDenom
+        Tbl = ( (hWght*hR)*T_b(i+1,j,k) + (hWght*hL + hR*hL)*T_b(i,j,k) ) * iDenom
+        Tbr = ( (hWght*hL)*T_b(i,j,k) + (hWght*hR + hR*hL)*T_b(i+1,j,k) ) * iDenom
+        Stl = ( (hWght*hR)*S_t(i+1,j,k) + (hWght*hL + hR*hL)*S_t(i,j,k) ) * iDenom
+        Str = ( (hWght*hL)*S_t(i,j,k) + (hWght*hR + hR*hL)*S_t(i+1,j,k) ) * iDenom
+        Sbl = ( (hWght*hR)*S_b(i+1,j,k) + (hWght*hL + hR*hL)*S_b(i,j,k) ) * iDenom
+        Sbr = ( (hWght*hL)*S_b(i,j,k) + (hWght*hR + hR*hL)*S_b(i+1,j,k) ) * iDenom
+      else
+        Ttl = T_t(i,j,k) ; Tbl = T_b(i,j,k) ; Ttr = T_t(i+1,j,k) ; Tbr = T_b(i+1,j,k)
+        Stl = S_t(i,j,k) ; Sbl = S_b(i,j,k) ; Str = S_t(i+1,j,k) ; Sbr = S_b(i+1,j,k)
+      endif
+      do m=2,4
+        w_left = wt_t(m) ; w_right = wt_b(m)
+        dz_x_l(m) = (w_left*(e(i,j,K) - e(i,j,K+1))) + (w_right*(e(i+1,j,K) - e(i+1,j,K+1)))
+        pos = (m-2)*5
+        T15l(pos+1) = (w_left*Ttl) + (w_right*Ttr)
+        T15l(pos+5) = (w_left*Tbl) + (w_right*Tbr)
+        S15l(pos+1) = (w_left*Stl) + (w_right*Str)
+        S15l(pos+5) = (w_left*Sbl) + (w_right*Sbr)
+        p15l(pos+1) = -GxRho * ((w_left*(e(i,j,K)-z0pres(i,j))) + (w_right*(e(i+1,j,K)-z0pres(i+1,j))))
+        do n=2,5
+          p15l(pos+n) = p15l(pos+n-1) + GxRho*0.25*dz_x_l(m)
+        enddo
+        do n=2,4
+          S15l(pos+n) = wt_t(n) * S15l(pos+1) + wt_b(n) * S15l(pos+5)
+          T15l(pos+n) = wt_t(n) * T15l(pos+1) + wt_b(n) * T15l(pos+5)
+        enddo
+      enddo
+      do n15=1,15
+        r15l(n15) = calculate_density_elem_loc(eos_form, T15l(n15), S15l(n15), p15l(n15), use_rho_ref, rho_ref)
+      enddo
+      intz(1) = dpa(i,j) ; intz(5) = dpa(i+1,j)
+      do m=2,4
+        pos = (m-2)*5
+        intz(m) = (G_e*dz_x_l(m)*( C1_90*(7.0*(r15l(pos+1)+r15l(pos+5)) + 32.0*(r15l(pos+2)+r15l(pos+4)) + &
+                          12.0*r15l(pos+3)) ))
+      enddo
+      intx_dpa(I,j) = C1_90*(7.0*(intz(1)+intz(5)) + 32.0*(intz(2)+intz(4)) + &
+                             12.0*intz(3))
+    enddo ; enddo
+   else
+    do j=HI%jsc,HI%jec
     do I=Isq,Ieq
       ! Corner values of T and S
       ! hWght is the distance measure by which the cell is violation of
@@ -863,10 +933,79 @@ subroutine int_density_dz_generic_plm(k, tv, T_t, T_b, S_t, S_b, e, rho_ref, &
       intx_dpa(I,j) = C1_90*(7.0*(intz(1)+intz(5)) + 32.0*(intz(2)+intz(4)) + &
                              12.0*intz(3))
     enddo
-  enddo ; endif
+  enddo
+   endif ! offload_phase2
+  endif ! present(intx_dpa)
 
   ! 3. Compute horizontal integrals in the y direction
-  if (present(inty_dpa)) then ; do J=Jsq,Jeq
+  if (present(inty_dpa)) then
+   if (offload_phase3) then
+    ! Offload phase 3 (y-integrals -> inty_dpa). Per-(J,i) size-15 q-point locals reproduce the host
+    ! loop below point-for-point; inty_dpa is independent across (J,i). dpa (device, from phase 1) is
+    ! read here without a host round-trip. Both hWght branches are carried verbatim.
+    !$omp target teams loop collapse(2) &
+    !$omp   private(T15l, S15l, p15l, r15l, dz_y_l, intz, hWght, hWghtTop, hL, hR, iDenom, &
+    !$omp           Ttl, Ttr, Tbl, Tbr, Stl, Str, Sbl, Sbr, w_left, w_right, m, n, n15, pos) &
+    !$omp   firstprivate(GxRho, G_e, rho_ref, use_rho_ref, k, eos_form, massWeightToggle, &
+    !$omp                TopWeightToggle, massWeightNVonlyToggle, h_nonvanished, dz_subroundoff, wt_t, wt_b)
+    do J=Jsq,Jeq ; do i=HI%isc,HI%iec
+      hWght = massWeightToggle * &
+              max(0., -bathyT(i,j)-e(i,j+1,K), -bathyT(i,j+1)-e(i,j,K))
+      hWghtTop = TopWeightToggle * &
+              max(0., e(i,j+1,K+1)-e(i,j,1), e(i,j,K+1)-e(i,j+1,1))
+      hWght = max(hWght, hWghtTop)
+      if (((e(i,j,K) - e(i,j,K+1)) > h_nonvanished) .and. ((e(i,j+1,K) - e(i,j+1,K+1)) > h_nonvanished)) then
+        hWght = massWeightNVonlyToggle * hWght
+      endif
+      if (hWght > 0.) then
+        hL = (e(i,j,K) - e(i,j,K+1)) + dz_subroundoff
+        hR = (e(i,j+1,K) - e(i,j+1,K+1)) + dz_subroundoff
+        hWght = hWght * ( (hL-hR)/(hL+hR) )**2
+        iDenom = 1./( hWght*(hR + hL) + hL*hR )
+        Ttl = ( (hWght*hR)*T_t(i,j+1,k) + (hWght*hL + hR*hL)*T_t(i,j,k) ) * iDenom
+        Ttr = ( (hWght*hL)*T_t(i,j,k) + (hWght*hR + hR*hL)*T_t(i,j+1,k) ) * iDenom
+        Tbl = ( (hWght*hR)*T_b(i,j+1,k) + (hWght*hL + hR*hL)*T_b(i,j,k) ) * iDenom
+        Tbr = ( (hWght*hL)*T_b(i,j,k) + (hWght*hR + hR*hL)*T_b(i,j+1,k) ) * iDenom
+        Stl = ( (hWght*hR)*S_t(i,j+1,k) + (hWght*hL + hR*hL)*S_t(i,j,k) ) * iDenom
+        Str = ( (hWght*hL)*S_t(i,j,k) + (hWght*hR + hR*hL)*S_t(i,j+1,k) ) * iDenom
+        Sbl = ( (hWght*hR)*S_b(i,j+1,k) + (hWght*hL + hR*hL)*S_b(i,j,k) ) * iDenom
+        Sbr = ( (hWght*hL)*S_b(i,j,k) + (hWght*hR + hR*hL)*S_b(i,j+1,k) ) * iDenom
+      else
+        Ttl = T_t(i,j,k) ; Tbl = T_b(i,j,k) ; Ttr = T_t(i,j+1,k) ; Tbr = T_b(i,j+1,k)
+        Stl = S_t(i,j,k) ; Sbl = S_b(i,j,k) ; Str = S_t(i,j+1,k) ; Sbr = S_b(i,j+1,k)
+      endif
+      do m=2,4
+        w_left = wt_t(m) ; w_right = wt_b(m)
+        dz_y_l(m) = (w_left*(e(i,j,K) - e(i,j,K+1))) + (w_right*(e(i,j+1,K) - e(i,j+1,K+1)))
+        pos = (m-2)*5
+        T15l(pos+1) = (w_left*Ttl) + (w_right*Ttr)
+        T15l(pos+5) = (w_left*Tbl) + (w_right*Tbr)
+        S15l(pos+1) = (w_left*Stl) + (w_right*Str)
+        S15l(pos+5) = (w_left*Sbl) + (w_right*Sbr)
+        p15l(pos+1) = -GxRho * ((w_left*(e(i,j,K)-z0pres(i,j))) + (w_right*(e(i,j+1,K)-z0pres(i,j+1))))
+        do n=2,5
+          p15l(pos+n) = p15l(pos+n-1) + GxRho*0.25*dz_y_l(m)
+        enddo
+        do n=2,4
+          S15l(pos+n) = wt_t(n) * S15l(pos+1) + wt_b(n) * S15l(pos+5)
+          T15l(pos+n) = wt_t(n) * T15l(pos+1) + wt_b(n) * T15l(pos+5)
+        enddo
+      enddo
+      do n15=1,15
+        r15l(n15) = calculate_density_elem_loc(eos_form, T15l(n15), S15l(n15), p15l(n15), use_rho_ref, rho_ref)
+      enddo
+      intz(1) = dpa(i,j) ; intz(5) = dpa(i,j+1)
+      do m=2,4
+        pos = (m-2)*5
+        intz(m) = (G_e*dz_y_l(m)*( C1_90*(7.0*(r15l(pos+1)+r15l(pos+5)) + &
+                                         32.0*(r15l(pos+2)+r15l(pos+4)) + &
+                                         12.0*r15l(pos+3)) ))
+      enddo
+      inty_dpa(i,J) = C1_90*(7.0*(intz(1)+intz(5)) + 32.0*(intz(2)+intz(4)) + &
+                             12.0*intz(3))
+    enddo ; enddo
+   else
+    do J=Jsq,Jeq
     do i=HI%isc,HI%iec
     ! Corner values of T and S
     ! hWght is the distance measure by which the cell is violation of
@@ -998,7 +1137,26 @@ subroutine int_density_dz_generic_plm(k, tv, T_t, T_b, S_t, S_b, e, rho_ref, &
       inty_dpa(i,J) = C1_90*(7.0*(intz(1)+intz(5)) + 32.0*(intz(2)+intz(4)) + &
                              12.0*intz(3))
     enddo
-  enddo ; endif
+   enddo
+   endif ! offload_phase3
+  endif ! present(inty_dpa)
+
+  ! Consolidated device->host copy-back: the device now holds dpa/intz_dpa (phase 1) and
+  ! intx_dpa/inty_dpa (phases 2/3). Refresh the host so the caller's kept "update to(dpa,...)"
+  ! does not overwrite them with stale host values. Removed in increment E with the round-trip.
+  if (offload_phase1) then
+    !$omp target update from(dpa)
+    if (do_intz) then
+      !$omp target update from(intz_dpa)
+    endif
+    !$omp target exit data map(release: z0pres)
+  endif
+  if (offload_phase2 .and. present(intx_dpa)) then
+    !$omp target update from(intx_dpa)
+  endif
+  if (offload_phase3 .and. present(inty_dpa)) then
+    !$omp target update from(inty_dpa)
+  endif
 
 end subroutine int_density_dz_generic_plm
 
