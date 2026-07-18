@@ -539,7 +539,12 @@ subroutine int_density_dz_generic_plm(k, tv, T_t, T_b, S_t, S_b, e, rho_ref, &
                         ! EOS unit-rescaling factors, resolved host-side.
   logical :: eos_unity  ! True when all EOS unit-rescaling factors are 1, matching the no-rescale
                         ! fast path of calculate_density_1d.
+  logical :: do_intz    ! present(intz_dpa), hoisted host-side for use inside the device region.
+  logical :: offload_phase1 ! True on GPU builds when phase 1 (vertical integrals) runs on device.
   integer :: n15        ! A subgrid-point loop index over the 15 q-point slots in a column.
+  real :: T5l(5), S5l(5), p5l(5), r5l(5) ! Per-(i,j) size-5 quadrature locals for the device phase-1
+                        ! kernel (compile-time sized to avoid device auto-allocation).
+  real :: dz_l          ! A per-(i,j) layer thickness for the device phase-1 kernel [Z ~> m].
   integer :: Isq, Ieq, Jsq, Jeq, i, j, m, n, pos
 
   Isq = HI%IscB ; Ieq = HI%IecB ; Jsq = HI%JscB ; Jeq = HI%JecB
@@ -589,7 +594,12 @@ subroutine int_density_dz_generic_plm(k, tv, T_t, T_b, S_t, S_b, e, rho_ref, &
                                 eos_RL2_T2_to_Pa, R_to_kg_m3=eos_R_to_kg_m3)
   eos_unity = (eos_RL2_T2_to_Pa == 1.0) .and. (eos_R_to_kg_m3 == 1.0) .and. &
               (eos_C_to_degC == 1.0) .and. (eos_S_to_ppt == 1.0)
+  do_intz = present(intz_dpa)  ! Hoisted host-side so the device phase-1 region needs no present().
+  ! Phase 1 runs on device only on GPU builds and only for the device-supported configuration
+  ! (non-Stanley, unscaled EOS units, accurate anomaly form); everything else keeps the host path.
+  offload_phase1 = .false.
 #ifdef __NVCOMPILER_OPENMP_GPU
+  offload_phase1 = (.not. use_stanley_eos) .and. eos_unity .and. use_rho_ref
   ! On GPU builds the non-Stanley density integrals below are evaluated with the device-callable
   ! dispatcher, which only covers ROQUET_RHO (in-situ density and anomaly) and buggy_Wright
   ! (in-situ density only). FATAL host-side, before any device region, on an unsupported config.
@@ -620,6 +630,40 @@ subroutine int_density_dz_generic_plm(k, tv, T_t, T_b, S_t, S_b, e, rho_ref, &
   EOSdom_h15(1) = 1 ; EOSdom_h15(2) = 15*(HI%iec-HI%isc+1)
 
   ! 1. Compute vertical integrals
+  if (offload_phase1) then
+    ! Offload phase 1 (vertical integrals -> dpa, intz_dpa). Per-(i,j) size-5 quadrature locals
+    ! reproduce the host loop below point-for-point; dpa/intz_dpa are independent across (i,j).
+    ! Residency: e, dpa, intz_dpa are already device-resident (mapped by the caller); S_t/S_b/T_t/T_b
+    ! are mapped by the caller before the k-loop; z0pres (a host-computed local) is mapped here.
+    !$omp target enter data map(to: z0pres)
+    !$omp target teams loop collapse(2) &
+    !$omp   private(T5l, S5l, p5l, r5l, rho_anom, dz_l, n) &
+    !$omp   firstprivate(GxRho, G_e, rho_ref, use_rho_ref, do_intz, k, eos_form, wt_t, wt_b)
+    do j=Jsq,Jeq+1 ; do i=Isq,Ieq+1
+      dz_l = e(i,j,K) - e(i,j,K+1)
+      do n=1,5
+        p5l(n) = -GxRho*((e(i,j,K) - z0pres(i,j)) - 0.25*real(n-1)*dz_l)
+        S5l(n) = wt_t(n) * S_t(i,j,k) + wt_b(n) * S_b(i,j,k)
+        T5l(n) = wt_t(n) * T_t(i,j,k) + wt_b(n) * T_b(i,j,k)
+      enddo
+      do n=1,5
+        r5l(n) = calculate_density_elem_loc(eos_form, T5l(n), S5l(n), p5l(n), use_rho_ref, rho_ref)
+      enddo
+      ! Boole's rule for the pressure anomaly change (use_rho_ref accurate form).
+      rho_anom = C1_90*(7.0*(r5l(1)+r5l(5)) + 32.0*(r5l(2)+r5l(4)) + 12.0*r5l(3))
+      dpa(i,j) = G_e*dz_l*rho_anom
+      if (do_intz) intz_dpa(i,j) = 0.5*G_e*dz_l**2 * &
+              (rho_anom - C1_90*(16.0*(r5l(4)-r5l(2)) + 7.0*(r5l(5)-r5l(1))) )
+    enddo ; enddo
+    ! Pull the device-computed results back to the host: phases 2 & 3 below (still host) read dpa,
+    ! and the caller's kept "update to(dpa,...)" would otherwise overwrite the device values with a
+    ! stale host copy. This intermediate copy-back is removed once phases 2/3 also run on device.
+    !$omp target update from(dpa)
+    if (do_intz) then
+      !$omp target update from(intz_dpa)
+    endif
+    !$omp target exit data map(release: z0pres)
+  else
   do j=Jsq,Jeq+1
     do i = Isq,Ieq+1
       dz(i) = e(i,j,K) - e(i,j,K+1)
@@ -691,6 +735,7 @@ subroutine int_density_dz_generic_plm(k, tv, T_t, T_b, S_t, S_b, e, rho_ref, &
       enddo
     endif
   enddo ! end loops on j
+  endif ! offload_phase1
 
   ! 2. Compute horizontal integrals in the x direction
   if (present(intx_dpa)) then ; do j=HI%jsc,HI%jec

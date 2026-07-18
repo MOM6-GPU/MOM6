@@ -1304,6 +1304,10 @@ subroutine PressureForce_FV_Bouss(h, tv, PFu, PFv, G, GV, US, CS, ALE_CSp, ADp, 
     !$omp target enter data map(to: tv_tmp, tv_tmp%T, tv_tmp%S) &
     !$omp   if(.not.(use_ALE .and. CS%Recon_Scheme > 0))
 
+    ! The layer edge T/S reconstructions are read on the device by the (offloaded) generic_plm
+    ! density integrals; map them once here (they are the same for every layer k).
+    !$omp target enter data map(to: T_t, T_b, S_t, S_b) if(use_ALE .and. CS%Recon_Scheme > 0)
+
     ! The following routine computes the integrals that are needed to
     ! calculate the pressure gradient force. Linear profiles for T and S are
     ! assumed when regridding is activated. Otherwise, the previous version
@@ -1346,6 +1350,7 @@ subroutine PressureForce_FV_Bouss(h, tv, PFu, PFv, G, GV, US, CS, ALE_CSp, ADp, 
                                     G%HI, MassWt_u(:,:,k), MassWt_v(:,:,k), &
                                     MassWghtInterpVanOnly=CS%MassWghtInterpVanOnly, h_nv=CS%h_nonvanished)
     enddo
+    !$omp target exit data map(release: T_t, T_b, S_t, S_b) if(use_ALE .and. CS%Recon_Scheme > 0)
     !$omp target exit data map(release: tv_tmp, tv_tmp%T, tv_tmp%S) &
     !$omp   if(.not.(use_ALE .and. CS%Recon_Scheme > 0))
   else
