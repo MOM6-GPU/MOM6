@@ -16,6 +16,10 @@ public buggy_Wright_EOS
 ! can compute density derivatives in-region without polymorphic dispatch.
 public calculate_density_derivs_elem_buggy_Wright_loc
 !$omp declare target(calculate_density_derivs_elem_buggy_Wright_loc)
+! Exposed as a device-callable (declare target) elemental so whole-column GPU kernels can compute
+! in-situ density in-region without polymorphic dispatch. (buggy_Wright has no anomaly _loc kernel.)
+public density_elem_buggy_Wright_loc
+!$omp declare target(density_elem_buggy_Wright_loc)
 public int_density_dz_wright, int_spec_vol_dp_wright
 public avg_spec_vol_buggy_Wright
 public set_params_buggy_Wright

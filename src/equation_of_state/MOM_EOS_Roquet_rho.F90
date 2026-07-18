@@ -14,6 +14,11 @@ public Roquet_rho_EOS
 ! can compute density derivatives in-region without polymorphic dispatch.
 public calculate_density_derivs_elem_Roquet_rho_loc
 !$omp declare target(calculate_density_derivs_elem_Roquet_rho_loc)
+! Exposed as device-callable (declare target) elementals so whole-column GPU kernels can compute
+! in-situ density and its anomaly in-region without polymorphic dispatch.
+public density_elem_Roquet_rho_loc, density_anomaly_elem_Roquet_rho_loc
+!$omp declare target(density_elem_Roquet_rho_loc)
+!$omp declare target(density_anomaly_elem_Roquet_rho_loc)
 
 real, parameter :: Pa2kb  = 1.e-8 !< Conversion factor between Pa and kbar [kbar Pa-1]
 !>@{ Parameters in the Roquet_rho (Roquet density) equation of state

@@ -10,6 +10,7 @@ use MOM_EOS_linear, only : linear_EOS, avg_spec_vol_linear
 use MOM_EOS_linear, only : int_density_dz_linear, int_spec_vol_dp_linear
 use MOM_EOS_Wright, only : buggy_Wright_EOS, avg_spec_vol_buggy_Wright
 use MOM_EOS_Wright, only : calculate_density_derivs_elem_buggy_Wright_loc
+use MOM_EOS_Wright, only : density_elem_buggy_Wright_loc
 use MOM_EOS_Wright, only : int_density_dz_wright, int_spec_vol_dp_wright
 use MOM_EOS_Wright_full, only : Wright_full_EOS, avg_spec_vol_Wright_full
 use MOM_EOS_Wright_full, only : int_density_dz_wright_full, int_spec_vol_dp_wright_full
@@ -19,6 +20,7 @@ use MOM_EOS_Jackett06, only : Jackett06_EOS
 use MOM_EOS_UNESCO, only : UNESCO_EOS
 use MOM_EOS_Roquet_rho, only : Roquet_rho_EOS
 use MOM_EOS_Roquet_rho, only : calculate_density_derivs_elem_Roquet_rho_loc
+use MOM_EOS_Roquet_rho, only : density_elem_Roquet_rho_loc, density_anomaly_elem_Roquet_rho_loc
 use MOM_EOS_Roquet_SpV, only : Roquet_SpV_EOS
 use MOM_EOS_TEOS10, only : TEOS10_EOS
 use MOM_EOS_TEOS10, only : gsw_sp_from_sr, gsw_pt_from_ct, gsw_sr_from_sp, gsw_ct_from_pt
@@ -49,6 +51,7 @@ public calculate_density_elem
 public calculate_density
 public calculate_density_derivs
 public calculate_density_derivs_elem_loc
+public calculate_density_elem_loc
 public get_EOS_form_and_scaling
 public calculate_density_second_derivs
 public calculate_spec_vol
@@ -923,6 +926,44 @@ subroutine calculate_density_derivs_elem_loc(form_of_EOS, T, S, pressure, drho_d
   end select
 
 end subroutine calculate_density_derivs_elem_loc
+
+!> Device-callable dispatcher for in-situ density (or its anomaly relative to rho_ref) at a single
+!! point, in mks units, selecting the equation-of-state form at runtime by integer id (no
+!! polymorphic dispatch) so it can be called from inside a do concurrent / target region by GPU
+!! kernels (e.g. the finite-volume pressure-gradient density integrals). Unit rescaling
+!! (EOS%*_to_* factors) and any `scale` factor are the caller's responsibility, exactly as in
+!! calculate_density_elem. If use_rho_ref is true, the density anomaly relative to rho_ref (all in
+!! mks units) is returned via the form's device-callable anomaly kernel. Combinations without a
+!! device-callable _loc kernel -- an unsupported form, or the anomaly branch of a form that has no
+!! anomaly kernel (e.g. buggy_Wright) -- are not handled here and return 0; a device-using module
+!! must FATAL at init on a GPU build before reaching this with such a combination.
+real function calculate_density_elem_loc(form_of_EOS, T, S, pressure, use_rho_ref, rho_ref)
+  integer, intent(in) :: form_of_EOS !< The equation of state form (EOS_ROQUET_RHO, EOS_WRIGHT, ...)
+  real,    intent(in) :: T           !< Temperature in the EOS kernel's mks units [degC]
+  real,    intent(in) :: S           !< Salinity in the EOS kernel's mks units [ppt or g kg-1]
+  real,    intent(in) :: pressure    !< Pressure [Pa]
+  logical, intent(in) :: use_rho_ref !< If true, return the density anomaly relative to rho_ref
+  real,    intent(in) :: rho_ref     !< A reference density [kg m-3], subtracted when use_rho_ref is true
+  !$omp declare target
+
+  calculate_density_elem_loc = 0.0
+  select case (form_of_EOS)
+    case (EOS_ROQUET_RHO)
+      if (use_rho_ref) then
+        calculate_density_elem_loc = density_anomaly_elem_Roquet_rho_loc(T, S, pressure, rho_ref)
+      else
+        calculate_density_elem_loc = density_elem_Roquet_rho_loc(T, S, pressure)
+      endif
+    case (EOS_WRIGHT)
+      ! buggy_Wright has a device-callable in-situ density kernel but no anomaly kernel, so the
+      ! anomaly branch is unsupported and returns 0 (host FATALs at init on GPU builds).
+      if (.not. use_rho_ref) &
+        calculate_density_elem_loc = density_elem_buggy_Wright_loc(T, S, pressure)
+    case default
+      calculate_density_elem_loc = 0.0
+  end select
+
+end function calculate_density_elem_loc
 
 !> Return the equation-of-state form id and the unit-rescaling factors held in an EOS_type.
 !! Lets a caller (e.g. a whole-column GPU kernel) reproduce, host-side, the unit conversion
