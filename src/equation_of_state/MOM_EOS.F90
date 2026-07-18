@@ -969,19 +969,22 @@ end function calculate_density_elem_loc
 !! Lets a caller (e.g. a whole-column GPU kernel) reproduce, host-side, the unit conversion
 !! and rescaling that calculate_density_derivs_1d applies around the mks _loc kernels, without
 !! needing access to the private components of EOS_type.
-subroutine get_EOS_form_and_scaling(EOS, form_of_EOS, kg_m3_to_R, C_to_degC, S_to_ppt, RL2_T2_to_Pa)
+subroutine get_EOS_form_and_scaling(EOS, form_of_EOS, kg_m3_to_R, C_to_degC, S_to_ppt, RL2_T2_to_Pa, &
+                                    R_to_kg_m3)
   type(EOS_type), intent(in)  :: EOS          !< Equation of state structure
   integer,        intent(out) :: form_of_EOS  !< The equation of state form id (EOS_ROQUET_RHO, ...)
   real,           intent(out) :: kg_m3_to_R   !< Factor converting kg m-3 to the internal density unit R [R m3 kg-1 ~> 1]
   real,           intent(out) :: C_to_degC    !< Factor converting the temperature unit to degC [degC C-1 ~> 1]
   real,           intent(out) :: S_to_ppt     !< Factor converting the salinity unit to ppt [ppt S-1 ~> 1]
   real,           intent(out) :: RL2_T2_to_Pa !< Factor converting the pressure unit to Pa [Pa T2 R-1 L-2 ~> 1]
+  real, optional, intent(out) :: R_to_kg_m3   !< Factor converting the internal density unit R to kg m-3 [kg R-1 m-3 ~> 1]
 
   form_of_EOS  = EOS%form_of_EOS
   kg_m3_to_R   = EOS%kg_m3_to_R
   C_to_degC    = EOS%C_to_degC
   S_to_ppt     = EOS%S_to_ppt
   RL2_T2_to_Pa = EOS%RL2_T2_to_Pa
+  if (present(R_to_kg_m3)) R_to_kg_m3 = EOS%R_to_kg_m3
 
 end subroutine get_EOS_form_and_scaling
 

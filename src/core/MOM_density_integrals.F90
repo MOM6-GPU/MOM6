@@ -10,6 +10,8 @@ use MOM_EOS,              only : EOS_quadrature, EOS_domain
 use MOM_EOS,              only : analytic_int_density_dz
 use MOM_EOS,              only : analytic_int_specific_vol_dp
 use MOM_EOS,              only : calculate_density
+use MOM_EOS,              only : calculate_density_elem_loc, get_EOS_form_and_scaling
+use MOM_EOS,              only : EOS_ROQUET_RHO, EOS_WRIGHT
 use MOM_EOS,              only : calculate_spec_vol
 use MOM_EOS,              only : calculate_specific_vol_derivs
 use MOM_EOS,              only : average_specific_vol
@@ -532,6 +534,12 @@ subroutine int_density_dz_generic_plm(k, tv, T_t, T_b, S_t, S_b, e, rho_ref, &
   integer, dimension(2) :: EOSdom_h5  ! The 5-point h-point i-computational domain for the equation of state
   integer, dimension(2) :: EOSdom_q15 ! The 3x5-point q-point i-computational domain for the equation of state
   integer, dimension(2) :: EOSdom_h15 ! The 3x5-point h-point i-computational domain for the equation of state
+  integer :: eos_form   ! The equation-of-state form id, resolved host-side for the device-callable density path.
+  real :: eos_kg_m3_to_R, eos_C_to_degC, eos_S_to_ppt, eos_RL2_T2_to_Pa, eos_R_to_kg_m3
+                        ! EOS unit-rescaling factors, resolved host-side.
+  logical :: eos_unity  ! True when all EOS unit-rescaling factors are 1, matching the no-rescale
+                        ! fast path of calculate_density_1d.
+  integer :: n15        ! A subgrid-point loop index over the 15 q-point slots in a column.
   integer :: Isq, Ieq, Jsq, Jeq, i, j, m, n, pos
 
   Isq = HI%IscB ; Ieq = HI%IecB ; Jsq = HI%JscB ; Jeq = HI%JecB
@@ -569,6 +577,31 @@ subroutine int_density_dz_generic_plm(k, tv, T_t, T_b, S_t, S_b, e, rho_ref, &
     use_varS = associated(tv%varS)
   endif
 
+  ! GPU port increment B: resolve the EOS form + unit scaling once on the host (the accessor is
+  ! not device-callable) so the non-Stanley density integrals can be evaluated point-by-point via
+  ! the device-callable dispatcher calculate_density_elem_loc, instead of the polymorphic
+  ! calculate_density interface, when this is (later) offloaded. eos_unity mirrors
+  ! calculate_density_1d's no-rescale fast path.
+  eos_form = -1
+  eos_kg_m3_to_R = 1.0 ; eos_C_to_degC = 1.0 ; eos_S_to_ppt = 1.0
+  eos_RL2_T2_to_Pa = 1.0 ; eos_R_to_kg_m3 = 1.0
+  call get_EOS_form_and_scaling(EOS, eos_form, eos_kg_m3_to_R, eos_C_to_degC, eos_S_to_ppt, &
+                                eos_RL2_T2_to_Pa, R_to_kg_m3=eos_R_to_kg_m3)
+  eos_unity = (eos_RL2_T2_to_Pa == 1.0) .and. (eos_R_to_kg_m3 == 1.0) .and. &
+              (eos_C_to_degC == 1.0) .and. (eos_S_to_ppt == 1.0)
+#ifdef __NVCOMPILER_OPENMP_GPU
+  ! On GPU builds the non-Stanley density integrals below are evaluated with the device-callable
+  ! dispatcher, which only covers ROQUET_RHO (in-situ density and anomaly) and buggy_Wright
+  ! (in-situ density only). FATAL host-side, before any device region, on an unsupported config.
+  if (.not. use_stanley_eos) then
+    if (.not. ((eos_form == EOS_ROQUET_RHO) .or. &
+               ((eos_form == EOS_WRIGHT) .and. (.not. use_rho_ref)))) call MOM_error(FATAL, &
+      "int_density_dz_generic_plm GPU build: no device-callable density kernel for this "// &
+      "EQN_OF_STATE / anomaly mode (only ROQUET_RHO, and buggy_Wright without rho_ref, are "// &
+      "supported); use a CPU build or add a _loc kernel.")
+  endif
+#endif
+
   T25(:) = 0.
   TS5(:) = 0.
   S25(:) = 0.
@@ -603,12 +636,32 @@ subroutine int_density_dz_generic_plm(k, tv, T_t, T_b, S_t, S_b, e, rho_ref, &
     if (use_Stanley_eos) then
       call calculate_density(T5, S5, p5, T25, TS5, S25, r5, EOS, EOSdom_h5, rho_ref=rho_ref)
     else
+#ifdef __NVCOMPILER_OPENMP_GPU
+      ! Device-callable element path reproducing calculate_density_1d(T5,S5,p5,r5,EOS,EOSdom_h5
+      ! [,rho_ref]) bit-for-bit: same _loc kernel per point, same unit rescaling. The eos_unity
+      ! branch is hoisted outside the point loop so the loop body is branch-free (offload-ready).
+      ! Iterating (i,n) covers exactly the EOSdom_h5 index range that the array call works on.
+      if (eos_unity) then
+        do i=Isq,Ieq+1 ; do n=1,5
+          r5(i*5+n) = calculate_density_elem_loc(eos_form, T5(i*5+n), S5(i*5+n), p5(i*5+n), &
+                                                 use_rho_ref, rho_ref)
+        enddo ; enddo
+      else
+        do i=Isq,Ieq+1 ; do n=1,5
+          r5(i*5+n) = eos_kg_m3_to_R * calculate_density_elem_loc(eos_form, &
+                        eos_C_to_degC*T5(i*5+n), eos_S_to_ppt*S5(i*5+n), eos_RL2_T2_to_Pa*p5(i*5+n), &
+                        use_rho_ref, eos_R_to_kg_m3*rho_ref)
+        enddo ; enddo
+      endif
+      if (.not. use_rho_ref) u5(:) = r5(:) - rho_ref
+#else
       if (use_rho_ref) then
         call calculate_density(T5, S5, p5, r5, EOS, EOSdom_h5, rho_ref=rho_ref)
       else
         call calculate_density(T5, S5, p5, r5, EOS, EOSdom_h5)
         u5(:) = r5(:) - rho_ref
       endif
+#endif
     endif
 
     if (use_rho_ref) then
@@ -720,11 +773,28 @@ subroutine int_density_dz_generic_plm(k, tv, T_t, T_b, S_t, S_b, e, rho_ref, &
     if (use_stanley_eos) then
       call calculate_density(T15, S15, p15, T215, TS15, S215, r15, EOS, EOSdom_q15, rho_ref=rho_ref)
     else
+#ifdef __NVCOMPILER_OPENMP_GPU
+      ! Device-callable element path reproducing calculate_density_1d(T15,S15,p15,r15,EOS,EOSdom_q15
+      ! [,rho_ref]) bit-for-bit. Iterating (I,n15) covers exactly the EOSdom_q15 index range.
+      if (eos_unity) then
+        do I=Isq,Ieq ; do n15=1,15
+          r15(I*15+n15) = calculate_density_elem_loc(eos_form, T15(I*15+n15), S15(I*15+n15), &
+                                                     p15(I*15+n15), use_rho_ref, rho_ref)
+        enddo ; enddo
+      else
+        do I=Isq,Ieq ; do n15=1,15
+          r15(I*15+n15) = eos_kg_m3_to_R * calculate_density_elem_loc(eos_form, &
+                            eos_C_to_degC*T15(I*15+n15), eos_S_to_ppt*S15(I*15+n15), &
+                            eos_RL2_T2_to_Pa*p15(I*15+n15), use_rho_ref, eos_R_to_kg_m3*rho_ref)
+        enddo ; enddo
+      endif
+#else
       if (use_rho_ref) then
         call calculate_density(T15, S15, p15, r15, EOS, EOSdom_q15, rho_ref=rho_ref)
       else
         call calculate_density(T15, S15, p15, r15, EOS, EOSdom_q15)
       endif
+#endif
     endif
 
     do I=Isq,Ieq
@@ -834,6 +904,22 @@ subroutine int_density_dz_generic_plm(k, tv, T_t, T_b, S_t, S_b, e, rho_ref, &
                              T215(15*HI%isc+1:), TS15(15*HI%isc+1:), S215(15*HI%isc+1:), &
                              r15(15*HI%isc+1:), EOS, EOSdom_h15, rho_ref=rho_ref)
     else
+#ifdef __NVCOMPILER_OPENMP_GPU
+      ! Device-callable element path reproducing calculate_density_1d over the h15 domain
+      ! bit-for-bit. Iterating (i,n15) covers exactly the r15(15*HI%isc+1:)/EOSdom_h15 range.
+      if (eos_unity) then
+        do i=HI%isc,HI%iec ; do n15=1,15
+          r15(i*15+n15) = calculate_density_elem_loc(eos_form, T15(i*15+n15), S15(i*15+n15), &
+                                                     p15(i*15+n15), use_rho_ref, rho_ref)
+        enddo ; enddo
+      else
+        do i=HI%isc,HI%iec ; do n15=1,15
+          r15(i*15+n15) = eos_kg_m3_to_R * calculate_density_elem_loc(eos_form, &
+                            eos_C_to_degC*T15(i*15+n15), eos_S_to_ppt*S15(i*15+n15), &
+                            eos_RL2_T2_to_Pa*p15(i*15+n15), use_rho_ref, eos_R_to_kg_m3*rho_ref)
+        enddo ; enddo
+      endif
+#else
       if (use_rho_ref) then
         call calculate_density(T15(15*HI%isc+1:), S15(15*HI%isc+1:), p15(15*HI%isc+1:), &
                                r15(15*HI%isc+1:), EOS, EOSdom_h15, rho_ref=rho_ref)
@@ -841,6 +927,7 @@ subroutine int_density_dz_generic_plm(k, tv, T_t, T_b, S_t, S_b, e, rho_ref, &
         call calculate_density(T15(15*HI%isc+1:), S15(15*HI%isc+1:), p15(15*HI%isc+1:), &
                                r15(15*HI%isc+1:), EOS, EOSdom_h15)
       endif
+#endif
     endif
 
     do i=HI%isc,HI%iec
