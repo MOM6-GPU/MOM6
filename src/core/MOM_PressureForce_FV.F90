@@ -19,6 +19,7 @@ use MOM_unit_scaling, only : unit_scale_type
 use MOM_variables, only : thermo_var_ptrs, accel_diag_ptrs
 use MOM_verticalGrid, only : verticalGrid_type
 use MOM_EOS, only : calculate_density, calculate_spec_vol, EOS_domain
+use MOM_EOS, only : get_EOS_form_and_scaling
 use MOM_density_integrals, only : int_density_dz, int_specific_vol_dp
 use MOM_density_integrals, only : int_density_dz_generic_plm, int_density_dz_generic_ppm
 use MOM_density_integrals, only : int_spec_vol_dp_generic_plm
@@ -1101,6 +1102,12 @@ subroutine PressureForce_FV_Bouss(h, tv, PFu, PFv, G, GV, US, CS, ALE_CSp, ADp, 
   integer, dimension(2) :: EOSdom_u ! The i-computational domain for the equation of state at u-velocity points
   integer, dimension(2) :: EOSdom_v ! The i-computational domain for the equation of state at v-velocity points
   integer :: EOSdom2d(2,2)  ! The 2D compute domain for the equation of state
+  logical :: idz_on_device  ! If true, int_density_dz_generic_plm leaves its outputs (dpa, intz_dpa,
+                            ! intx_dpa, inty_dpa) device-resident, so the caller neither pushes e to the
+                            ! host for it nor pulls the integrals back (GPU builds, supported config).
+  real :: eos_kg_m3_to_R, eos_C_to_degC, eos_S_to_ppt, eos_RL2_T2_to_Pa, eos_R_to_kg_m3
+                            ! EOS unit-rescaling factors, used only to test eos_unity for idz_on_device.
+  integer :: eos_form_pf    ! EOS form id (from get_EOS_form_and_scaling; not otherwise used here).
   integer :: is, ie, js, je, Isq, Ieq, Jsq, Jeq, nz, nkmb
   integer :: i, j, k, m
 
@@ -1295,10 +1302,34 @@ subroutine PressureForce_FV_Bouss(h, tv, PFu, PFv, G, GV, US, CS, ALE_CSp, ADp, 
 
   ! Calculate 4 integrals through the layer that are required in the
   ! subsequent calculation.
+
+  ! Determine whether int_density_dz_generic_plm will leave its outputs (dpa, intz_dpa, intx_dpa,
+  ! inty_dpa) on the device: GPU build, ALE PLM reconstruction (scheme 1 or 3), non-Stanley,
+  ! accurate anomaly form, and unscaled EOS units. This mirrors that routine's internal offload
+  ! gate so the caller can drop the host round-trip for exactly that case. It is k-independent.
+  idz_on_device = .false.
+#ifdef __NVCOMPILER_OPENMP_GPU
+  if (use_EOS .and. use_ALE .and. (CS%Recon_Scheme == 1 .or. CS%Recon_Scheme == 3) .and. &
+      (.not. CS%use_stanley_pgf) .and. (.not. CS%use_inaccurate_pgf_rho_anom)) then
+    call get_EOS_form_and_scaling(tv%eqn_of_state, eos_form_pf, eos_kg_m3_to_R, eos_C_to_degC, &
+                                  eos_S_to_ppt, eos_RL2_T2_to_Pa, R_to_kg_m3=eos_R_to_kg_m3)
+    idz_on_device = (eos_RL2_T2_to_Pa == 1.0) .and. (eos_R_to_kg_m3 == 1.0) .and. &
+                    (eos_C_to_degC == 1.0) .and. (eos_S_to_ppt == 1.0)
+  endif
+#endif
+
   !$omp target enter data map(alloc: dpa, intx_dpa, inty_dpa, intz_dpa)
 
   if (use_EOS) then
-    !$omp target update from(e) if( (use_ALE .and. CS%Recon_Scheme > 0) .or. &
+    ! e is pulled to the host only for host-side consumers: a host-run int_density (when not
+    ! idz_on_device -- e.g. Recon scheme 2, Stanley, non-unity units), the MassWt diagnostics, the
+    ! correction/reset-intxpa reference-interface searches, or the SAL/tides "new answers" blocks
+    ! (which read e(:,:,1) and read-modify e(:,:,K) on the host). When idz_on_device would otherwise
+    ! suppress the pull, those SAL/tides host reads would see stale e, so keep the pull for them.
+    !$omp target update from(e) if( (use_ALE .and. CS%Recon_Scheme > 0 .and. (.not. idz_on_device)) .or. &
+    !$omp                           CS%correction_intxpa .or. CS%reset_intxpa_integral .or. &
+    !$omp                           (CS%calculate_SAL .and. CS%tides_answer_date>20250131) .or. &
+    !$omp                           (CS%tides .and. CS%tides_answer_date>20250131) .or. &
     !$omp                           (CS%id_MassWt_u > 0) .or. (CS%id_MassWt_v > 0))
     ! transfer tv_tmp%* only if int_density_dz is called
     !$omp target enter data map(to: tv_tmp, tv_tmp%T, tv_tmp%S) &
@@ -1331,8 +1362,13 @@ subroutine PressureForce_FV_Bouss(h, tv, PFu, PFv, G, GV, US, CS, ALE_CSp, ADp, 
                     MassWghtInterp=CS%MassWghtInterp, Z_0p=Z_0p, &
                     MassWghtInterpVanOnly=CS%MassWghtInterpVanOnly, h_nv=dz_nonvanished)
         endif
-        ! defensive update - not sure if it works
-        !$omp target update to(dpa, intx_dpa, inty_dpa, intz_dpa)
+        ! Push the host-computed integrals to the device only when int_density ran on the host
+        ! (Recon scheme 2 / Stanley / non-unity units). When idz_on_device the generic_plm kernels
+        ! already wrote them on the device, so this copy is both unnecessary and would clobber them
+        ! with a stale host copy.
+        if (.not. idz_on_device) then
+          !$omp target update to(dpa, intx_dpa, inty_dpa, intz_dpa)
+        endif
       else
         call int_density_dz(tv_tmp%T(:,:,k), tv_tmp%S(:,:,k), e(:,:,K), e(:,:,K+1), &
                   rho_ref, rho0_int_density, GV%g_Earth, G%HI, tv%eqn_of_state, US, dpa(:,:,k), &
@@ -1953,6 +1989,12 @@ subroutine PressureForce_FV_Bouss(h, tv, PFu, PFv, G, GV, US, CS, ALE_CSp, ADp, 
   !$omp   map(delete:tv_tmp, tv_tmp%T, tv_tmp%S, tv, tv%eqn_of_state, EOSdom2d)
 
   !$omp target exit data map(delete: Z_0p) if (use_EOS)
+
+  ! When idz_on_device, intx_dpa/inty_dpa were written on the device and are not otherwise copied
+  ! back. The SAL/tides gradient diagnostics below read them on the host, so pull them back before
+  ! the device mapping is deleted -- guarded to exactly that host-consuming configuration.
+  !$omp target update from(intx_dpa, inty_dpa) &
+  !$omp   if(idz_on_device .and. (.not. CS%bq_sal_tides) .and. (CS%calculate_SAL .or. CS%tides))
 
   !$omp target exit data &
   !$omp   map(delete: pa, dpa) &
