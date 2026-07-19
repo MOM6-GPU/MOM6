@@ -183,15 +183,24 @@ subroutine Calculate_kappa_shear(u_in, v_in, h, tv, p_surf, kappa_io, tke_io, &
     diag_S2_init, & ! Diagnostic of S2 as provided to this routine [T-2 ~> s-2]
     diag_N2_mean, & ! Diagnostic of N2 averaged over the timestep applied [T-2 ~> s-2]
     diag_S2_mean ! Diagnostic of S2 averaged over the timestep applied [T-2 ~> s-2]
-  real, dimension(SZI_(G),SZK_(GV)) :: &
-    h_2d, &             ! A 2-D version of h [H ~> m or kg m-2].
-    dz_2d, &            ! Vertical distance between interface heights [Z ~> m].
-    u_2d, v_2d, &       ! 2-D versions of u_in and v_in, converted to [L T-1 ~> m s-1].
-    T_2d, S_2d, rho_2d  ! 2-D versions of T [C ~> degC], S [S ~> ppt], and rho [R ~> kg m-3].
-  real, dimension(SZI_(G),SZK_(GV)+1) :: &
-    kappa_2d, & ! 2-D version of kappa_io [H Z T-1 ~> m2 s-1 or Pa s]
-    tke_2d      ! 2-D version tke_io [Z2 T-2 ~> m2 s-2].
+  ! GPU port: the per-J 2-D slabs (h_2d/dz_2d/u_2d/v_2d/T_2d/S_2d/rho_2d) and the per-J kappa_2d/
+  ! tke_2d are gone; the device column loop reads the mapped 3-D inputs (h, u_in, v_in, tv%T, tv%S,
+  ! dz_3d) directly and stages its results in kappa_3d/tke_3d (was the per-J kappa_2d/tke_2d).
+  real, dimension(SZI_(G),SZJ_(G),SZK_(GV)) :: &
+    dz_3d           ! Vertical distance between interface heights [Z ~> m].
+  real, dimension(SZI_(G),SZJ_(G),SZK_(GV)+1) :: &
+    kappa_3d, & ! Device staging array for the columns' averaged kappa [H Z T-1 ~> m2 s-1 or Pa s]
+    tke_3d      ! Device staging array for the columns' TKE [Z2 T-2 ~> m2 s-2].
+  real, dimension(SZI_(G),SZJ_(G)) :: &
+    surface_pres_2d ! The surface pressure at tracer points [R L2 T-2 ~> Pa].
+  ! In GPU builds the per-column private scratch has compile-time-constant sizes so each device
+  ! thread gets stack ("local memory") arrays; runtime-sized privates are device-heap allocated
+  ! per column, which exhausts the default heap and serializes on the allocator.
+#ifdef __NVCOMPILER_OPENMP_GPU
+  real, dimension(GPU_nk_max) :: &
+#else
   real, dimension(SZK_(GV)) :: &
+#endif
     Idz, &      ! The inverse of the thickness of the merged layers [H-1 ~> m2 kg-1].
     h_lay, &    ! The layer thickness [H ~> m or kg m-2]
     dz_lay, &   ! The geometric layer thickness in height units [Z ~> m]
@@ -200,7 +209,11 @@ subroutine Calculate_kappa_shear(u_in, v_in, h, tv, p_surf, kappa_io, tke_io, &
     T0xdz, &    ! The initial temperature times thickness [C H ~> degC m or degC kg m-2] or if
                 ! temperature is not a state variable, the density times thickness [R H ~> kg m-2 or kg2 m-5]
     S0xdz       ! The initial salinity times dz [S H ~> ppt m or ppt kg m-2].
+#ifdef __NVCOMPILER_OPENMP_GPU
+  real, dimension(GPU_nk_max+1) :: &
+#else
   real, dimension(SZK_(GV)+1) :: &
+#endif
     kappa, &    ! The shear-driven diapycnal diffusivity at an interface [H Z T-1 ~> m2 s-1 or Pa s]
     tke, &      ! The Turbulent Kinetic Energy per unit mass at an interface [Z2 T-2 ~> m2 s-2].
     kappa_avg, & ! The time-weighted average of kappa [H Z T-1 ~> m2 s-1 or Pa s]
@@ -219,10 +232,18 @@ subroutine Calculate_kappa_shear(u_in, v_in, h, tv, p_surf, kappa_io, tke_io, &
   logical :: use_temperature  !  If true, temperature and salinity have been
                         ! allocated and are being used as state variables.
 
+#ifdef __NVCOMPILER_OPENMP_GPU
+  integer, dimension(GPU_nk_max+1) :: kc ! The index map between the original
+#else
   integer, dimension(SZK_(GV)+1) :: kc ! The index map between the original
+#endif
                         ! interfaces and the interfaces with massless layers
                         ! merged into nearby massive layers.
+#ifdef __NVCOMPILER_OPENMP_GPU
+  real, dimension(GPU_nk_max+1) :: kf ! The fractional weight of interface kc+1 for
+#else
   real, dimension(SZK_(GV)+1) :: kf ! The fractional weight of interface kc+1 for
+#endif
                         ! interpolating back to the original index space [nondim].
   integer :: is, ie, js, je, i, j, k, nz, nzc
   integer :: eos_form   ! The equation-of-state form id, resolved host-side for the GPU EOS path.
@@ -256,30 +277,62 @@ subroutine Calculate_kappa_shear(u_in, v_in, h, tv, p_surf, kappa_io, tke_io, &
   if (CS%id_N2_mean>0) diag_N2_mean(:,:,:) = 0.0
   if (CS%id_S2_mean>0) diag_S2_mean(:,:,:) = 0.0
 
-  !$OMP parallel do default(private) shared(js,je,is,ie,nz,h,u_in,v_in,use_temperature,tv,G,GV,US, &
-  !$OMP                                     CS,kappa_io,dz_massless,k0dt,p_surf,dt,tke_io,kv_io, &
-  !$OMP                                     eos_form,eos_kg_m3_to_R,eos_C_to_degC,eos_S_to_ppt,eos_RL2_T2_to_Pa, &
-  !$OMP                                     diag_N2_init,diag_S2_init,diag_N2_mean,diag_S2_mean)
-  do j=js,je
-
-    ! Convert layer thicknesses into geometric thickness in height units.
-    call thickness_to_dz(h, tv, dz_2d, j, G, GV)
-
-    do k=1,nz ; do i=is,ie
-      h_2d(i,k) = h(i,j,k)
-      u_2d(i,k) = u_in(i,j,k) ; v_2d(i,k) = v_in(i,j,k)
+  ! GPU port: interpolate p_surf to tracer points on the host, ahead of the device column region
+  ! (p_surf is a possibly-unassociated pointer, simpler kept off the device). Verbatim from the
+  ! former in-column expression, evaluated for every tracer point; land values are never read.
+  surface_pres_2d(:,:) = 0.0
+  if (associated(p_surf)) then
+    do j=js,je ; do i=is,ie
+      surface_pres_2d(i,j) = p_surf(i,j)
     enddo ; enddo
-    if (use_temperature) then ; do k=1,nz ; do i=is,ie
-      T_2d(i,k) = tv%T(i,j,k) ; S_2d(i,k) = tv%S(i,j,k)
-    enddo ; enddo ; else ; do k=1,nz ; do i=is,ie
-      rho_2d(i,k) = GV%Rlay(k) ! Could be tv%Rho(i,j,k) ?
-    enddo ; enddo ; endif
+  endif
+
+  ! Convert layer thicknesses into geometric thickness in height units, over the whole compute
+  ! domain (was a per-J call inside the loop; hoisted so dz_3d can be mapped once).
+  call thickness_to_dz(h, tv, dz_3d, G, GV, US, halo_size=0)
+
+  ! --- GPU port: run the per-column solver on the device.  The columns iterate as a target teams
+  ! loop collapsed over (j,i); every piece of per-column scratch is private (the declare-target
+  ! solver's own locals are automatically private per device thread).  h is host-authoritative in
+  ! the (host) diabatic stack -> refresh.  tv%T/tv%S are persistently mapped (MOM.F90) but this
+  ! non-full_convection path reads the diabatic-mutated fields directly, so refresh them too
+  ! (a map(to:) on an already-present object copies nothing).  u_in/v_in (set_diffusivity's
+  ! u_h/v_h) and dz_3d are fresh host locals.  CS is all scalars plus a diag pointer that is never
+  ! dereferenced in device code, so a per-call shallow map(to:) suffices.  kappa_io/tke_io/kv_io
+  ! are mapped to: (not alloc) and refreshed so the host values (halos, and kappa_io's previous
+  ! contents outside the compute domain) survive the full-array update from below.  diag_* are
+  ! mapped after their (conditional) host zeroing.  kappa_3d/tke_3d are device-only staging for
+  ! what was the per-J kappa_2d/tke_2d.
+  !$omp target enter data map(to: h)
+  !$omp target update to(h)
+  ! tv%T/tv%S are read on the device in the column setup below.  The T/S *data* is persistently
+  ! mapped via MOM's CS%tv (MOM.F90), but that attaches it to a different descriptor; this routine's
+  ! tv dummy must be mapped here so the device can resolve tv%T/tv%S (refcount bump + attach, no
+  ! copy), then update to refreshes the diabatic-mutated values.  (set_viscosity uses this idiom.)
+  if (use_temperature) then
+    !$omp target enter data map(to: tv, tv%T, tv%S)
+    !$omp target update to(tv%T, tv%S)
+  endif
+  !$omp target enter data map(to: u_in, v_in, dz_3d)
+  !$omp target update to(u_in, v_in)
+  !$omp target enter data map(to: CS)
+  !$omp target enter data map(to: surface_pres_2d)
+  !$omp target enter data map(to: kappa_io, tke_io, kv_io)
+  !$omp target update to(kappa_io, tke_io, kv_io)
+  !$omp target enter data map(to: diag_N2_init, diag_S2_init, diag_N2_mean, diag_S2_mean)
+  !$omp target enter data map(alloc: kappa_3d, tke_3d)
 
 !---------------------------------------
 ! Work on each column.
 !---------------------------------------
+  !$omp target teams loop collapse(2) &
+  !$omp   private(nzc, kc, kf, Idz, h_lay, dz_lay, u0xdz, v0xdz, T0xdz, S0xdz, dz_in_lay, &
+  !$omp           f2, surface_pres, kappa, tke, kappa_avg, tke_avg, N2_init, S2_init, &
+  !$omp           N2_mean, S2_mean, k) &
+  !$omp   firstprivate(nz, dt, k0dt, dz_massless, use_temperature, eos_form, &
+  !$omp                eos_kg_m3_to_R, eos_C_to_degC, eos_S_to_ppt, eos_RL2_T2_to_Pa)
+  do j=js,je
     do i=is,ie ; if (G%mask2dT(i,j) > 0.0) then
-    ! call cpu_clock_begin(id_clock_setup)
 
       ! Store a transposed version of the initial arrays.
       ! Any elimination of massless layers would occur here.
@@ -291,25 +344,20 @@ subroutine Calculate_kappa_shear(u_in, v_in, h, tv, p_surf, kappa_io, tke_io, &
           T0xdz(k) = 0.0 ; S0xdz(k) = 0.0
 
           ! Add a new layer if this one has mass.
-!          if ((h_lay(nzc) > 0.0) .and. (h_2d(i,k) > dz_massless)) nzc = nzc+1
           if ((k>CS%nkml) .and. (h_lay(nzc) > 0.0) .and. &
-              (h_2d(i,k) > dz_massless)) nzc = nzc+1
-
-          ! Only merge clusters of massless layers.
-!         if ((h_lay(nzc) > dz_massless) .or. &
-!             ((h_lay(nzc) > 0.0) .and. (h_2d(i,k) > dz_massless))) nzc = nzc+1
+              (h(i,j,k) > dz_massless)) nzc = nzc+1
 
           kc(k) = nzc
-          h_lay(nzc) = h_lay(nzc) + h_2d(i,k)
-          dz_lay(nzc) = dz_lay(nzc) + dz_2d(i,k)
-          u0xdz(nzc) = u0xdz(nzc) + u_2d(i,k)*h_2d(i,k)
-          v0xdz(nzc) = v0xdz(nzc) + v_2d(i,k)*h_2d(i,k)
+          h_lay(nzc) = h_lay(nzc) + h(i,j,k)
+          dz_lay(nzc) = dz_lay(nzc) + dz_3d(i,j,k)
+          u0xdz(nzc) = u0xdz(nzc) + u_in(i,j,k)*h(i,j,k)
+          v0xdz(nzc) = v0xdz(nzc) + v_in(i,j,k)*h(i,j,k)
           if (use_temperature) then
-            T0xdz(nzc) = T0xdz(nzc) + T_2d(i,k)*h_2d(i,k)
-            S0xdz(nzc) = S0xdz(nzc) + S_2d(i,k)*h_2d(i,k)
+            T0xdz(nzc) = T0xdz(nzc) + tv%T(i,j,k)*h(i,j,k)
+            S0xdz(nzc) = S0xdz(nzc) + tv%S(i,j,k)*h(i,j,k)
           else
-            T0xdz(nzc) = T0xdz(nzc) + rho_2d(i,k)*h_2d(i,k)
-            S0xdz(nzc) = S0xdz(nzc) + rho_2d(i,k)*h_2d(i,k)
+            T0xdz(nzc) = T0xdz(nzc) + GV%Rlay(k)*h(i,j,k)
+            S0xdz(nzc) = S0xdz(nzc) + GV%Rlay(k)*h(i,j,k)
           endif
         enddo
         kc(nz+1) = nzc+1
@@ -319,28 +367,28 @@ subroutine Calculate_kappa_shear(u_in, v_in, h, tv, p_surf, kappa_io, tke_io, &
 
         !   Now determine kf, the fractional weight of interface kc when
         ! interpolating between interfaces kc and kc+1.
-        kf(1) = 0.0 ; dz_in_lay = h_2d(i,1)
+        kf(1) = 0.0 ; dz_in_lay = h(i,j,1)
         do k=2,nz
           if (kc(k) > kc(k-1)) then
-            kf(k) = 0.0 ; dz_in_lay = h_2d(i,k)
+            kf(k) = 0.0 ; dz_in_lay = h(i,j,k)
           else
-            kf(k) = dz_in_lay*Idz(kc(k)) ; dz_in_lay = dz_in_lay + h_2d(i,k)
+            kf(k) = dz_in_lay*Idz(kc(k)) ; dz_in_lay = dz_in_lay + h(i,j,k)
           endif
         enddo
         kf(nz+1) = 0.0
       else
         do k=1,nz
-          h_lay(k) = h_2d(i,k)
-          dz_lay(k) = dz_2d(i,k)
-          u0xdz(k) = u_2d(i,k)*h_lay(k) ; v0xdz(k) = v_2d(i,k)*h_lay(k)
+          h_lay(k) = h(i,j,k)
+          dz_lay(k) = dz_3d(i,j,k)
+          u0xdz(k) = u_in(i,j,k)*h_lay(k) ; v0xdz(k) = v_in(i,j,k)*h_lay(k)
         enddo
         if (use_temperature) then
           do k=1,nz
-            T0xdz(k) = T_2d(i,k)*h_lay(k) ; S0xdz(k) = S_2d(i,k)*h_lay(k)
+            T0xdz(k) = tv%T(i,j,k)*h_lay(k) ; S0xdz(k) = tv%S(i,j,k)*h_lay(k)
           enddo
         else
           do k=1,nz
-            T0xdz(k) = rho_2d(i,k)*h_lay(k) ; S0xdz(k) = rho_2d(i,k)*h_lay(k)
+            T0xdz(k) = GV%Rlay(k)*h_lay(k) ; S0xdz(k) = GV%Rlay(k)*h_lay(k)
           enddo
         endif
         nzc = nz
@@ -348,12 +396,9 @@ subroutine Calculate_kappa_shear(u_in, v_in, h, tv, p_surf, kappa_io, tke_io, &
       endif
       f2 = 0.25 * ((G%Coriolis2Bu(I,J) + G%Coriolis2Bu(I-1,J-1)) + &
                    (G%Coriolis2Bu(I,J-1) + G%Coriolis2Bu(I-1,J)))
-      surface_pres = 0.0 ; if (associated(p_surf)) surface_pres = p_surf(i,j)
-
-    ! ----------------------------------------------------    I_Ld2_1d, dz_Int_1d
+      surface_pres = surface_pres_2d(i,j)
 
     ! Set the initial guess for kappa, here defined at interfaces.
-    ! ----------------------------------------------------
       do K=1,nzc+1 ; kappa(K) = CS%kappa_seed ; enddo
 
       call kappa_shear_column(kappa, tke, dt, nzc, f2, surface_pres, &
@@ -363,15 +408,14 @@ subroutine Calculate_kappa_shear(u_in, v_in, h, tv, p_surf, kappa_io, tke_io, &
                               eos_form, eos_kg_m3_to_R, eos_C_to_degC, eos_S_to_ppt, eos_RL2_T2_to_Pa, &
                               use_temperature)
 
-    ! call cpu_clock_begin(id_clock_setup)
     ! Extrapolate from the vertically reduced grid back to the original layers.
       if (nz == nzc) then
         do K=1,nz+1
-          kappa_2d(i,K) = kappa_avg(K)
+          kappa_3d(i,j,K) = kappa_avg(K)
           if (CS%all_layer_TKE_bug) then
-            tke_2d(i,K) = tke(K)
+            tke_3d(i,j,K) = tke(K)
           else
-            tke_2d(i,K) = tke_avg(K)
+            tke_3d(i,j,K) = tke_avg(K)
           endif
         enddo
         if (CS%id_N2_mean>0) then ; do K=1,nz+1
@@ -389,11 +433,11 @@ subroutine Calculate_kappa_shear(u_in, v_in, h, tv, p_surf, kappa_io, tke_io, &
       else
         do K=1,nz+1
           if (kf(K) == 0.0) then
-            kappa_2d(i,K) = kappa_avg(kc(K))
-            tke_2d(i,K) = tke_avg(kc(K))
+            kappa_3d(i,j,K) = kappa_avg(kc(K))
+            tke_3d(i,j,K) = tke_avg(kc(K))
           else
-            kappa_2d(i,K) = (1.0-kf(K)) * kappa_avg(kc(K)) + kf(K) * kappa_avg(kc(K)+1)
-            tke_2d(i,K) = (1.0-kf(K)) * tke_avg(kc(K)) + kf(K) * tke_avg(kc(K)+1)
+            kappa_3d(i,j,K) = (1.0-kf(K)) * kappa_avg(kc(K)) + kf(K) * kappa_avg(kc(K)+1)
+            tke_3d(i,j,K) = (1.0-kf(K)) * tke_avg(kc(K)) + kf(K) * tke_avg(kc(K)+1)
           endif
         enddo
         do K=1,nz+1
@@ -414,21 +458,38 @@ subroutine Calculate_kappa_shear(u_in, v_in, h, tv, p_surf, kappa_io, tke_io, &
           endif
         enddo
       endif
-    ! call cpu_clock_end(id_clock_setup)
     else  ! Land points, still inside the i-loop.
       do K=1,nz+1
-        kappa_2d(i,K) = 0.0 ; tke_2d(i,K) = 0.0
+        kappa_3d(i,j,K) = 0.0 ; tke_3d(i,j,K) = 0.0
       enddo
     endif ; enddo ! i-loop
-
-    do K=1,nz+1 ; do i=is,ie
-      kappa_io(i,j,K) = G%mask2dT(i,j) * kappa_2d(i,K)
-      tke_io(i,j,K) = G%mask2dT(i,j) * tke_2d(i,K)
-      kv_io(i,j,K) = ( G%mask2dT(i,j) * kappa_2d(i,K) ) * CS%Prandtl_turb
-
-    enddo ; enddo
-
   enddo ! end of j-loop
+
+  ! Store the columns' results back in the output arrays (masked), on the device.
+  do concurrent (K=1:nz+1, j=js:je, i=is:ie)
+    kappa_io(i,j,K) = G%mask2dT(i,j) * kappa_3d(i,j,K)
+    tke_io(i,j,K) = G%mask2dT(i,j) * tke_3d(i,j,K)
+    kv_io(i,j,K) = ( G%mask2dT(i,j) * kappa_3d(i,j,K) ) * CS%Prandtl_turb
+  enddo
+
+  ! The checksums and post_data below are still on the host; copy back the outputs (and, guarded
+  ! by the same conditions as their consumers, the diag_* arrays), then mirror the enter data.
+  !$omp target update from(kappa_io, tke_io, kv_io)
+  if ((CS%id_N2_init>0) .or. (CS%id_S2_init>0) .or. (CS%id_N2_mean>0) .or. (CS%id_S2_mean>0) &
+      .or. CS%debug) then
+    !$omp target update from(diag_N2_init, diag_S2_init, diag_N2_mean, diag_S2_mean)
+  endif
+
+  !$omp target exit data map(release: kappa_3d, tke_3d)
+  !$omp target exit data map(release: diag_N2_init, diag_S2_init, diag_N2_mean, diag_S2_mean)
+  !$omp target exit data map(release: kappa_io, tke_io, kv_io)
+  !$omp target exit data map(release: surface_pres_2d)
+  !$omp target exit data map(release: CS)
+  !$omp target exit data map(release: u_in, v_in, dz_3d)
+  if (use_temperature) then
+    !$omp target exit data map(release: tv, tv%T, tv%S)
+  endif
+  !$omp target exit data map(release: h)
 
   if (CS%debug) then
     call hchksum(diag_N2_init, "kappa_shear N2_init", G%HI, unscale=US%s_to_T**2)
