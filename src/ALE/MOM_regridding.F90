@@ -1465,6 +1465,28 @@ subroutine filtered_grid_motion( CS, nk, z_old, z_new, dz_g )
   real, dimension(CS%nk+1), intent(in)    :: z_new !< New grid position before filtering [H ~> m or kg m-2]
   real, dimension(CS%nk+1), intent(inout) :: dz_g  !< Change in interface positions including
                                                    !! the effects of filtering [H ~> m or kg m-2]
+
+  call filtered_grid_motion_loc( CS%nk, CS%depth_of_time_filter_shallow, CS%depth_of_time_filter_deep, &
+                                 CS%old_grid_weight, nk, z_old, z_new, dz_g )
+
+end subroutine filtered_grid_motion
+
+!> Element-wise, control-structure-free form of filtered_grid_motion: it takes the (host-resolved)
+!! target level count and filter parameters explicitly so it can be made device-callable, avoiding a
+!! dereference of regridding_CS inside a device region.  The arithmetic is verbatim.
+subroutine filtered_grid_motion_loc( nk_tgt, filt_shallow, filt_deep, old_grid_wt, nk, z_old, z_new, dz_g )
+  integer,                   intent(in)    :: nk_tgt !< Number of cells in the target grid (was CS%nk)
+  real,                      intent(in)    :: filt_shallow !< Depth at which the shallow filter
+                                                    !! timescale applies [H ~> m or kg m-2] (was CS%depth_of_time_filter_shallow)
+  real,                      intent(in)    :: filt_deep !< Depth at which the deep filter timescale
+                                                    !! applies [H ~> m or kg m-2] (was CS%depth_of_time_filter_deep)
+  real,                      intent(in)    :: old_grid_wt !< Weight given to the old grid when
+                                                    !! filtering [nondim] (was CS%old_grid_weight)
+  integer,                   intent(in)    :: nk !< Number of cells in source grid
+  real, dimension(nk+1),     intent(in)    :: z_old !< Old grid position [H ~> m or kg m-2]
+  real, dimension(nk_tgt+1), intent(in)    :: z_new !< New grid position before filtering [H ~> m or kg m-2]
+  real, dimension(nk_tgt+1), intent(inout) :: dz_g  !< Change in interface positions including
+                                                   !! the effects of filtering [H ~> m or kg m-2]
   ! Local variables
   real :: sgn     ! The sign convention for downward [nondim].
   real :: dz_tgt  ! The target grid movement of the unfiltered grid [H ~> m or kg m-2]
@@ -1491,19 +1513,19 @@ subroutine filtered_grid_motion( CS, nk, z_old, z_new, dz_g )
   logical :: debug = .false.
   integer :: k
 
-  if ((z_old(nk+1) - z_old(1)) * (z_new(CS%nk+1) - z_new(1)) < 0.0) then
+  if ((z_old(nk+1) - z_old(1)) * (z_new(nk_tgt+1) - z_new(1)) < 0.0) then
     call MOM_error(FATAL, "filtered_grid_motion: z_old and z_new use different sign conventions.")
-  elseif ((z_old(nk+1) - z_old(1)) * (z_new(CS%nk+1) - z_new(1)) == 0.0) then
+  elseif ((z_old(nk+1) - z_old(1)) * (z_new(nk_tgt+1) - z_new(1)) == 0.0) then
     ! This is a massless column, so do nothing and return.
-    do k=1,CS%nk+1 ; dz_g(k) = 0.0 ; enddo ; return
-  elseif ((z_old(nk+1) - z_old(1)) + (z_new(CS%nk+1) - z_new(1)) > 0.0) then
+    do k=1,nk_tgt+1 ; dz_g(k) = 0.0 ; enddo ; return
+  elseif ((z_old(nk+1) - z_old(1)) + (z_new(nk_tgt+1) - z_new(1)) > 0.0) then
     sgn = 1.0
   else
     sgn = -1.0
   endif
 
   if (debug) then
-    do k=2,CS%nk+1
+    do k=2,nk_tgt+1
       if (sgn*(z_new(k)-z_new(k-1)) < -5e-16*(abs(z_new(k))+abs(z_new(k-1))) ) &
           call MOM_error(FATAL, "filtered_grid_motion: z_new is tangled.")
     enddo
@@ -1514,9 +1536,9 @@ subroutine filtered_grid_motion( CS, nk, z_old, z_new, dz_g )
     ! ddz_g_s(:) = 0.0 ; ddz_g_d(:) = 0.0
   endif
 
-  zs = CS%depth_of_time_filter_shallow
-  zd = CS%depth_of_time_filter_deep
-  wtd = 1.0 - CS%old_grid_weight
+  zs = filt_shallow
+  zd = filt_deep
+  wtd = 1.0 - old_grid_wt
   Iwtd = 1.0 / wtd
 
   dzwt = (zd - zs)
@@ -1526,7 +1548,7 @@ subroutine filtered_grid_motion( CS, nk, z_old, z_new, dz_g )
 
   dz_g(1) = 0.0
   z_old_k = z_old(1)
-  do k = 2,CS%nk+1
+  do k = 2,nk_tgt+1
     if (k<=nk+1) z_old_k = z_old(k) ! This allows for virtual z_old interface at bottom of the model
     ! zr1 is positive and increases with depth, and dz_tgt is positive downward.
     dz_tgt = sgn*(z_new(k) - z_old_k)
@@ -1595,17 +1617,17 @@ subroutine filtered_grid_motion( CS, nk, z_old, z_new, dz_g )
 
   if (debug) then
     z_old_k = z_old(1)
-    do k=1,CS%nk+1
+    do k=1,nk_tgt+1
       if (k<=nk+1) z_old_k = z_old(k) ! This allows for virtual z_old interface at bottom of the model
       z_act(k) = z_old_k + dz_g(k)
     enddo
-    do k=2,CS%nk+1
+    do k=2,nk_tgt+1
       if (sgn*((z_act(k))-z_act(k-1)) < -1e-15*(abs(z_act(k))+abs(z_act(k-1))) ) &
           call MOM_error(FATAL, "filtered_grid_motion: z_output is tangled.")
     enddo
   endif
 
-end subroutine filtered_grid_motion
+end subroutine filtered_grid_motion_loc
 
 !> Builds a z*-coordinate grid with partial steps (Adcroft and Campin, 2004).
 !! z* is defined as
@@ -2164,6 +2186,21 @@ subroutine adjust_interface_motion( CS, nk, h_old, dz_int )
   real, dimension(nk),      intent(in)    :: h_old  !< Layer thicknesses on the old grid [H ~> m or kg m-2]
   real, dimension(CS%nk+1), intent(inout) :: dz_int !< Interface movements, adjusted to keep the thicknesses
                                                     !! thicker than their minimum value [H ~> m or kg m-2]
+
+  call adjust_interface_motion_loc( CS%nk, CS%min_thickness, nk, h_old, dz_int )
+
+end subroutine adjust_interface_motion
+
+!> Element-wise, control-structure-free form of adjust_interface_motion: it takes the (host-resolved)
+!! target level count and minimum thickness explicitly so it can be made device-callable.  Verbatim.
+subroutine adjust_interface_motion_loc( nk_tgt, min_thick, nk, h_old, dz_int )
+  integer,                   intent(in)    :: nk_tgt !< Number of cells in the target grid (was CS%nk)
+  real,                      intent(in)    :: min_thick !< Minimum allowed thickness [H ~> m or kg m-2]
+                                                    !! (was CS%min_thickness)
+  integer,                   intent(in)    :: nk !< Number of layers in h_old
+  real, dimension(nk),       intent(in)    :: h_old  !< Layer thicknesses on the old grid [H ~> m or kg m-2]
+  real, dimension(nk_tgt+1), intent(inout) :: dz_int !< Interface movements, adjusted to keep the thicknesses
+                                                    !! thicker than their minimum value [H ~> m or kg m-2]
   ! Local variables
   real :: h_new   ! A layer thickness on the new grid [H ~> m or kg m-2]
   real :: eps     ! A tiny relative thickness [nondim]
@@ -2175,7 +2212,7 @@ subroutine adjust_interface_motion( CS, nk, h_old, dz_int )
   eps = 1. ; eps = epsilon(eps)
 
   h_total = 0. ; h_err = 0.
-  do k = 1, min(CS%nk,nk)
+  do k = 1, min(nk_tgt,nk)
     h_total = h_total + h_old(k)
     h_err = h_err + max( h_old(k), abs(dz_int(k)), abs(dz_int(k+1)) )*eps
     h_new = h_old(k) + ( dz_int(k) - dz_int(k+1) )
@@ -2187,8 +2224,8 @@ subroutine adjust_interface_motion( CS, nk, h_old, dz_int )
                      'implied h<0 is larger than roundoff!')
     endif
   enddo
-  if (CS%nk>nk) then
-    do k = nk+1, CS%nk
+  if (nk_tgt>nk) then
+    do k = nk+1, nk_tgt
       h_err = h_err + max( abs(dz_int(k)), abs(dz_int(k+1)) )*eps
       h_new = ( dz_int(k) - dz_int(k+1) )
       if (h_new < -3.0*h_err) then
@@ -2200,10 +2237,10 @@ subroutine adjust_interface_motion( CS, nk, h_old, dz_int )
       endif
     enddo
   endif
-  do k = min(CS%nk,nk),2,-1
+  do k = min(nk_tgt,nk),2,-1
     h_new = h_old(k) + ( dz_int(k) - dz_int(k+1) )
-    if (h_new<CS%min_thickness) &
-        dz_int(k) = ( dz_int(k+1) - h_old(k) ) + CS%min_thickness ! Implies next h_new = min_thickness
+    if (h_new<min_thick) &
+        dz_int(k) = ( dz_int(k+1) - h_old(k) ) + min_thick ! Implies next h_new = min_thickness
     h_new = h_old(k) + ( dz_int(k) - dz_int(k+1) )
     if (h_new<0.) &
         dz_int(k) = ( 1. - eps ) * ( dz_int(k+1) - h_old(k) ) ! Backup in case min_thickness==0
@@ -2219,7 +2256,7 @@ subroutine adjust_interface_motion( CS, nk, h_old, dz_int )
   enddo
  !if (dz_int(1)/=0.) stop 'MOM_regridding: adjust_interface_motion() surface moved'
 
-end subroutine adjust_interface_motion
+end subroutine adjust_interface_motion_loc
 
 
 !------------------------------------------------------------------------------
