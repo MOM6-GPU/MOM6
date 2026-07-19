@@ -604,7 +604,11 @@ subroutine int_density_dz_generic_plm(k, tv, T_t, T_b, S_t, S_b, e, rho_ref, &
   offload_phase1 = .false. ; offload_phase2 = .false. ; offload_phase3 = .false.
 #ifdef __NVCOMPILER_OPENMP_GPU
   offload_phase1 = (.not. use_stanley_eos) .and. eos_unity .and. use_rho_ref
-  offload_phase2 = offload_phase1  ! (settable independently for x-only failure bisection)
+  ! These must track offload_phase1: the caller (MOM_PressureForce_FV) mirrors this gate to decide
+  ! idz_on_device and no longer copies the outputs back to the host, so decoupling a phase would
+  ! leave its host-computed integral (intx/inty_dpa) stranded on the host while the caller reads a
+  ! stale device copy. Do not set them independently now that the device->host round-trip is gone.
+  offload_phase2 = offload_phase1
   offload_phase3 = offload_phase1
   ! On GPU builds the non-Stanley density integrals below are evaluated with the device-callable
   ! dispatcher, which only covers ROQUET_RHO (in-situ density and anomaly) and buggy_Wright
@@ -1141,21 +1145,11 @@ subroutine int_density_dz_generic_plm(k, tv, T_t, T_b, S_t, S_b, e, rho_ref, &
    endif ! offload_phase3
   endif ! present(inty_dpa)
 
-  ! Consolidated device->host copy-back: the device now holds dpa/intz_dpa (phase 1) and
-  ! intx_dpa/inty_dpa (phases 2/3). Refresh the host so the caller's kept "update to(dpa,...)"
-  ! does not overwrite them with stale host values. Removed in increment E with the round-trip.
+  ! The outputs dpa/intz_dpa/intx_dpa/inty_dpa are left device-resident: the caller consumes them
+  ! entirely in its own device regions (interface-pressure accumulation and the PFu/PFv loops), so
+  ! there is no device->host copy-back here. Only the per-call z0pres scratch mapping is released.
   if (offload_phase1) then
-    !$omp target update from(dpa)
-    if (do_intz) then
-      !$omp target update from(intz_dpa)
-    endif
     !$omp target exit data map(release: z0pres)
-  endif
-  if (offload_phase2 .and. present(intx_dpa)) then
-    !$omp target update from(intx_dpa)
-  endif
-  if (offload_phase3 .and. present(inty_dpa)) then
-    !$omp target update from(inty_dpa)
   endif
 
 end subroutine int_density_dz_generic_plm
