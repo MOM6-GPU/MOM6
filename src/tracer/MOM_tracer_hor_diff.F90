@@ -39,6 +39,13 @@ implicit none ; private
 
 public tracer_hordiff, tracer_hor_diff_init, tracer_hor_diff_end
 
+!> On GPU builds this makes the per-column private scratch in tracer_epipycnal_ML_diff's device
+!! regions fixed-size (stack) arrays instead of runtime-sized privates, which nvfortran cannot
+!! place in local memory (NVFORTRAN-W-0155) and instead spills to slow device global memory.
+!! Checked against GV%ke in tracer_epipycnal_ML_diff.  Unused in CPU builds, where the
+!! declarations keep their exact SZK_(GV) sizes.
+integer, parameter :: GPU_nk_max = 128
+
 !> The control structure for along-layer and epineutral tracer diffusion
 type, public :: tracer_hor_diff_CS ; private
   real    :: KhTr           !< The along-isopycnal tracer diffusivity [L2 T-1 ~> m2 s-1].
@@ -800,7 +807,11 @@ subroutine tracer_epipycnal_ML_diff(h, dt, Tr, ntr, khdt_epi_x, khdt_epi_y, G, &
   integer, dimension(SZI_(G),SZK_(GV), SZJ_(G)) :: &
     k0_srt     ! The original k-index that each layer of the sorted column corresponds to.
 
+#ifdef __NVCOMPILER_OPENMP_GPU
+  real, dimension(GPU_nk_max) :: &
+#else
   real, dimension(SZK_(GV)) :: &
+#endif
     h_demand_L, & ! The thickness in the left column that is demanded to match the thickness
                   ! in the counterpart [H ~> m or kg m-2].
     h_demand_R, & ! The thickness in the right column that is demanded to match the thickness
@@ -843,10 +854,18 @@ subroutine tracer_epipycnal_ML_diff(h, dt, Tr, ntr, khdt_epi_x, khdt_epi_y, G, &
 
   ! The total number of pairings is usually much less than twice the number of layers, but
   ! the memory in these 1-d columns of pairings can be allocated generously for safety.
+#ifdef __NVCOMPILER_OPENMP_GPU
+  integer, dimension(GPU_nk_max*2) :: &
+#else
   integer, dimension(SZK_(GV)*2) :: &
+#endif
     kbs_Lp, &   ! The sorted indices of the Left and Right columns for
     kbs_Rp      ! each pairing.
+#ifdef __NVCOMPILER_OPENMP_GPU
+  logical, dimension(GPU_nk_max*2) :: &
+#else
   logical, dimension(SZK_(GV)*2) :: &
+#endif
     left_set, &  ! If true, the left or right point determines the density of
     right_set    ! of the trio.  If densities are exactly equal, both are true.
 
@@ -863,6 +882,11 @@ subroutine tracer_epipycnal_ML_diff(h, dt, Tr, ntr, khdt_epi_x, khdt_epi_y, G, &
   is = G%isc ; ie = G%iec ; js = G%jsc ; je = G%jec ; nz = GV%ke
   isd = G%isd ; ied = G%ied ; jsd = G%jsd ; jed = G%jed
   IsdB = G%IsdB ; IedB = G%IedB ; JsdB = G%JsdB ; JedB = G%JedB
+#ifdef __NVCOMPILER_OPENMP_GPU
+  if (nz > GPU_nk_max) call MOM_error(FATAL, &
+    "tracer_epipycnal_ML_diff: GPU builds require GV%ke <= GPU_nk_max because the device column "//&
+    "regions use fixed-size private scratch arrays; increase GPU_nk_max in MOM_tracer_hor_diff.F90.")
+#endif
   Idt = 1.0 / dt
   nkmb = GV%nk_rho_varies
 
