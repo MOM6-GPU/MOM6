@@ -23,7 +23,8 @@ type, public :: zlike_CS ; private
   real, allocatable, dimension(:) :: coordinateResolution
 end type zlike_CS
 
-public init_coord_zlike, set_zlike_params, build_zstar_column, build_zstar_column_loc, end_coord_zlike
+public init_coord_zlike, set_zlike_params, build_zstar_column, build_zstar_column_loc
+public get_zlike_coord_res, end_coord_zlike
 
 contains
 
@@ -79,19 +80,29 @@ subroutine build_zstar_column(CS, depth, total_thickness, zInterface, &
   real, optional,           intent(in)    :: zScale !< Scaling factor from the target coordinate resolution
                                                     !! in Z to desired units for zInterface, perhaps Z_to_H,
                                                     !! often [nondim] or [H Z-1 ~> 1 or kg m-3]
+  real :: z_scale_w ! zScale with its default resolved on the host
 
+  z_scale_w = 1.0 ; if (present(zScale)) z_scale_w = zScale
   call build_zstar_column_loc(CS%nk, CS%min_thickness, CS%coordinateResolution, depth, &
-                              total_thickness, zInterface, z_rigid_top=z_rigid_top, &
-                              eta_orig=eta_orig, zScale=zScale)
+                              total_thickness, zInterface, z_scale_w, z_rigid_top, eta_orig)
 
 end subroutine build_zstar_column
+
+!> Copy the target coordinate resolution out of a zlike_CS (a private component), for callers that
+!! need it as a plain array -- e.g. to hoist it onto a device region without dereferencing the CS.
+subroutine get_zlike_coord_res(CS, coordinateResolution)
+  type(zlike_CS),     intent(in)  :: CS !< Coordinate control structure
+  real, dimension(:), intent(out) :: coordinateResolution !< Target coordinate resolution [Z ~> m]
+  integer :: k
+  do k=1,CS%nk ; coordinateResolution(k) = CS%coordinateResolution(k) ; enddo
+end subroutine get_zlike_coord_res
 
 !> Builds a z* coordinate with a minimum thickness.  This is the element-wise, control-structure-free
 !! form of build_zstar_column: it takes the (host-resolved) scalar and array parameters explicitly so
 !! it can be made device-callable, avoiding a dereference of the nested (pointer + allocatable) zlike_CS
 !! inside a device region.  The arithmetic is verbatim from the former build_zstar_column body.
 subroutine build_zstar_column_loc(nk, min_thick, coordinateResolution, depth, total_thickness, &
-                                  zInterface, z_rigid_top, eta_orig, zScale)
+                                  zInterface, z_scale, z_rigid_top, eta_orig)
   integer,                  intent(in)    :: nk !< Number of levels to be generated
   real,                     intent(in)    :: min_thick !< Minimum thickness allowed for layers, in the
                                                    !! same units as depth [Z ~> m] or [H ~> m or kg m-2]
@@ -102,21 +113,20 @@ subroutine build_zstar_column_loc(nk, min_thick, coordinateResolution, depth, to
                                                    !! units as depth) [Z ~> m] or [H ~> m or kg m-2]
   real, dimension(nk+1),    intent(inout) :: zInterface !< Absolute positions of interfaces (in the same
                                                    !! units as depth) [Z ~> m] or [H ~> m or kg m-2]
+  real,                     intent(in)    :: z_scale !< Scaling factor from the target coordinate resolution
+                                                   !! in Z to desired units for zInterface (was optional zScale;
+                                                   !! required here so device call sites need no keyword args)
   real, optional,           intent(in)    :: z_rigid_top !< The height of a rigid top (positive upward in the same
                                                    !! units as depth) [Z ~> m] or [H ~> m or kg m-2]
   real, optional,           intent(in)    :: eta_orig !< The actual original height of the top (in the same
                                                    !! units as depth) [Z ~> m] or [H ~> m or kg m-2]
-  real, optional,           intent(in)    :: zScale !< Scaling factor from the target coordinate resolution
-                                                    !! in Z to desired units for zInterface, perhaps Z_to_H,
-                                                    !! often [nondim] or [H Z-1 ~> 1 or kg m-3]
   ! Local variables
   real :: eta   ! Free surface height [Z ~> m] or [H ~> m or kg m-2]
   real :: stretching ! A stretching factor for the coordinate [nondim]
-  real :: dh, min_thickness, z0_top, z_star, z_scale ! Thicknesses or heights [Z ~> m] or [H ~> m or kg m-2]
+  real :: dh, min_thickness, z0_top, z_star ! Thicknesses or heights [Z ~> m] or [H ~> m or kg m-2]
   integer :: k
   logical :: new_zstar_def
-
-  z_scale = 1.0 ; if (present(zScale)) z_scale = zScale
+  !$omp declare target
 
   new_zstar_def = .false.
   min_thickness = min( min_thick, total_thickness/real(nk) )
