@@ -333,14 +333,13 @@ end type ePBL_column_diags
 !$omp declare target(find_mstar, mstar_Langmuir)
 !$omp declare target(ePBL_column)
 
-! TODO(gpu-bitwise-repro): ePBL is the ONE routine on feat/port-ePBL that is not yet GPU/CPU
-! bit-for-bit. The device run differs from host at ~1e-13 in the energy diagnostic (T/S/mass are
-! bit-identical) SOLELY because of device-vs-host libm/libdevice divergence in transcendental ops
-! in this routine's on-device kernels -- there is no deterministic drop-in for these (unlike the
-! x**(1/3) cube roots, which the answer_date>=20240101 path already handles via cuberoot()). The
-! real fix is a matched-transcendental / bitwise-repro implementation being done by Marshall; do NOT
-! duplicate it here. The live (benchmark_ALE) device-vs-host transcendental sites, for Marshall's
-! pass / for the eventual GPU==CPU verify against ocean_only/cpu_build:
+! RESOLVED(gpu-bitwise-repro) 2026-07-20: ePBL is now GPU/CPU bit-for-bit -- the on-device
+! transcendentals below were routed through the reproducible kernels exp_reprod/log_reprod/
+! erfc_reprod (MOM_intrinsic_functions), and a same-source nvfortran-CPU build (ocean_only/cpu_build)
+! reproduces the GPU benchmark_ALE ocean.stats bit-for-bit (empty diff). These prototype reprod
+! kernels change answers slightly vs the intrinsics (like cuberoot vs x**(1/3)); coordinate with
+! Marshall's transcendental-repro pass, which may supersede them. The sites that were wired (kept as
+! a record; live in benchmark_ALE) were the device-vs-host divergence before the fix:
 !   - find_PE_chg / find_PE_chg_orig : exp() in the PE-change integrals (core, per interface x
 !       iteration -- the likely dominant contributor).
 !   - exp_decay_TKE_adjust (~:1533)  : exp(-h*Idecay_len_TKE) TKE decay.
