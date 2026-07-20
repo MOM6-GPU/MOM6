@@ -41,6 +41,11 @@ interface thickness_to_dz
   module procedure thickness_to_dz_3d, thickness_to_dz_jslice
 end interface thickness_to_dz
 
+!> Computes the density of the near-bottom water in the ocean.
+interface find_rho_bottom
+  module procedure find_rho_bottom_1d, find_rho_bottom_2d
+end interface find_rho_bottom
+
 contains
 
 !> Calculates the change in height across layers, using the appropriate form for
@@ -486,7 +491,7 @@ end subroutine find_col_mass
 
 !> Determine the in situ density averaged over a specified distance from the bottom,
 !! calculating it as the inverse of the mass-weighted average specific volume.
-subroutine find_rho_bottom(G, GV, US, tv, h, dz, pres_int, dz_avg, j, Rho_bot, h_bot, k_bot)
+subroutine find_rho_bottom_1d(G, GV, US, tv, h, dz, pres_int, dz_avg, j, Rho_bot, h_bot, k_bot)
   type(ocean_grid_type),    intent(in)  :: G    !< The ocean's grid structure
   type(verticalGrid_type),  intent(in)  :: GV   !< The ocean's vertical grid structure
   type(unit_scale_type),    intent(in)  :: US   !< A dimensional unit scaling type
@@ -663,8 +668,205 @@ subroutine find_rho_bottom(G, GV, US, tv, h, dz, pres_int, dz_avg, j, Rho_bot, h
     enddo
   endif
 
-end subroutine find_rho_bottom
+end subroutine find_rho_bottom_1d
 
+!> Computes the density of the near-bottom water for a j-block of rows, using pre-computed
+!! blocked arrays with an explicit j-block index dimension.
+subroutine find_rho_bottom_2d(G, GV, US, tv, h, dz, pres_int, dz_avg, jstart, jend, nj, Rho_bot, h_bot, k_bot)
+  type(ocean_grid_type),    intent(in)  :: G    !< The ocean's grid structure
+  type(verticalGrid_type),  intent(in)  :: GV   !< The ocean's vertical grid structure
+  type(unit_scale_type),    intent(in)  :: US   !< A dimensional unit scaling type
+  type(thermo_var_ptrs),    intent(in)  :: tv   !< Structure containing pointers to any available
+                                                !! thermodynamic fields.
+  real, dimension(SZI_(G),SZJ_(G),SZK_(GV)), &
+                            intent(in)  :: h    !< Layer thicknesses [H ~> m or kg m-2]
+  integer,                  intent(in)  :: nj   !< Number of j-rows in the block
+  real, dimension(SZI_(G),SZK_(GV),nj), &
+                            intent(in)  :: dz   !< Height change across layers [Z ~> m]
+  real, dimension(SZI_(G),SZK_(GV)+1,nj), &
+                            intent(in)  :: pres_int !< Pressure at each interface [R L2 T-2 ~> Pa]
+  real, dimension(SZI_(G),nj), intent(in)  :: dz_avg !< The vertical distance over which to average [Z ~> m]
+  integer,                  intent(in)  :: jstart !< Starting j-index of this block
+  integer,                  intent(in)  :: jend !< Ending j-index of this block
+  real, dimension(SZI_(G),nj), intent(out) :: Rho_bot  !< Near-bottom density [R ~> kg m-3].
+  real, dimension(SZI_(G),nj), intent(out) :: h_bot !< Bottom boundary layer thickness [H ~> m or kg m-2]
+  integer, dimension(SZI_(G),nj), intent(out) :: k_bot !< Bottom boundary layer top layer index
+
+  ! Local variables
+  real :: hb(SZI_(G),nj)         ! Running sum of the thickness in the bottom boundary layer [H ~> m or kg m-2]
+  real :: SpV_h_bot(SZI_(G),nj)  ! Running sum of the specific volume times thickness in the bottom
+                                 ! boundary layer [H R-1 ~> m4 kg-1 or m]
+  real :: dz_bbl_rem(SZI_(G),nj) ! Vertical extent of the boundary layer that has yet to be accounted
+                                 ! for [Z ~> m]
+  real :: h_bbl_frac(SZI_(G),nj) ! Thickness of the fractional layer that makes up the top of the
+                                 ! boundary layer [H ~> m or kg m-2]
+  real :: T_bbl(SZI_(G),nj)      ! Temperature of the fractional layer that makes up the top of the
+                                 ! boundary layer [C ~> degC]
+  real :: S_bbl(SZI_(G),nj)      ! Salinity of the fractional layer that makes up the top of the
+                                 ! boundary layer [S ~> ppt]
+  real :: P_bbl(SZI_(G),nj)      ! Pressure the top of the boundary layer [R L2 T-2 ~> Pa]
+  real :: dp(SZI_(G),nj)         ! Pressure change across the fractional layer that makes up the top
+                                 ! of the boundary layer [R L2 T-2 ~> Pa]
+  real :: SpV_bbl(SZI_(G),nj)    ! In situ specific volume of the fractional layer that makes up the
+                                 ! top of the boundary layer [R-1 ~> m3 kg-1]
+  real :: frac_in             ! The fraction of a layer that is within the bottom boundary layer [nondim]
+  logical :: do_i(SZI_(G),nj), do_any
+  logical :: use_EOS
+  integer, dimension(2) :: EOSdom ! The i-computational domain for the equation of state
+  integer :: i, j, k, is, ie, nz, jj
+
+  is = G%isc ; ie = G%iec ; nz = GV%ke
+
+  use_EOS = associated(tv%T) .and. associated(tv%S) .and. associated(tv%eqn_of_state)
+
+  if (GV%Boussinesq .or. GV%semi_Boussinesq .or. .not.allocated(tv%SpV_avg)) then
+    ! Obtain bottom boundary layer thickness and index of top layer
+    do j=jstart,jend ; jj = j - jstart + 1
+      do i=is,ie
+        rho_bot(i,jj) = GV%Rho0
+        hb(i,jj) = 0.0 ; h_bot(i,jj) = 0.0 ; k_bot(i,jj) = nz
+        dz_bbl_rem(i,jj) = G%mask2dT(i,j) * max(0.0, dz_avg(i,jj))
+        do_i(i,jj) = .true.
+        if (G%mask2dT(i,j) <= 0.0) then
+          h_bbl_frac(i,jj) = 0.0
+          do_i(i,jj) = .false.
+        endif
+      enddo
+    enddo
+
+    do j=jstart,jend ; jj = j - jstart + 1 ; do k=nz,1,-1
+      do_any = .false.
+      
+        do i=is,ie ; if (do_i(i,jj)) then
+          if (dz(i,k,jj) < dz_bbl_rem(i,jj)) then
+            ! This layer is fully within the averaging depth.
+            dz_bbl_rem(i,jj) = dz_bbl_rem(i,jj) - dz(i,k,jj)
+            hb(i,jj) = hb(i,jj) + h(i,j,k)
+            k_bot(i,jj) = k
+            do_any = .true.
+          else
+            if (dz(i,k,jj) > 0.0) then
+              frac_in = dz_bbl_rem(i,jj) / dz(i,k,jj)
+              if (frac_in >= 0.5) k_bot(i,jj) = k ! update bbl top index if >= 50% of layer
+            else
+              frac_in = 0.0
+            endif
+            h_bbl_frac(i,jj) = frac_in * h(i,j,k)
+            dz_bbl_rem(i,jj) = 0.0
+            do_i(i,jj) = .false.
+          endif
+        endif ; enddo
+      enddo
+      if (.not.do_any) exit
+    enddo
+    do j=jstart,jend ; jj = j - jstart + 1
+      do i=is,ie ; if (do_i(i,jj)) then
+        ! The nominal bottom boundary layer is thicker than the water column, but layer 1 is
+        ! already included in the averages.  These values are set so that the call to find
+        ! the layer-average specific volume will behave sensibly.
+        h_bbl_frac(i,jj) = 0.0
+      endif ; enddo
+    enddo
+
+    do j=jstart,jend ; jj = j - jstart + 1
+      do i=is,ie
+        if (hb(i,jj) + h_bbl_frac(i,jj) < GV%H_subroundoff) h_bbl_frac(i,jj) = GV%H_subroundoff
+        h_bot(i,jj) = hb(i,jj) + h_bbl_frac(i,jj)
+      enddo
+    enddo
+
+  else
+    ! Check that SpV_avg has been set.
+    if (tv%valid_SpV_halo < 0) call MOM_error(FATAL, &
+        "find_rho_bottom called in fully non-Boussinesq mode with invalid values of SpV_avg.")
+
+    ! Set the bottom density to the inverse of the in situ specific volume averaged over the
+    ! specified distance, with care taken to avoid having compressibility lead to an imprint
+    ! of the layer thicknesses on this density.
+    do j=jstart,jend ; jj = j - jstart + 1
+      do i=is,ie
+        hb(i,jj) = 0.0 ; SpV_h_bot(i,jj) = 0.0 ; h_bot(i,jj) = 0.0 ; k_bot(i,jj) = nz
+        dz_bbl_rem(i,jj) = G%mask2dT(i,j) * max(0.0, dz_avg(i,jj))
+        do_i(i,jj) = .true.
+        if (G%mask2dT(i,j) <= 0.0) then
+          ! Set acceptable values for calling the equation of state over land.
+          T_bbl(i,jj) = 0.0 ; S_bbl(i,jj) = 0.0 ; dp(i,jj) = 0.0 ; P_bbl(i,jj) = 0.0
+          SpV_bbl(i,jj) = 1.0 ! This value is arbitrary, provided it is non-zero.
+          h_bbl_frac(i,jj) = 0.0
+          do_i(i,jj) = .false.
+        endif
+      enddo
+    enddo
+
+    do k=nz,1,-1
+      do_any = .false.
+      do j=jstart,jend ; jj = j - jstart + 1
+        do i=is,ie ; if (do_i(i,jj)) then
+          if (dz(i,k,jj) < dz_bbl_rem(i,jj)) then
+            ! This layer is fully within the averaging depth.
+            SpV_h_bot(i,jj) = SpV_h_bot(i,jj) + h(i,j,k) * tv%SpV_avg(i,j,k)
+            dz_bbl_rem(i,jj) = dz_bbl_rem(i,jj) - dz(i,k,jj)
+            hb(i,jj) = hb(i,jj) + h(i,j,k)
+            k_bot(i,jj) = k
+            do_any = .true.
+          else
+            if (dz(i,k,jj) > 0.0) then
+              frac_in = dz_bbl_rem(i,jj) / dz(i,k,jj)
+              if (frac_in >= 0.5) k_bot(i,jj) = k ! update bbl top index if >= 50% of layer
+            else
+              frac_in = 0.0
+            endif
+            if (use_EOS) then
+              ! Store the properties of this layer to determine the average
+              ! specific volume of the portion that is within the BBL.
+              T_bbl(i,jj) = tv%T(i,j,k) ; S_bbl(i,jj) = tv%S(i,j,k)
+              dp(i,jj) = frac_in * (GV%g_Earth*GV%H_to_RZ * h(i,j,k))
+              P_bbl(i,jj) = pres_int(i,K,jj) + (1.0-frac_in) * (GV%g_Earth*GV%H_to_RZ * h(i,j,k))
+            else
+              SpV_bbl(i,jj) = tv%SpV_avg(i,j,k)
+            endif
+            h_bbl_frac(i,jj) = frac_in * h(i,j,k)
+            dz_bbl_rem(i,jj) = 0.0
+            do_i(i,jj) = .false.
+          endif
+        endif ; enddo
+      enddo
+      if (.not.do_any) exit
+    enddo
+    do j=jstart,jend ; jj = j - jstart + 1
+      do i=is,ie ; if (do_i(i,jj)) then
+        ! The nominal bottom boundary layer is thicker than the water column, but layer 1 is
+        ! already included in the averages.  These values are set so that the call to find
+        ! the layer-average specific volume will behave sensibly.
+        if (use_EOS) then
+          T_bbl(i,jj) = tv%T(i,j,1) ; S_bbl(i,jj) = tv%S(i,j,1)
+          dp(i,jj) = 0.0
+          P_bbl(i,jj) = pres_int(i,1,jj)
+        else
+          SpV_bbl(i,jj) = tv%SpV_avg(i,j,1)
+        endif
+        h_bbl_frac(i,jj) = 0.0
+      endif ; enddo
+    enddo
+
+    if (use_EOS) then
+      ! Find the average specific volume of the fractional layer atop the BBL.
+      EOSdom(:) = EOS_domain(G%HI)
+      do j=jstart,jend ; jj = j - jstart + 1
+        call average_specific_vol(T_bbl(:,jj), S_bbl(:,jj), P_bbl(:,jj), dp(:,jj), SpV_bbl(:,jj), tv%eqn_of_state, EOSdom)
+      enddo
+    endif
+
+    do j=jstart,jend ; jj = j - jstart + 1
+      do i=is,ie
+        if (hb(i,jj) + h_bbl_frac(i,jj) < GV%H_subroundoff) h_bbl_frac(i,jj) = GV%H_subroundoff
+        rho_bot(i,jj) = G%mask2dT(i,j) * (hb(i,jj) + h_bbl_frac(i,jj)) / (SpV_h_bot(i,jj) + h_bbl_frac(i,jj)*SpV_bbl(i,jj))
+        h_bot(i,jj) = hb(i,jj) + h_bbl_frac(i,jj)
+      enddo
+    enddo
+  endif
+
+end subroutine find_rho_bottom_2d
 
 !> Converts thickness from geometric height units to thickness units, perhaps via an
 !! inversion of the integral of the density in pressure using variables stored in

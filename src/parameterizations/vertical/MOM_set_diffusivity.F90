@@ -239,6 +239,8 @@ end type diffusivity_diags
 integer :: id_clock_kappaShear, id_clock_CVMix_ddiff
 !>@}
 
+integer, parameter :: njblock = 1 !< Number of j-rows per block in the tiled j-loop
+
 contains
 
 subroutine set_diffusivity(u, v, h, u_h, v_h, tv, fluxes, optics, visc, dt, Kd_int, &
@@ -285,10 +287,10 @@ subroutine set_diffusivity(u, v, h, u_h, v_h, tv, fluxes, optics, visc, dt, Kd_i
                                                    !! [H Z T-1 ~> m2 s-1 or kg m-1 s-1]
 
   ! local variables
-  real :: N2_bot(SZI_(G))  ! Bottom squared buoyancy frequency [T-2 ~> s-2]
-  real :: rho_bot(SZI_(G)) ! In situ near-bottom density [T-2 ~> s-2]
-  real :: h_bot(SZI_(G))   ! Bottom boundary layer thickness [H ~> m or kg m-2]
-  integer :: k_bot(SZI_(G))   ! Bottom boundary layer thickness top layer index
+  real :: N2_bot(SZI_(G),njblock)  ! Bottom squared buoyancy frequency [T-2 ~> s-2]
+  real :: rho_bot(SZI_(G),njblock) ! In situ near-bottom density [T-2 ~> s-2]
+  real :: h_bot(SZI_(G),njblock)   ! Bottom boundary layer thickness [H ~> m or kg m-2]
+  integer :: k_bot(SZI_(G),njblock)   ! Bottom boundary layer thickness top layer index
 
   type(diffusivity_diags)  :: dd ! structure with arrays of available diags
 
@@ -297,29 +299,33 @@ subroutine set_diffusivity(u, v, h, u_h, v_h, tv, fluxes, optics, visc, dt, Kd_i
     T_f, S_f      ! Temperature and salinity [C ~> degC] and [S ~> ppt] with properties in massless layers
                   ! filled vertically by diffusion or the properties after full convective adjustment.
 
-  real, dimension(SZI_(G),SZK_(GV)) :: &
-    N2_lay, &     !< Squared buoyancy frequency associated with layers [T-2 ~> s-2]
+  real, dimension(SZI_(G),SZK_(GV),njblock) :: &
+    N2_lay,   &   !< Squared buoyancy frequency associated with layers [T-2 ~> s-2]
     Kd_lay_2d, &  !< The layer diffusivities [H Z T-1 ~> m2 s-1 or kg m-1 s-1]
-    dz, &         !< Height change across layers [Z ~> m]
     maxTKE, &     !< Energy required to entrain to h_max [H Z2 T-3 ~> m3 s-3 or W m-2]
+    TKE_to_Kd, &  !< Conversion rate (~1.0 / (G_Earth + dRho_lay)) between
+                  !< TKE dissipated within a layer and Kd in that layer [T2 Z-1 ~> s2 m-1]
+    dz            !< Height change across layers [Z ~> m]
+
+  real, dimension(SZI_(G),SZK_(GV)) :: &
     prof_leak_2d, & !< vertical profile for leakage [Z-1 ~> m-1]
     prof_quad_2d, & !< vertical profile for bottom drag [Z-1 ~> m-1]
     prof_itidal_2d, & !< vertical profile for wave drag [Z-1 ~> m-1]
     prof_Froude_2d, & !< vertical profile for Froude drag [Z-1 ~> m-1]
-    prof_slope_2d, & !< vertical profile for critical slopes [Z-1 ~> m-1]
-    TKE_to_Kd     !< Conversion rate (~1.0 / (G_Earth + dRho_lay)) between
-                  !< TKE dissipated within a layer and Kd in that layer [T2 Z-1 ~> s2 m-1]
+    prof_slope_2d  !< vertical profile for critical slopes [Z-1 ~> m-1]
+
+  real, dimension(SZI_(G),SZK_(GV)+1,njblock) :: &
+    N2_int,   &   !< squared buoyancy frequency associated at interfaces [T-2 ~> s-2]
+    dRho_int, &   !< Locally referenced potential density difference across interfaces [R ~> kg m-3]
+    Kd_int_2d, &  !< The interface diffusivities [H Z T-1 ~> m2 s-1 or kg m-1 s-1]
+    Kv_bkgnd      !< The background diffusion related interface viscosities [H Z T-1 ~> m2 s-1 or Pa s]
 
   real, dimension(SZI_(G),SZK_(GV)+1) :: &
-    N2_int,   &   !< squared buoyancy frequency associated at interfaces [T-2 ~> s-2]
-    Kd_int_2d, &  !< The interface diffusivities [H Z T-1 ~> m2 s-1 or kg m-1 s-1]
-    Kv_bkgnd, &   !< The background diffusion related interface viscosities [H Z T-1 ~> m2 s-1 or Pa s]
     Kd_leak_2d, & !< internal tides leakage diffusivity [H Z T-1 ~> m2 s-1 or kg m-1 s-1]
     Kd_quad_2d, & !< internal tides bottom drag diffusivity [H Z T-1 ~> m2 s-1 or kg m-1 s-1]
     Kd_itidal_2d, & !< internal tides wave drag diffusivity [H Z T-1 ~> m2 s-1 or kg m-1 s-1]
     Kd_Froude_2d, & !< internal tides high Froude diffusivity [H Z T-1 ~> m2 s-1 or kg m-1 s-1]
     Kd_slope_2d, & !< internal tides critical slopes diffusivity [H Z T-1 ~> m2 s-1 or kg m-1 s-1]
-    dRho_int, &   !< Locally referenced potential density difference across interfaces [R ~> kg m-3]
     KT_extra, &   !< Double diffusion diffusivity of temperature [H Z T-1 ~> m2 s-1 or kg m-1 s-1]
     KS_extra      !< Double diffusion diffusivity of salinity [H Z T-1 ~> m2 s-1 or kg m-1 s-1]
 
@@ -328,11 +334,12 @@ subroutine set_diffusivity(u, v, h, u_h, v_h, tv, fluxes, optics, visc, dt, Kd_i
 
   logical   :: use_EOS      ! If true, compute density from T/S using equation of state.
   logical   :: TKE_to_Kd_used ! If true, TKE_to_Kd and maxTKE need to be calculated.
-  integer   :: kb(SZI_(G))  ! The index of the lightest layer denser than the
-                            ! buffer layer, or -1 without a bulk mixed layer.
+  integer   :: kb(SZI_(G),njblock)  ! The index of the lightest layer denser than the
+                                   ! buffer layer, or -1 without a bulk mixed layer.
   logical   :: showCallTree ! If true, show the call tree.
 
   integer :: i, j, k, is, ie, js, je, nz, isd, ied, jsd, jed
+  integer :: jstart, jend, jj
 
   real      :: kappa_dt_fill ! diffusivity times a timestep used to fill massless layers [H Z ~> m2 or kg m-1]
 
@@ -472,211 +479,246 @@ subroutine set_diffusivity(u, v, h, u_h, v_h, tv, fluxes, optics, visc, dt, Kd_i
   ! be an appropriate place to add a depth-dependent parameterization or another explicit
   ! parameterization of Kd.
 
-  !$OMP parallel do default(shared) private(dRho_int,N2_lay,Kd_lay_2d,Kd_int_2d,Kv_bkgnd,N2_int,dz, &
-  !$OMP                                     N2_bot,rho_bot,h_bot,k_bot,KT_extra,KS_extra,TKE_to_Kd,maxTKE,dissip,kb) &
-  !$OMP                             if(.not. CS%use_CVMix_ddiff)
-  do j=js,je
+  do jstart=js,je,njblock
+    jend = min(jstart+njblock-1, je)
+
+    do j=jstart,jend ; jj = j - jstart + 1
+      call thickness_to_dz(h, tv, dz(:,:,jj), j, G, GV)
+    enddo
 
     ! Set up variables related to the stratification.
-    call find_N2(h, tv, T_f, S_f, fluxes, j, G, GV, US, CS, dRho_int, N2_lay, N2_int, N2_bot, rho_bot, h_bot, k_bot)
-
-    if (associated(dd%N2_3d)) then
-      do K=1,nz+1 ; do i=is,ie ; dd%N2_3d(i,j,K) = N2_int(i,K) ; enddo ; enddo
-    endif
+    call find_N2(h, tv, T_f, S_f, fluxes, njblock, jstart, jend, G, GV, US, CS, dRho_int, N2_lay, N2_int, N2_bot, rho_bot, h_bot, k_bot, dz)
 
     ! Add background mixing
-    call calculate_bkgnd_mixing(h, tv, N2_lay, Kd_lay_2d, Kd_int_2d, Kv_bkgnd, j, G, GV, US, CS%bkgnd_mixing_csp)
+    call calculate_bkgnd_mixing(h, tv, N2_lay, Kd_lay_2d, Kd_int_2d, Kv_bkgnd, jstart, jend, njblock, G, GV, US, CS%bkgnd_mixing_csp)
+
+    if (associated(dd%N2_3d)) then
+      do j=jstart,jend ; jj = j - jstart + 1
+        do K=1,nz+1 ; do i=is,ie ; dd%N2_3d(i,j,K) = N2_int(i,K,jj) ; enddo ; enddo
+      enddo
+    endif
     ! Update Kv and 3-d diffusivity diagnostics.
-    if (associated(visc%Kv_slow)) then ; do K=1,nz+1 ; do i=is,ie
-      visc%Kv_slow(i,j,K) = visc%Kv_slow(i,j,K) + Kv_bkgnd(i,K)
-    enddo ; enddo ; endif
-    if (CS%id_Kv_bkgnd > 0) then ; do K=1,nz+1 ; do i=is,ie
-      dd%Kv_bkgnd(i,j,K) = Kv_bkgnd(i,K)
-    enddo ; enddo ; endif
-    if (CS%id_Kd_bkgnd > 0) then ; do K=1,nz+1 ; do i=is,ie
-      dd%Kd_bkgnd(i,j,K) = Kd_int_2d(i,K)
-    enddo ; enddo ; endif
-    if (associated(VBF%Kd_bkgnd)) then ; do K=1,nz+1 ; do i=is,ie
-      VBF%Kd_bkgnd(i,j,K) = Kd_int_2d(i,K)
-    enddo ; enddo ; endif
-
-    ! Double-diffusion (old method)
-    if (CS%double_diffusion) then
-      call double_diffusion(tv, h, T_f, S_f, j, G, GV, US, CS, KT_extra, KS_extra)
-      ! One of Kd_extra_T and Kd_extra_S is always 0. Kd_extra_S is positive for salt fingering.
-      ! Kd_extra_T is positive for double diffusive convection.
-      do K=2,nz ; do i=is,ie
-        if (KS_extra(i,K) > KT_extra(i,K)) then ! salt fingering
-          Kd_lay_2d(i,k-1) = Kd_lay_2d(i,k-1) + 0.5 * KT_extra(i,K)
-          Kd_lay_2d(i,k)   = Kd_lay_2d(i,k)   + 0.5 * KT_extra(i,K)
-          Kd_extra_S(i,j,K) = KS_extra(i,K) - KT_extra(i,K)
-          Kd_extra_T(i,j,K) = 0.0
-        elseif (KT_extra(i,K) > 0.0) then ! double-diffusive convection
-          Kd_lay_2d(i,k-1) = Kd_lay_2d(i,k-1) + 0.5 * KS_extra(i,K)
-          Kd_lay_2d(i,k)   = Kd_lay_2d(i,k)   + 0.5 * KS_extra(i,K)
-          Kd_extra_T(i,j,K) = KT_extra(i,K) - KS_extra(i,K)
-          Kd_extra_S(i,j,K) = 0.0
-        else ! There is no double diffusion at this interface.
-          Kd_extra_T(i,j,K) = 0.0
-          Kd_extra_S(i,j,K) = 0.0
-        endif
-      enddo ; enddo
-      if (associated(dd%KT_extra)) then ; do K=1,nz+1 ; do i=is,ie
-        dd%KT_extra(i,j,K) = KT_extra(i,K)
-      enddo ; enddo ; endif
-
-      if (associated(dd%KS_extra)) then ; do K=1,nz+1 ; do i=is,ie
-        dd%KS_extra(i,j,K) = KS_extra(i,K)
-      enddo ; enddo ; endif
-
-      if (associated(VBF%Kd_ddiff_T)) then ; do K=1,nz+1 ; do i=is,ie
-        VBF%Kd_ddiff_T(i,j,K) = KT_extra(i,K)
-      enddo ; enddo ; endif
-      if (associated(VBF%Kd_ddiff_S)) then ; do K=1,nz+1 ; do i=is,ie
-        VBF%Kd_ddiff_S(i,j,K) = KS_extra(i,K)
-      enddo ; enddo ; endif
+    if (associated(visc%Kv_slow)) then
+      do j=jstart,jend ; jj = j - jstart + 1
+        do K=1,nz+1 ; do i=is,ie
+          visc%Kv_slow(i,j,K) = visc%Kv_slow(i,j,K) + Kv_bkgnd(i,K,jj)
+        enddo ; enddo
+      enddo
+    endif
+    if (CS%id_Kv_bkgnd > 0) then
+      do j=jstart,jend ; jj = j - jstart + 1
+        do K=1,nz+1 ; do i=is,ie
+          dd%Kv_bkgnd(i,j,K) = Kv_bkgnd(i,K,jj)
+        enddo ; enddo
+      enddo
+    endif
+    if (CS%id_Kd_bkgnd > 0) then
+      do j=jstart,jend ; jj = j - jstart + 1
+        do K=1,nz+1 ; do i=is,ie
+          dd%Kd_bkgnd(i,j,K) = Kd_int_2d(i,K,jj)
+        enddo ; enddo
+      enddo
+    endif
+    if (associated(VBF%Kd_bkgnd)) then
+      do j=jstart,jend ; jj = j - jstart + 1
+        do K=1,nz+1 ; do i=is,ie
+          VBF%Kd_bkgnd(i,j,K) = Kd_int_2d(i,K,jj)
+        enddo ; enddo
+      enddo
     endif
 
-    ! Apply double diffusion via CVMix
-    ! GMM, we need to pass HBL to compute_ddiff_coeffs, but it is not yet available.
-    if (CS%use_CVMix_ddiff) then
-      call cpu_clock_begin(id_clock_CVMix_ddiff)
-      if (associated(dd%drho_rat)) then
-        call compute_ddiff_coeffs(h, tv, G, GV, US, j, Kd_extra_T, Kd_extra_S, &
-                                  CS%CVMix_ddiff_csp, dd%drho_rat)
-      else
-        call compute_ddiff_coeffs(h, tv, G, GV, US, j, Kd_extra_T, Kd_extra_S, CS%CVMix_ddiff_csp)
+    do j=jstart,jend ; jj = j - jstart + 1
+      ! Double-diffusion (old method)
+      if (CS%double_diffusion) then
+        call double_diffusion(tv, h, T_f, S_f, j, G, GV, US, CS, KT_extra, KS_extra)
+        ! One of Kd_extra_T and Kd_extra_S is always 0. Kd_extra_S is positive for salt fingering.
+        ! Kd_extra_T is positive for double diffusive convection.
+        do K=2,nz ; do i=is,ie
+          if (KS_extra(i,K) > KT_extra(i,K)) then ! salt fingering
+            Kd_lay_2d(i,k-1,jj) = Kd_lay_2d(i,k-1,jj) + 0.5 * KT_extra(i,K)
+            Kd_lay_2d(i,k,jj)   = Kd_lay_2d(i,k,jj)   + 0.5 * KT_extra(i,K)
+            Kd_extra_S(i,j,K) = KS_extra(i,K) - KT_extra(i,K)
+            Kd_extra_T(i,j,K) = 0.0
+          elseif (KT_extra(i,K) > 0.0) then ! double-diffusive convection
+            Kd_lay_2d(i,k-1,jj) = Kd_lay_2d(i,k-1,jj) + 0.5 * KS_extra(i,K)
+            Kd_lay_2d(i,k,jj)   = Kd_lay_2d(i,k,jj)   + 0.5 * KS_extra(i,K)
+            Kd_extra_T(i,j,K) = KT_extra(i,K) - KS_extra(i,K)
+            Kd_extra_S(i,j,K) = 0.0
+          else ! There is no double diffusion at this interface.
+            Kd_extra_T(i,j,K) = 0.0
+            Kd_extra_S(i,j,K) = 0.0
+          endif
+        enddo ; enddo
+        if (associated(dd%KT_extra)) then ; do K=1,nz+1 ; do i=is,ie
+          dd%KT_extra(i,j,K) = KT_extra(i,K)
+        enddo ; enddo ; endif
+
+        if (associated(dd%KS_extra)) then ; do K=1,nz+1 ; do i=is,ie
+          dd%KS_extra(i,j,K) = KS_extra(i,K)
+        enddo ; enddo ; endif
+
+        if (associated(VBF%Kd_ddiff_T)) then ; do K=1,nz+1 ; do i=is,ie
+          VBF%Kd_ddiff_T(i,j,K) = KT_extra(i,K)
+        enddo ; enddo ; endif
+        if (associated(VBF%Kd_ddiff_S)) then ; do K=1,nz+1 ; do i=is,ie
+          VBF%Kd_ddiff_S(i,j,K) = KS_extra(i,K)
+        enddo ; enddo ; endif
       endif
-      if (associated(VBF%Kd_ddiff_T)) then ; do K=1,nz+1 ; do i=is,ie
-        VBF%Kd_ddiff_T(i,j,K) = KT_extra(i,K)
-      enddo ; enddo ; endif
-      if (associated(VBF%Kd_ddiff_S)) then ; do K=1,nz+1 ; do i=is,ie
-        VBF%Kd_ddiff_S(i,j,K) = KS_extra(i,K)
-      enddo ; enddo ; endif
-      call cpu_clock_end(id_clock_CVMix_ddiff)
-    endif
+
+      ! Apply double diffusion via CVMix
+      ! GMM, we need to pass HBL to compute_ddiff_coeffs, but it is not yet available.
+      if (CS%use_CVMix_ddiff) then
+        call cpu_clock_begin(id_clock_CVMix_ddiff)
+        if (associated(dd%drho_rat)) then
+          call compute_ddiff_coeffs(h, tv, G, GV, US, j, Kd_extra_T, Kd_extra_S, &
+                                    CS%CVMix_ddiff_csp, dd%drho_rat)
+        else
+          call compute_ddiff_coeffs(h, tv, G, GV, US, j, Kd_extra_T, Kd_extra_S, CS%CVMix_ddiff_csp)
+        endif
+        if (associated(VBF%Kd_ddiff_T)) then ; do K=1,nz+1 ; do i=is,ie
+          VBF%Kd_ddiff_T(i,j,K) = KT_extra(i,K)
+        enddo ; enddo ; endif
+        if (associated(VBF%Kd_ddiff_S)) then ; do K=1,nz+1 ; do i=is,ie
+          VBF%Kd_ddiff_S(i,j,K) = KS_extra(i,K)
+        enddo ; enddo ; endif
+        call cpu_clock_end(id_clock_CVMix_ddiff)
+      endif
+    enddo
 
     ! Calculate conversion ratios from TKE to layer diffusivities.
     if (TKE_to_Kd_used) then
-      call find_TKE_to_Kd(h, tv, dRho_int, N2_lay, j, dt, G, GV, US, CS, TKE_to_Kd, maxTKE, kb)
-      if (associated(dd%maxTKE)) then ; do k=1,nz ; do i=is,ie
-        dd%maxTKE(i,j,k) = maxTKE(i,k)
-      enddo ; enddo ; endif
-      if (associated(dd%TKE_to_Kd)) then ; do k=1,nz ; do i=is,ie
-        dd%TKE_to_Kd(i,j,k) = TKE_to_Kd(i,k)
-      enddo ; enddo ; endif
+      call find_TKE_to_Kd(h, tv, dRho_int, N2_lay, jstart, jend, njblock, dt, G, GV, US, CS, TKE_to_Kd, maxTKE, kb, dz)
+      if (associated(dd%maxTKE)) then
+        do j=jstart,jend ; jj = j - jstart + 1 ; do k=1,nz ; do i=is,ie
+          dd%maxTKE(i,j,k) = maxTKE(i,k,jj)
+        enddo ; enddo ; enddo
+      endif
+      if (associated(dd%TKE_to_Kd)) then
+        do j=jstart,jend ; jj = j - jstart + 1 ; do k=1,nz ; do i=is,ie
+          dd%TKE_to_Kd(i,j,k) = TKE_to_Kd(i,k,jj)
+        enddo ; enddo ; enddo
+      endif
     endif
 
     ! Add the input turbulent diffusivity.
     if (CS%useKappaShear .or. CS%use_CVMix_shear) then
-      do K=2,nz ; do i=is,ie
-        Kd_int_2d(i,K) = visc%Kd_shear(i,j,K) + 0.5 * (Kd_lay_2d(i,k-1) + Kd_lay_2d(i,k))
+      do j=jstart,jend ; jj = j - jstart + 1 ; do K=2,nz ; do i=is,ie
+        Kd_int_2d(i,K,jj) = visc%Kd_shear(i,j,K) + 0.5 * (Kd_lay_2d(i,k-1,jj) + Kd_lay_2d(i,k,jj))
+      enddo ; enddo ; enddo
+      do j=jstart,jend ; jj = j - jstart + 1 ; do i=is,ie
+        Kd_int_2d(i,1,jj) = visc%Kd_shear(i,j,1) ! This isn't actually used. It could be 0.
+        Kd_int_2d(i,nz+1,jj) = 0.0
       enddo ; enddo
-      do i=is,ie
-        Kd_int_2d(i,1) = visc%Kd_shear(i,j,1) ! This isn't actually used. It could be 0.
-        Kd_int_2d(i,nz+1) = 0.0
-      enddo
-      do k=1,nz ; do i=is,ie
-        Kd_lay_2d(i,k) = Kd_lay_2d(i,k) + 0.5 * (visc%Kd_shear(i,j,K) + visc%Kd_shear(i,j,K+1))
-      enddo ; enddo
+      do j=jstart,jend ; jj = j - jstart + 1 ; do k=1,nz ; do i=is,ie
+        Kd_lay_2d(i,k,jj) = Kd_lay_2d(i,k,jj) + 0.5 * (visc%Kd_shear(i,j,K) + visc%Kd_shear(i,j,K+1))
+      enddo ; enddo ; enddo
     else
-      do i=is,ie
-        Kd_int_2d(i,1) = Kd_lay_2d(i,1) ; Kd_int_2d(i,nz+1) = 0.0
-      enddo
-      do K=2,nz ; do i=is,ie
-        Kd_int_2d(i,K) = 0.5 * (Kd_lay_2d(i,k-1) + Kd_lay_2d(i,k))
+      do j=jstart,jend ; jj = j - jstart + 1 ; do i=is,ie
+        Kd_int_2d(i,1,jj) = Kd_lay_2d(i,1,jj) ; Kd_int_2d(i,nz+1,jj) = 0.0
       enddo ; enddo
-    endif
-
-    if (CS%ML_radiation .or. CS%use_tidal_mixing .or. associated(dd%Kd_Work)) then
-      call thickness_to_dz(h, tv, dz, j, G, GV)
+      do j=jstart,jend ; jj = j - jstart + 1 ; do K=2,nz ; do i=is,ie
+        Kd_int_2d(i,K,jj) = 0.5 * (Kd_lay_2d(i,k-1,jj) + Kd_lay_2d(i,k,jj))
+      enddo ; enddo ; enddo
     endif
 
     ! Add the ML_Rad diffusivity.
     if (CS%ML_radiation) then
-      call add_MLrad_diffusivity(dz, fluxes, tv, j, Kd_int_2d, G, GV, US, CS, TKE_to_Kd, Kd_lay_2d)
+      do j=jstart,jend ; jj = j - jstart + 1
+        call add_MLrad_diffusivity(dz(:,:,jj), fluxes, tv, j, Kd_int_2d(:,:,jj), G, GV, US, CS, TKE_to_Kd(:,:,jj), Kd_lay_2d(:,:,jj))
+      enddo
     endif
 
     ! Add the Nikurashin and / or tidal bottom-driven mixing
-    if (CS%use_tidal_mixing) &
-      call calculate_tidal_mixing(dz, j, N2_bot, rho_bot, N2_lay, N2_int, TKE_to_Kd, &
-                                  maxTKE, G, GV, US, CS%tidal_mixing, &
-                                  CS%Kd_max, visc%Kv_slow, Kd_lay_2d, Kd_int_2d, VBF)
+    if (CS%use_tidal_mixing) then
+      do j=jstart,jend ; jj = j - jstart + 1
+        call calculate_tidal_mixing(dz(:,:,jj), j, N2_bot(:,jj), rho_bot(:,jj), N2_lay(:,:,jj), N2_int(:,:,jj), TKE_to_Kd(:,:,jj), &
+                                    maxTKE(:,:,jj), G, GV, US, CS%tidal_mixing, &
+                                    CS%Kd_max, visc%Kv_slow, Kd_lay_2d(:,:,jj), Kd_int_2d(:,:,jj), VBF)
+      enddo
+    endif
 
     ! Add diffusivity from internal tides ray tracing
     if (CS%use_int_tides) then
+      do j=jstart,jend ; jj = j - jstart + 1
+        call get_lowmode_diffusivity(G, GV, h, tv, US, h_bot(:,jj), k_bot(:,jj), j, N2_lay(:,:,jj), N2_int(:,:,jj), TKE_to_Kd(:,:,jj), CS%Kd_max, &
+                                     CS%int_tide_CSp, Kd_leak_2d, Kd_quad_2d, Kd_itidal_2d, Kd_Froude_2d, Kd_slope_2d, &
+                                     Kd_lay_2d(:,:,jj), Kd_int_2d(:,:,jj), prof_leak_2d, prof_quad_2d, prof_itidal_2d, prof_froude_2d, &
+                                     prof_slope_2d)
 
-      call get_lowmode_diffusivity(G, GV, h, tv, US, h_bot, k_bot, j, N2_lay, N2_int, TKE_to_Kd, CS%Kd_max, &
-                                   CS%int_tide_CSp, Kd_leak_2d, Kd_quad_2d, Kd_itidal_2d, Kd_Froude_2d, Kd_slope_2d, &
-                                   Kd_lay_2d, Kd_int_2d, prof_leak_2d, prof_quad_2d, prof_itidal_2d, prof_froude_2d, &
-                                   prof_slope_2d)
+        if (CS%id_kbbl > 0) then ; do i=is,ie
+          dd%kbbl(i,j) = k_bot(i,jj)
+        enddo ; endif
+        if (CS%id_bbl_thick > 0) then ; do i=is,ie
+          dd%bbl_thick(i,j) = h_bot(i,jj)
+        enddo ; endif
+        if (CS%id_Kd_leak > 0) then ; do K=1,nz+1 ; do i=is,ie
+          dd%Kd_leak(i,j,K) = Kd_leak_2d(i,K)
+        enddo ; enddo ; endif
+        if (CS%id_Kd_quad > 0) then ; do K=1,nz+1 ; do i=is,ie
+          dd%Kd_quad(i,j,K) = Kd_quad_2d(i,K)
+        enddo ; enddo ; endif
+        if (CS%id_Kd_itidal > 0) then ; do K=1,nz+1 ; do i=is,ie
+          dd%Kd_itidal(i,j,K) = Kd_itidal_2d(i,K)
+        enddo ; enddo ; endif
+        if (CS%id_Kd_Froude > 0) then ; do K=1,nz+1 ; do i=is,ie
+          dd%Kd_Froude(i,j,K) = Kd_Froude_2d(i,K)
+        enddo ; enddo ; endif
+        if (CS%id_Kd_slope > 0) then ; do K=1,nz+1 ; do i=is,ie
+          dd%Kd_slope(i,j,K) = Kd_slope_2d(i,K)
+        enddo ; enddo ; endif
+        if (associated (VBF%Kd_leak)) then ; do K=1,nz+1 ; do i=is,ie
+          VBF%Kd_leak(i,j,K) = min(Kd_leak_2d(i,K), CS%Kd_max)
+        enddo ; enddo ; endif
+        if (associated (VBF%Kd_quad)) then ; do K=1,nz+1 ; do i=is,ie
+          VBF%Kd_quad(i,j,K) = min(Kd_quad_2d(i,K), CS%Kd_max)
+        enddo ; enddo ; endif
+        if (associated (VBF%Kd_itidal)) then ; do K=1,nz+1 ; do i=is,ie
+          VBF%Kd_itidal(i,j,K) = min(Kd_itidal_2d(i,K), CS%Kd_max)
+        enddo ; enddo ; endif
+        if (associated (VBF%Kd_Froude)) then ; do K=1,nz+1 ; do i=is,ie
+          VBF%Kd_Froude(i,j,K) = min(Kd_Froude_2d(i,K), CS%Kd_max)
+        enddo ; enddo ; endif
+        if (associated (VBF%Kd_slope)) then ; do K=1,nz+1 ; do i=is,ie
+          VBF%Kd_slope(i,j,K) = min(Kd_slope_2d(i,K), CS%Kd_max)
+        enddo ; enddo ; endif
 
-      if (CS%id_kbbl > 0) then ; do i=is,ie
-        dd%kbbl(i,j) = k_bot(i)
-      enddo ; endif
-      if (CS%id_bbl_thick > 0) then ; do i=is,ie
-        dd%bbl_thick(i,j) = h_bot(i)
-      enddo ; endif
-      if (CS%id_Kd_leak > 0) then ; do K=1,nz+1 ; do i=is,ie
-        dd%Kd_leak(i,j,K) = Kd_leak_2d(i,K)
-      enddo ; enddo ; endif
-      if (CS%id_Kd_quad > 0) then ; do K=1,nz+1 ; do i=is,ie
-        dd%Kd_quad(i,j,K) = Kd_quad_2d(i,K)
-      enddo ; enddo ; endif
-      if (CS%id_Kd_itidal > 0) then ; do K=1,nz+1 ; do i=is,ie
-        dd%Kd_itidal(i,j,K) = Kd_itidal_2d(i,K)
-      enddo ; enddo ; endif
-      if (CS%id_Kd_Froude > 0) then ; do K=1,nz+1 ; do i=is,ie
-        dd%Kd_Froude(i,j,K) = Kd_Froude_2d(i,K)
-      enddo ; enddo ; endif
-      if (CS%id_Kd_slope > 0) then ; do K=1,nz+1 ; do i=is,ie
-        dd%Kd_slope(i,j,K) = Kd_slope_2d(i,K)
-      enddo ; enddo ; endif
-      if (associated (VBF%Kd_leak)) then ; do K=1,nz+1 ; do i=is,ie
-        VBF%Kd_leak(i,j,K) = min(Kd_leak_2d(i,K), CS%Kd_max)
-      enddo ; enddo ; endif
-      if (associated (VBF%Kd_quad)) then ; do K=1,nz+1 ; do i=is,ie
-        VBF%Kd_quad(i,j,K) = min(Kd_quad_2d(i,K), CS%Kd_max)
-      enddo ; enddo ; endif
-      if (associated (VBF%Kd_itidal)) then ; do K=1,nz+1 ; do i=is,ie
-        VBF%Kd_itidal(i,j,K) = min(Kd_itidal_2d(i,K), CS%Kd_max)
-      enddo ; enddo ; endif
-      if (associated (VBF%Kd_Froude)) then ; do K=1,nz+1 ; do i=is,ie
-        VBF%Kd_Froude(i,j,K) = min(Kd_Froude_2d(i,K), CS%Kd_max)
-      enddo ; enddo ; endif
-      if (associated (VBF%Kd_slope)) then ; do K=1,nz+1 ; do i=is,ie
-        VBF%Kd_slope(i,j,K) = min(Kd_slope_2d(i,K), CS%Kd_max)
-      enddo ; enddo ; endif
-
-      if (CS%id_prof_leak > 0) then ; do k=1,nz ; do i=is,ie
-        dd%prof_leak(i,j,k) = prof_leak_2d(i,k)
-      enddo ; enddo ; endif
-      if (CS%id_prof_quad > 0) then ; do k=1,nz ; do i=is,ie
-        dd%prof_quad(i,j,k) = prof_quad_2d(i,k)
-      enddo ; enddo ; endif
-      if (CS%id_prof_itidal > 0) then ; do k=1,nz ; do i=is,ie
-        dd%prof_itidal(i,j,k) = prof_itidal_2d(i,k)
-      enddo ; enddo ; endif
-      if (CS%id_prof_Froude > 0) then ; do k=1,nz ; do i=is,ie
-        dd%prof_Froude(i,j,k) = prof_Froude_2d(i,k)
-      enddo ; enddo ; endif
-      if (CS%id_prof_slope > 0) then ; do k=1,nz ; do i=is,ie
-        dd%prof_slope(i,j,k) = prof_slope_2d(i,k)
-      enddo ; enddo ; endif
+        if (CS%id_prof_leak > 0) then ; do k=1,nz ; do i=is,ie
+          dd%prof_leak(i,j,k) = prof_leak_2d(i,k)
+        enddo ; enddo ; endif
+        if (CS%id_prof_quad > 0) then ; do k=1,nz ; do i=is,ie
+          dd%prof_quad(i,j,k) = prof_quad_2d(i,k)
+        enddo ; enddo ; endif
+        if (CS%id_prof_itidal > 0) then ; do k=1,nz ; do i=is,ie
+          dd%prof_itidal(i,j,k) = prof_itidal_2d(i,k)
+        enddo ; enddo ; endif
+        if (CS%id_prof_Froude > 0) then ; do k=1,nz ; do i=is,ie
+          dd%prof_Froude(i,j,k) = prof_Froude_2d(i,k)
+        enddo ; enddo ; endif
+        if (CS%id_prof_slope > 0) then ; do k=1,nz ; do i=is,ie
+          dd%prof_slope(i,j,k) = prof_slope_2d(i,k)
+        enddo ; enddo ; endif
+      enddo
     endif
 
-    ! This adds the diffusion sustained by the energy extracted from the flow by the bottom drag.
+    ! This adds the diffusion sustained by drag TKE.
+    if (CS%bottomdraglaw .and. (CS%BBL_effic > 0.0) .and. .not. CS%use_LOTW_BBL_diffusivity) &
+      call add_drag_diffusivity(h, u, v, tv, fluxes, visc, jstart, jend, njblock, TKE_to_Kd, &
+                                maxTKE, kb, rho_bot, G, GV, US, CS, Kd_lay_2d, Kd_int_2d, dd%Kd_BBL)
+
     if (CS%bottomdraglaw .and. (CS%BBL_effic > 0.0)) then
       if (CS%use_LOTW_BBL_diffusivity) then
-        call add_LOTW_BBL_diffusivity(h, u, v, tv, fluxes, visc, j, N2_int, Rho_bot, Kd_int_2d, &
-                                      G, GV, US, CS, dd%Kd_BBL, Kd_lay_2d)
-      else
-        call add_drag_diffusivity(h, u, v,  tv, fluxes, visc, j, TKE_to_Kd, &
-                                  maxTKE, kb, rho_bot, G, GV, US, CS, Kd_lay_2d, Kd_int_2d, dd%Kd_BBL)
+        do j=jstart,jend ; jj = j - jstart + 1
+          call add_LOTW_BBL_diffusivity(h, u, v, tv, fluxes, visc, j, N2_int(:,:,jj), Rho_bot(:,jj), &
+                                        Kd_int_2d(:,:,jj), G, GV, US, CS, dd%Kd_BBL, Kd_lay_2d(:,:,jj), dz(:,:,jj))
+        enddo
       endif
-      if (associated(VBF%Kd_BBL)) then ; do K=1,nz+1 ; do i=is,ie
-        VBF%Kd_BBL(i,j,K) = dd%Kd_BBL(i,j,K)
-      enddo ; enddo ; endif
+      if (associated(VBF%Kd_BBL)) then
+        do j=jstart,jend ; jj = j - jstart + 1
+          do K=1,nz+1 ; do i=is,ie
+            VBF%Kd_BBL(i,j,K) = dd%Kd_BBL(i,j,K)
+          enddo ; enddo
+        enddo
+      endif
     endif
 
     if (CS%limit_dissipation) then
@@ -685,27 +727,33 @@ subroutine set_diffusivity(u, v, h, u_h, v_h, tv, fluxes, optics, visc, dt, Kd_i
       !   1) a global constant,
       !   2) a dissipation proportional to N (aka Gargett) and
       !   3) dissipation corresponding to a (nearly) constant diffusivity.
-      do K=2,nz ; do i=is,ie
-        dissip = max( CS%dissip_min, &   ! Const. floor on dissip.
-                      CS%dissip_N0 + CS%dissip_N1 * sqrt(N2_int(i,K)), & ! Floor aka Gargett
-                      CS%dissip_N2 * N2_int(i,K)) ! Floor of Kd_min*rho0/F_Ri
-        Kd_int_2d(i,K) = max(Kd_int_2d(i,K) , &  ! Apply floor to Kd
-                            dissip * (CS%FluxRi_max / (GV%H_to_RZ * (N2_int(i,K) + Omega2))))
-      enddo ; enddo
+      do j=jstart,jend ; jj = j - jstart + 1
+        do K=2,nz ; do i=is,ie
+          dissip = max( CS%dissip_min, &   ! Const. floor on dissip.
+                        CS%dissip_N0 + CS%dissip_N1 * sqrt(N2_int(i,K,jj)), & ! Floor aka Gargett
+                        CS%dissip_N2 * N2_int(i,K,jj)) ! Floor of Kd_min*rho0/F_Ri
+          Kd_int_2d(i,K,jj) = max(Kd_int_2d(i,K,jj) , &  ! Apply floor to Kd
+                              dissip * (CS%FluxRi_max / (GV%H_to_RZ * (N2_int(i,K,jj) + Omega2))))
+        enddo ; enddo
+      enddo
     endif
 
     ! Optionally add a uniform diffusivity at the interfaces.
     if (CS%Kd_add > 0.0) then
-      do K=1,nz+1 ; do i=is,ie
-        Kd_int_2d(i,K) = Kd_int_2d(i,K) + CS%Kd_add
-      enddo ; enddo
+      do j=jstart,jend ; jj = j - jstart + 1
+        do K=1,nz+1 ; do i=is,ie
+          Kd_int_2d(i,K,jj) = Kd_int_2d(i,K,jj) + CS%Kd_add
+        enddo ; enddo
+      enddo
       VBF%Kd_add = CS%Kd_add
     endif
 
     ! Copy the 2-d slices into the 3-d array that is exported.
-    do K=1,nz+1 ; do i=is,ie
-      Kd_int(i,j,K) = Kd_int_2d(i,K)
-    enddo ; enddo
+    do j=jstart,jend ; jj = j - jstart + 1
+      do K=1,nz+1 ; do i=is,ie
+        Kd_int(i,j,K) = Kd_int_2d(i,K,jj)
+      enddo ; enddo
+    enddo
 
     if (CS%limit_dissipation) then
       ! This calculates the layer dissipation ONLY from Kd calculated in this routine
@@ -713,39 +761,51 @@ subroutine set_diffusivity(u, v, h, u_h, v_h, tv, fluxes, optics, visc, dt, Kd_i
       !   1) a global constant,
       !   2) a dissipation proportional to N (aka Gargett) and
       !   3) dissipation corresponding to a (nearly) constant diffusivity.
-      do k=2,nz-1 ; do i=is,ie
-        dissip = max( CS%dissip_min, &   ! Const. floor on dissip.
-                      CS%dissip_N0 + CS%dissip_N1 * sqrt(N2_lay(i,k)), & ! Floor aka Gargett
-                      CS%dissip_N2 * N2_lay(i,k)) ! Floor of Kd_min*rho0/F_Ri
-        Kd_lay_2d(i,k) = max(Kd_lay_2d(i,k) , &  ! Apply floor to Kd
-                            dissip * (CS%FluxRi_max / (GV%H_to_RZ * (N2_lay(i,k) + Omega2))))
-      enddo ; enddo
+      do j=jstart,jend ; jj = j - jstart + 1
+        do k=2,nz-1 ; do i=is,ie
+          dissip = max( CS%dissip_min, &   ! Const. floor on dissip.
+                        CS%dissip_N0 + CS%dissip_N1 * sqrt(N2_lay(i,k,jj)), & ! Floor aka Gargett
+                        CS%dissip_N2 * N2_lay(i,k,jj)) ! Floor of Kd_min*rho0/F_Ri
+          Kd_lay_2d(i,k,jj) = max(Kd_lay_2d(i,k,jj) , &  ! Apply floor to Kd
+                              dissip * (CS%FluxRi_max / (GV%H_to_RZ * (N2_lay(i,k,jj) + Omega2))))
+        enddo ; enddo
+      enddo
     endif
 
     if (associated(dd%Kd_Work)) then
-      do k=1,nz ; do i=is,ie
-        dd%Kd_Work(i,j,k) = GV%H_to_RZ * Kd_lay_2d(i,k) * N2_lay(i,k) * dz(i,k)  ! Watt m-2 = kg s-3
-      enddo ; enddo
+      do j=jstart,jend ; jj = j - jstart + 1
+        do k=1,nz ; do i=is,ie
+          dd%Kd_Work(i,j,k) = GV%H_to_RZ * Kd_lay_2d(i,k,jj) * N2_lay(i,k,jj) * dz(i,k,jj)  ! Watt m-2 = kg s-3
+        enddo ; enddo
+      enddo
     endif
 
     ! Optionally add a uniform diffusivity to the layers.
     if ((CS%Kd_add > 0.0) .and. (present(Kd_lay))) then
-      do k=1,nz ; do i=is,ie
-        Kd_lay_2d(i,k) = Kd_lay_2d(i,k) + CS%Kd_add
-      enddo ; enddo
+      do j=jstart,jend ; jj = j - jstart + 1
+        do k=1,nz ; do i=is,ie
+          Kd_lay_2d(i,k,jj) = Kd_lay_2d(i,k,jj) + CS%Kd_add
+        enddo ; enddo
+      enddo
     endif
 
     if (associated(dd%Kd_Work_added)) then
-      do k=1,nz ; do i=is,ie
-        dd%Kd_Work_added(i,j,k) = GV%H_to_RZ * CS%Kd_add * N2_lay(i,k) * dz(i,k)  ! Watt m-2 = kg s-3
-      enddo ; enddo
+      do j=jstart,jend ; jj = j - jstart + 1
+        do k=1,nz ; do i=is,ie
+          dd%Kd_Work_added(i,j,k) = GV%H_to_RZ * CS%Kd_add * N2_lay(i,k,jj) * dz(i,k,jj)  ! Watt m-2 = kg s-3
+        enddo ; enddo
+      enddo
     endif
 
     ! Copy the 2-d slices into the 3-d array that is exported; this was done above for Kd_int.
-    if (present(Kd_lay)) then ; do k=1,nz ; do i=is,ie
-      Kd_lay(i,j,k) = Kd_lay_2d(i,k)
-    enddo ; enddo ; endif
-  enddo ! j-loop
+    if (present(Kd_lay)) then
+      do j=jstart,jend ; jj = j - jstart + 1
+        do k=1,nz ; do i=is,ie
+          Kd_lay(i,j,k) = Kd_lay_2d(i,k,jj)
+        enddo ; enddo
+      enddo
+    endif
+  enddo ! jstart-loop
 
   if (CS%user_change_diff) then
     call user_change_diff(h, tv, G, GV, US, CS%user_change_diff_CSp, Kd_lay, Kd_int, &
@@ -868,8 +928,8 @@ subroutine set_diffusivity(u, v, h, u_h, v_h, tv, fluxes, optics, visc, dt, Kd_i
 end subroutine set_diffusivity
 
 !> Convert turbulent kinetic energy to diffusivity
-subroutine find_TKE_to_Kd(h, tv, dRho_int, N2_lay, j, dt, G, GV, US, CS, &
-                          TKE_to_Kd, maxTKE, kb)
+subroutine find_TKE_to_Kd(h, tv, dRho_int, N2_lay, jstart, jend, nj, dt, G, GV, US, CS, &
+                          TKE_to_Kd, maxTKE, kb, dz)
   type(ocean_grid_type),            intent(in)    :: G    !< The ocean's grid structure
   type(verticalGrid_type),          intent(in)    :: GV   !< The ocean's vertical grid structure
   type(unit_scale_type),            intent(in)    :: US   !< A dimensional unit scaling type
@@ -877,24 +937,27 @@ subroutine find_TKE_to_Kd(h, tv, dRho_int, N2_lay, j, dt, G, GV, US, CS, &
                                     intent(in)    :: h    !< Layer thicknesses [H ~> m or kg m-2]
   type(thermo_var_ptrs),            intent(in)    :: tv   !< Structure containing pointers to any available
                                                           !! thermodynamic fields.
-  real, dimension(SZI_(G),SZK_(GV)+1), intent(in) :: dRho_int !< Change in locally referenced potential density
+  real, dimension(SZI_(G),SZK_(GV)+1,nj), intent(in) :: dRho_int !< Change in locally referenced potential density
                                                           !! across each interface [R ~> kg m-3].
-  real, dimension(SZI_(G),SZK_(GV)), intent(in)   :: N2_lay !< The squared buoyancy frequency of the
+  real, dimension(SZI_(G),SZK_(GV),nj),   intent(in) :: N2_lay !< The squared buoyancy frequency of the
                                                           !! layers [T-2 ~> s-2].
-  integer,                          intent(in)    :: j    !< j-index of row to work on
+  integer,                          intent(in)    :: jstart !< Start j-index of the j-block
+  integer,                          intent(in)    :: jend   !< End j-index of the j-block
+  integer,                          intent(in)    :: nj   !< Number of j-rows in the block
   real,                             intent(in)    :: dt   !< Time increment [T ~> s].
   type(set_diffusivity_CS),         pointer       :: CS   !< Diffusivity control structure
-  real, dimension(SZI_(G),SZK_(GV)), intent(out)  :: TKE_to_Kd !< The conversion rate between the
+  real, dimension(SZI_(G),SZK_(GV),nj), intent(out) :: TKE_to_Kd !< The conversion rate between the
                                                           !! TKE dissipated within a layer and the
                                                           !! diapycnal diffusivity within that layer,
                                                           !! usually (~Rho_0 / (G_Earth * dRho_lay))
                                                           !! [T2 Z-1 ~> s2 m-1]
-  real, dimension(SZI_(G),SZK_(GV)), intent(out)  :: maxTKE !< The energy required to for a layer to entrain to its
+  real, dimension(SZI_(G),SZK_(GV),nj), intent(out) :: maxTKE !< The energy required to for a layer to entrain to its
                                                           !! maximum realizable thickness [H Z2 T-3 ~> m3 s-3 or W m-2]
-  integer, dimension(SZI_(G)),      intent(out)   :: kb   !< Index of lightest layer denser than the buffer
+  integer, dimension(SZI_(G),nj),   intent(out)   :: kb   !< Index of lightest layer denser than the buffer
                                                           !! layer, or -1 without a bulk mixed layer.
+  real, dimension(SZI_(G),SZK_(GV),nj), intent(in) :: dz  !< Height change across layers [Z ~> m]
   ! Local variables
-  real, dimension(SZI_(G),SZK_(GV)) :: &
+  real, dimension(SZI_(G),nj,SZK_(GV)) :: &
     ds_dsp1, &    ! coordinate variable (sigma-2) difference across an
                   ! interface divided by the difference across the interface
                   ! below it [nondim]
@@ -902,12 +965,11 @@ subroutine find_TKE_to_Kd(h, tv, dRho_int, N2_lay, j, dt, G, GV, US, CS, &
                   ! across an interface times the difference across the
                   ! interface above it [nondim]
     rho_0,   &    ! Layer potential densities relative to surface pressure [R ~> kg m-3]
-    dz,      &    ! Height change across layers [Z ~> m]
     maxEnt        ! maxEnt is the maximum value of entrainment from below (with
                   ! compensating entrainment from above to keep the layer
                   ! density from changing) that will not deplete all of the
                   ! layers above or below a layer within a timestep [H ~> m or kg m-2].
-  real, dimension(SZI_(G)) :: &
+  real, dimension(SZI_(G),nj) :: &
     htot,    &    ! total thickness above or below a layer, or the
                   ! integrated thickness in the BBL [H ~> m or kg m-2].
     mFkb,    &    ! total thickness in the mixed and buffer layers times ds_dsp1 [H ~> m or kg m-2]
@@ -927,10 +989,10 @@ subroutine find_TKE_to_Kd(h, tv, dRho_int, N2_lay, j, dt, G, GV, US, CS, &
   real :: I_dt        ! 1/dt [T-1 ~> s-1]
   real :: dz_neglect  ! A negligibly small height change [Z ~> m]
   real :: hN2pO2      ! h (N^2 + Omega^2), in [Z T-2 ~> m s-2].
-  logical :: do_i(SZI_(G))
+  logical :: do_i(SZI_(G),nj)
 
   integer, dimension(2) :: EOSdom ! The i-computational domain for the equation of state
-  integer :: i, k, is, ie, nz, i_rem, kmb, kb_min
+  integer :: i, j, k, is, ie, nz, i_rem, kmb, kb_min, jj
   is = G%isc ; ie = G%iec ; nz = GV%ke
 
   I_dt      = 1.0 / dt
@@ -944,156 +1006,163 @@ subroutine find_TKE_to_Kd(h, tv, dRho_int, N2_lay, j, dt, G, GV, US, CS, &
     G_IRho0 = GV%H_to_Z*G_Rho0
   endif
 
-  ! Find the vertical distances across layers.
-  call thickness_to_dz(h, tv, dz, j, G, GV)
-
   ! Simple but coordinate-independent estimate of Kd/TKE
   if (CS%simple_TKE_to_Kd) then
-    do k=1,nz ; do i=is,ie
-      hN2pO2 = dz(i,k) * (N2_lay(i,k) + Omega2) ! Units of Z T-2.
+    do j=jstart,jend ; jj = j - jstart + 1 ; do k=1,nz ; do i=is,ie
+      hN2pO2 = dz(i,k,jj) * (N2_lay(i,k,jj) + Omega2) ! Units of Z T-2.
       if (hN2pO2 > 0.) then
-        TKE_to_Kd(i,k) = 1.0 / hN2pO2 ! Units of T2 H-1.
-      else ; TKE_to_Kd(i,k) = 0. ; endif
+        TKE_to_Kd(i,k,jj) = 1.0 / hN2pO2 ! Units of T2 H-1.
+      else ; TKE_to_Kd(i,k,jj) = 0. ; endif
       ! The maximum TKE conversion we allow is really a statement
       ! about the upper diffusivity we allow. Kd_max must be set.
-      maxTKE(i,k) = hN2pO2 * CS%Kd_max ! Units of H Z2 T-3.
-    enddo ; enddo
-    kb(is:ie) = -1 ! kb should not be used by any code in non-layered mode -AJA
+      maxTKE(i,k,jj) = hN2pO2 * CS%Kd_max ! Units of H Z2 T-3.
+    enddo ; enddo ; enddo
+    do j=jstart,jend ; jj = j - jstart + 1
+      kb(is:ie,jj) = -1 ! kb should not be used by any code in non-layered mode -AJA
+    enddo
     return
   endif
 
   ! Determine kb - the index of the shallowest active interior layer.
   if (CS%bulkmixedlayer) then
     kmb = GV%nk_rho_varies
-    do i=is,ie ; p_0(i) = 0.0 ; p_ref(i) = tv%P_Ref ; enddo
-    EOSdom(:) = EOS_domain(G%HI)
-    do k=1,nz
-      call calculate_density(tv%T(:,j,k), tv%S(:,j,k), p_0, rho_0(:,k), tv%eqn_of_state, EOSdom)
-    enddo
-    call calculate_density(tv%T(:,j,kmb), tv%S(:,j,kmb), p_ref, Rcv_kmb, tv%eqn_of_state, EOSdom)
-
     kb_min = kmb+1
-    do i=is,ie
+    EOSdom(:) = EOS_domain(G%HI)
+    do j=jstart,jend ; jj = j - jstart + 1 ; do i=is,ie
+      p_0(i,jj) = 0.0 ; p_ref(i,jj) = tv%P_Ref
+    enddo ; enddo
+    do j=jstart,jend ; jj = j - jstart + 1 ; do k=1,nz
+      call calculate_density(tv%T(:,j,k), tv%S(:,j,k), p_0(:,jj), rho_0(:,jj,k), tv%eqn_of_state, EOSdom)
+    enddo ; enddo
+    do j=jstart,jend ; jj = j - jstart + 1
+      call calculate_density(tv%T(:,j,kmb), tv%S(:,j,kmb), p_ref(:,jj), Rcv_kmb(:,jj), tv%eqn_of_state, EOSdom)
+    enddo
+    do j=jstart,jend ; jj = j - jstart + 1 ; do i=is,ie
       !   Determine the next denser layer than the buffer layer in the
       ! coordinate density (sigma-2).
-      do k=kmb+1,nz-1 ; if (Rcv_kmb(i) <= GV%Rlay(k)) exit ; enddo
-      kb(i) = k
+      do k=kmb+1,nz-1 ; if (Rcv_kmb(i,jj) <= GV%Rlay(k)) exit ; enddo
+      kb(i,jj) = k
 
     !   Backtrack, in case there are massive layers above that are stable
     ! in sigma-0.
-      do k=kb(i)-1,kmb+1,-1
-        if (rho_0(i,kmb) > rho_0(i,k)) exit
-        if (h(i,j,k)>2.0*GV%Angstrom_H) kb(i) = k
+      do k=kb(i,jj)-1,kmb+1,-1
+        if (rho_0(i,jj,kmb) > rho_0(i,jj,k)) exit
+        if (h(i,j,k)>2.0*GV%Angstrom_H) kb(i,jj) = k
       enddo
-    enddo
-
-    call set_density_ratios(h, tv, kb, G, GV, US, CS, j, ds_dsp1, rho_0)
+    enddo ; enddo
+    call set_density_ratios(h, tv, kb, G, GV, US, CS, jstart, jend, nj, ds_dsp1, rho_0)
   else ! not bulkmixedlayer
     kb_min = 2 ; kmb = 0
-    do i=is,ie ; kb(i) = 1 ; enddo
-    call set_density_ratios(h, tv, kb, G, GV, US, CS, j, ds_dsp1)
+    do j=jstart,jend ; jj = j - jstart + 1 ; do i=is,ie
+      kb(i,jj) = 1
+    enddo ; enddo
+    call set_density_ratios(h, tv, kb, G, GV, US, CS, jstart, jend, nj, ds_dsp1)
   endif
 
   ! Determine maxEnt - the maximum permitted entrainment from below by each
   ! interior layer.
-  do k=2,nz-1 ; do i=is,ie
-    dsp1_ds(i,k) = 1.0 / ds_dsp1(i,k)
+  do k=2,nz-1 ; do j=jstart,jend ; jj = j - jstart + 1 ; do i=is,ie
+    dsp1_ds(i,jj,k) = 1.0 / ds_dsp1(i,jj,k)
+  enddo ; enddo ; enddo
+  do j=jstart,jend ; jj = j - jstart + 1 ; do i=is,ie
+    dsp1_ds(i,jj,nz) = 0.0
   enddo ; enddo
-  do i=is,ie ; dsp1_ds(i,nz) = 0.0 ; enddo
 
   if (CS%bulkmixedlayer) then
     kmb = GV%nk_rho_varies
-    do i=is,ie
-      htot(i) = h(i,j,kmb)
-      mFkb(i) = 0.0
-      if (kb(i) < nz) mFkb(i) = ds_dsp1(i,kb(i)) * (h(i,j,kmb) - GV%Angstrom_H)
-    enddo
-    do k=1,kmb-1 ; do i=is,ie
-      htot(i) = htot(i) + h(i,j,k)
-      mFkb(i) = mFkb(i) + ds_dsp1(i,k+1)*(h(i,j,k) - GV%Angstrom_H)
+    do j=jstart,jend ; jj = j - jstart + 1 ; do i=is,ie
+      htot(i,jj) = h(i,j,kmb)
+      mFkb(i,jj) = 0.0
+      if (kb(i,jj) < nz) mFkb(i,jj) = ds_dsp1(i,jj,kb(i,jj)) * (h(i,j,kmb) - GV%Angstrom_H)
     enddo ; enddo
+    do k=1,kmb-1 ; do j=jstart,jend ; jj = j - jstart + 1 ; do i=is,ie
+      htot(i,jj) = htot(i,jj) + h(i,j,k)
+      mFkb(i,jj) = mFkb(i,jj) + ds_dsp1(i,jj,k+1)*(h(i,j,k) - GV%Angstrom_H)
+    enddo ; enddo ; enddo
   else
-    do i=is,i
-      maxEnt(i,1) = 0.0 ; htot(i) = h(i,j,1) - GV%Angstrom_H
-    enddo
+    do j=jstart,jend ; jj = j - jstart + 1 ; do i=is,ie
+      maxEnt(i,jj,1) = 0.0 ; htot(i,jj) = h(i,j,1) - GV%Angstrom_H
+    enddo ; enddo
   endif
-  do k=kb_min,nz-1 ; do i=is,ie
-    if (k == kb(i)) then
-      maxEnt(i,kb(i)) = mFkb(i)
-    elseif (k > kb(i)) then
+  do k=kb_min,nz-1 ; do j=jstart,jend ; jj = j - jstart + 1 ; do i=is,ie
+    if (k == kb(i,jj)) then
+      maxEnt(i,jj,kb(i,jj)) = mFkb(i,jj)
+    elseif (k > kb(i,jj)) then
       if (CS%answer_date < 20190101) then
-        maxEnt(i,k) = (1.0/dsp1_ds(i,k))*(maxEnt(i,k-1) + htot(i))
+        maxEnt(i,jj,k) = (1.0/dsp1_ds(i,jj,k))*(maxEnt(i,jj,k-1) + htot(i,jj))
       else
-        maxEnt(i,k) = ds_dsp1(i,k)*(maxEnt(i,k-1) + htot(i))
+        maxEnt(i,jj,k) = ds_dsp1(i,jj,k)*(maxEnt(i,jj,k-1) + htot(i,jj))
       endif
-      htot(i) = htot(i) + (h(i,j,k) - GV%Angstrom_H)
+      htot(i,jj) = htot(i,jj) + (h(i,j,k) - GV%Angstrom_H)
     endif
-  enddo ; enddo
+  enddo ; enddo ; enddo
 
-  do i=is,ie
-    htot(i) = h(i,j,nz) - GV%Angstrom_H ; maxEnt(i,nz) = 0.0
-    do_i(i) = (G%mask2dT(i,j) > 0.0)
-  enddo
+  do j=jstart,jend ; jj = j - jstart + 1 ; do i=is,ie
+    htot(i,jj) = h(i,j,nz) - GV%Angstrom_H ; maxEnt(i,jj,nz) = 0.0
+    do_i(i,jj) = (G%mask2dT(i,j) > 0.0)
+  enddo ; enddo
   do k=nz-1,kb_min,-1
-    i_rem = 0
-    do i=is,ie ; if (do_i(i)) then
-      if (k<kb(i)) then ; do_i(i) = .false. ; cycle ; endif
-      i_rem = i_rem + 1  ! Count the i-rows that are still being worked on.
-      maxEnt(i,k) = MIN(maxEnt(i,k), dsp1_ds(i,k+1)*maxEnt(i,k+1) + htot(i))
-      htot(i) = htot(i) + (h(i,j,k) - GV%Angstrom_H)
-    endif ; enddo
-    if (i_rem == 0) exit
-  enddo ! k-loop
+    do j=jstart,jend ; jj = j - jstart + 1
+      i_rem = 0
+      do i=is,ie ; if (do_i(i,jj)) then
+        if (k<kb(i,jj)) then ; do_i(i,jj) = .false. ; cycle ; endif
+        i_rem = i_rem + 1  ! Count the i-rows that are still being worked on.
+        maxEnt(i,jj,k) = MIN(maxEnt(i,jj,k), dsp1_ds(i,jj,k+1)*maxEnt(i,jj,k+1) + htot(i,jj))
+        htot(i,jj) = htot(i,jj) + (h(i,j,k) - GV%Angstrom_H)
+      endif ; enddo
+      if (i_rem == 0) exit
+    enddo ! k-loop
+  enddo ! j-loop
 
   ! Now set maxTKE and TKE_to_Kd.
-  do i=is,ie
-    maxTKE(i,1) = 0.0 ; TKE_to_Kd(i,1) = 0.0
-    maxTKE(i,nz) = 0.0 ; TKE_to_Kd(i,nz) = 0.0
-  enddo
-  do k=2,kmb ; do i=is,ie
-    maxTKE(i,k) = 0.0
-    TKE_to_Kd(i,k) = 1.0 / ((N2_lay(i,k) + Omega2) * (dz(i,k) + dz_neglect))
+  do j=jstart,jend ; jj = j - jstart + 1 ; do i=is,ie
+    maxTKE(i,1,jj) = 0.0 ; TKE_to_Kd(i,1,jj) = 0.0
+    maxTKE(i,nz,jj) = 0.0 ; TKE_to_Kd(i,nz,jj) = 0.0
   enddo ; enddo
-  do k=kmb+1,kb_min-1 ; do i=is,ie
+  do j=jstart,jend ; jj = j - jstart + 1 ; do k=2,kmb ; do i=is,ie
+    maxTKE(i,k,jj) = 0.0
+    TKE_to_Kd(i,k,jj) = 1.0 / ((N2_lay(i,k,jj) + Omega2) * (dz(i,k,jj) + dz_neglect))
+  enddo ; enddo ; enddo
+  do j=jstart,jend ; jj = j - jstart + 1 ; do k=kmb+1,kb_min-1 ; do i=is,ie
     !   These are the properties in the deeper mixed and buffer layers, and
     ! should perhaps be revisited.
-    maxTKE(i,k) = 0.0 ; TKE_to_Kd(i,k) = 0.0
-  enddo ; enddo
-  do k=kb_min,nz-1 ; do i=is,ie
-    if (k<kb(i)) then
-      maxTKE(i,k) = 0.0
-      TKE_to_Kd(i,k) = 0.0
+    maxTKE(i,k,jj) = 0.0 ; TKE_to_Kd(i,k,jj) = 0.0
+  enddo ; enddo ; enddo
+  do j=jstart,jend ; jj = j - jstart + 1 ; do k=kb_min,nz-1 ; do i=is,ie
+    if (k<kb(i,jj)) then
+      maxTKE(i,k,jj) = 0.0
+      TKE_to_Kd(i,k,jj) = 0.0
     else
       ! maxTKE is found by determining the kappa that gives maxEnt.
       !  kappa_max = I_dt * dRho_int(i,K+1) * maxEnt(i,k) * &
       !              G_IRho0*(h(i,j,k) + dh_max) / (G_Rho0*dRho_lay)
       !  maxTKE(i,k) = GV%g_Earth_Z_T2 * dRho_lay * kappa_max
       ! dRho_int should already be non-negative, so the max is redundant?
-      dh_max = maxEnt(i,k) * (1.0 + dsp1_ds(i,k))
-      dRho_lay = 0.5 * max(dRho_int(i,K) + dRho_int(i,K+1), 0.0)
+      dh_max = maxEnt(i,jj,k) * (1.0 + dsp1_ds(i,jj,k))
+      dRho_lay = 0.5 * max(dRho_int(i,K,jj) + dRho_int(i,K+1,jj), 0.0)
 
       ! TKE_to_Kd should be rho_InSitu / G_Earth * (delta rho_InSitu)
       ! The omega^2 term in TKE_to_Kd is due to a rescaling of the efficiency of turbulent
       ! mixing by a factor of N^2 / (N^2 + Omega^2), as proposed by Melet et al., 2013?
       if (allocated(tv%SpV_avg)) then
-        maxTKE(i,k) = I_dt * ((GV%H_to_RZ * grav * tv%SpV_avg(i,j,k)**2) * &
-            (0.5*max(dRho_int(i,K+1) + dsp1_ds(i,k)*dRho_int(i,K), 0.0))) * &
-             ((h(i,j,k) + dh_max) * maxEnt(i,k))
-        TKE_to_Kd(i,k) = 1.0 / (grav * tv%SpV_avg(i,j,k) * dRho_lay + CS%omega**2 * (dz(i,k) + dz_neglect))
+        maxTKE(i,k,jj) = I_dt * ((GV%H_to_RZ * grav * tv%SpV_avg(i,j,k)**2) * &
+            (0.5*max(dRho_int(i,K+1,jj) + dsp1_ds(i,jj,k)*dRho_int(i,K,jj), 0.0))) * &
+             ((h(i,j,k) + dh_max) * maxEnt(i,jj,k))
+        TKE_to_Kd(i,k,jj) = 1.0 / (grav * tv%SpV_avg(i,j,k) * dRho_lay + CS%omega**2 * (dz(i,k,jj) + dz_neglect))
       else
-        maxTKE(i,k) = I_dt * (G_IRho0 * &
-            (0.5*max(dRho_int(i,K+1) + dsp1_ds(i,k)*dRho_int(i,K), 0.0))) * &
-             ((h(i,j,k) + dh_max) * maxEnt(i,k))
-        TKE_to_Kd(i,k) = 1.0 / (G_Rho0 * dRho_lay + CS%omega**2 * (dz(i,k) + dz_neglect))
+        maxTKE(i,k,jj) = I_dt * (G_IRho0 * &
+            (0.5*max(dRho_int(i,K+1,jj) + dsp1_ds(i,jj,k)*dRho_int(i,K,jj), 0.0))) * &
+             ((h(i,j,k) + dh_max) * maxEnt(i,jj,k))
+        TKE_to_Kd(i,k,jj) = 1.0 / (G_Rho0 * dRho_lay + CS%omega**2 * (dz(i,k,jj) + dz_neglect))
       endif
     endif
-  enddo ; enddo
+  enddo ; enddo ; enddo
 
 end subroutine find_TKE_to_Kd
 
 !> Calculate Brunt-Vaisala frequency, N^2.
-subroutine find_N2(h, tv, T_f, S_f, fluxes, j, G, GV, US, CS, dRho_int, &
-                   N2_lay, N2_int, N2_bot, Rho_bot, h_bot, k_bot)
+subroutine find_N2(h, tv, T_f, S_f, fluxes, nj, jstart, jend, G, GV, US, CS, dRho_int, &
+                   N2_lay, N2_int, N2_bot, Rho_bot, h_bot, k_bot, dz)
   type(ocean_grid_type),    intent(in)  :: G    !< The ocean's grid structure
   type(verticalGrid_type),  intent(in)  :: GV   !< The ocean's vertical grid structure
   type(unit_scale_type),    intent(in)  :: US   !< A dimensional unit scaling type
@@ -1108,29 +1177,30 @@ subroutine find_N2(h, tv, T_f, S_f, fluxes, j, G, GV, US, CS, dRho_int, &
                             intent(in)  :: S_f  !< Layer salinities with values in massless
                                                 !! layers filled vertically by diffusion [S ~> ppt].
   type(forcing),            intent(in)  :: fluxes !< A structure of thermodynamic surface fluxes
-  integer,                  intent(in)  :: j    !< j-index of row to work on
+  integer,                  intent(in)  :: nj   !< Number of j-rows in this block
+  integer,                  intent(in)  :: jstart !< Starting j-index of this block
+  integer,                  intent(in)  :: jend !< Ending j-index of this block
   type(set_diffusivity_CS), pointer     :: CS   !< Diffusivity control structure
-  real, dimension(SZI_(G),SZK_(GV)+1), &
+  real, dimension(SZI_(G),SZK_(GV)+1,nj), &
                             intent(out) :: dRho_int !< Change in locally referenced potential density
                                                 !! across each interface [R ~> kg m-3].
-  real, dimension(SZI_(G),SZK_(GV)+1), &
+  real, dimension(SZI_(G),SZK_(GV)+1,nj), &
                             intent(out) :: N2_int !< The squared buoyancy frequency at the interfaces [T-2 ~> s-2].
-  real, dimension(SZI_(G),SZK_(GV)), &
+  real, dimension(SZI_(G),SZK_(GV),nj), &
                             intent(out) :: N2_lay !< The squared buoyancy frequency of the layers [T-2 ~> s-2].
-  real, dimension(SZI_(G)), intent(out) :: N2_bot !< The near-bottom squared buoyancy frequency [T-2 ~> s-2].
-  real, dimension(SZI_(G)), intent(out) :: Rho_bot !< Near-bottom density [R ~> kg m-3].
-  real, dimension(SZI_(G)), optional, intent(out) :: h_bot !< Bottom boundary layer thickness [H ~> m or kg m-2].
-  integer, dimension(SZI_(G)), optional, intent(out) :: k_bot !< Bottom boundary layer top layer index.
+  real, dimension(SZI_(G),nj), intent(out) :: N2_bot !< The near-bottom squared buoyancy frequency [T-2 ~> s-2].
+  real, dimension(SZI_(G),nj), intent(out) :: Rho_bot !< Near-bottom density [R ~> kg m-3].
+  real, dimension(SZI_(G),nj), intent(out) :: h_bot !< Bottom boundary layer thickness [H ~> m or kg m-2].
+  integer, dimension(SZI_(G),nj), intent(out) :: k_bot !< Bottom boundary layer top layer index.
+  real, dimension(SZI_(G),SZK_(GV),nj), intent(in) :: dz !< Height change across layers [Z ~> m]
 
   ! Local variables
-  real, dimension(SZI_(G),SZK_(GV)+1) :: &
-    pres, &            ! pressure at each interface [R L2 T-2 ~> Pa]
+  real, dimension(SZI_(G),nj,SZK_(GV)+1) :: &
+    pres,            & ! pressure at each interface [R L2 T-2 ~> Pa]
     dRho_int_unfilt, & ! unfiltered density differences across interfaces [R ~> kg m-3]
     dRho_dT,         & ! partial derivative of density wrt temp [R C-1 ~> kg m-3 degC-1]
     dRho_dS            ! partial derivative of density wrt saln [R S-1 ~> kg m-3 ppt-1]
-  real, dimension(SZI_(G),SZK_(GV)) :: &
-    dz            ! Height change across layers [Z ~> m]
-  real, dimension(SZI_(G)) :: &
+  real, dimension(SZI_(G),nj) :: &
     Temp_int,  &  ! temperature at each interface [C ~> degC]
     Salin_int, &  ! salinity at each interface [S ~> ppt]
     drho_bot,  &  ! A density difference [R ~> kg m-3]
@@ -1144,128 +1214,166 @@ subroutine find_N2(h, tv, T_f, S_f, fluxes, j, G, GV, US, CS, dRho_int, &
                     ! times some unit conversion factors [H T-2 R-1 ~> m4 s-2 kg-1 or m s-2].
   real :: H_neglect ! A negligibly small thickness [H ~> m or kg m-2]
 
-  logical :: do_i(SZI_(G)), do_any
+  logical :: do_i(SZI_(G),nj), do_any
   integer, dimension(2) :: EOSdom ! The i-computational domain for the equation of state
-  integer :: i, k, is, ie, nz
+  integer :: i, j, k, is, ie, nz, jj
 
   is = G%isc ; ie = G%iec ; nz = GV%ke
   G_Rho0    = GV%g_Earth_Z_T2 / GV%H_to_RZ
   H_neglect = GV%H_subroundoff
 
   ! Find the (limited) density jump across each interface.
-  do i=is,ie
-    dRho_int(i,1) = 0.0 ; dRho_int(i,nz+1) = 0.0
-    dRho_int_unfilt(i,1) = 0.0 ; dRho_int_unfilt(i,nz+1) = 0.0
+  do j=jstart,jend ; jj = j - jstart + 1
+    do i=is,ie
+      dRho_int(i,1,jj) = 0.0 ; dRho_int(i,nz+1,jj) = 0.0
+      dRho_int_unfilt(i,jj,1) = 0.0 ; dRho_int_unfilt(i,jj,nz+1) = 0.0
+    enddo
   enddo
   if (associated(tv%eqn_of_state)) then
     if (associated(fluxes%p_surf)) then
-      do i=is,ie ; pres(i,1) = fluxes%p_surf(i,j) ; enddo
+      do j=jstart,jend ; jj = j - jstart + 1
+        do i=is,ie ; pres(i,jj,1) = fluxes%p_surf(i,j) ; enddo
+      enddo
     else
-      do i=is,ie ; pres(i,1) = 0.0 ; enddo
+      do j=jstart,jend ; jj = j - jstart + 1
+        do i=is,ie ; pres(i,jj,1) = 0.0 ; enddo
+      enddo
     endif
     EOSdom(:) = EOS_domain(G%HI)
     do K=2,nz
-      do i=is,ie
-        pres(i,K) = pres(i,K-1) + (GV%g_Earth*GV%H_to_RZ)*h(i,j,k-1)
-        Temp_Int(i) = 0.5 * (T_f(i,j,k) + T_f(i,j,k-1))
-        Salin_Int(i) = 0.5 * (S_f(i,j,k) + S_f(i,j,k-1))
-      enddo
-      call calculate_density_derivs(Temp_int, Salin_int, pres(:,K), dRho_dT(:,K), dRho_dS(:,K), &
-                                    tv%eqn_of_state, EOSdom)
-      do i=is,ie
-        dRho_int(i,K) = max(dRho_dT(i,K)*(T_f(i,j,k) - T_f(i,j,k-1)) + &
-                            dRho_dS(i,K)*(S_f(i,j,k) - S_f(i,j,k-1)), 0.0)
-        dRho_int_unfilt(i,K) = max(dRho_dT(i,K)*(tv%T(i,j,k) - tv%T(i,j,k-1)) + &
-                                   dRho_dS(i,K)*(tv%S(i,j,k) - tv%S(i,j,k-1)), 0.0)
+      do j=jstart,jend ; jj = j - jstart + 1
+        do i=is,ie
+          pres(i,jj,K) = pres(i,jj,K-1) + (GV%g_Earth*GV%H_to_RZ)*h(i,j,k-1)
+          Temp_Int(i,jj) = 0.5 * (T_f(i,j,k) + T_f(i,j,k-1))
+          Salin_Int(i,jj) = 0.5 * (S_f(i,j,k) + S_f(i,j,k-1))
+        enddo
+        call calculate_density_derivs(Temp_int(:,jj), Salin_int(:,jj), pres(:,jj,K), dRho_dT(:,jj,K), dRho_dS(:,jj,K), &
+                                      tv%eqn_of_state, EOSdom)
+        do i=is,ie
+          dRho_int(i,K,jj) = max(dRho_dT(i,jj,K)*(T_f(i,j,k) - T_f(i,j,k-1)) + &
+                                 dRho_dS(i,jj,K)*(S_f(i,j,k) - S_f(i,j,k-1)), 0.0)
+          dRho_int_unfilt(i,jj,K) = max(dRho_dT(i,jj,K)*(tv%T(i,j,k) - tv%T(i,j,k-1)) + &
+                                        dRho_dS(i,jj,K)*(tv%S(i,j,k) - tv%S(i,j,k-1)), 0.0)
+        enddo
       enddo
     enddo
   else
-    do K=2,nz ; do i=is,ie
-      dRho_int(i,K) = GV%Rlay(k) - GV%Rlay(k-1)
-    enddo ; enddo
+    do j=jstart,jend ; jj = j - jstart + 1
+      do K=2,nz
+        do i=is,ie
+          dRho_int(i,K,jj) = GV%Rlay(k) - GV%Rlay(k-1)
+        enddo
+      enddo
+    enddo
   endif
 
-  ! Find the vertical distances across layers.
-  call thickness_to_dz(h, tv, dz, j, G, GV)
-
   ! Set the buoyancy frequencies.
-  do k=1,nz ; do i=is,ie
-    N2_lay(i,k) = G_Rho0 * 0.5*(dRho_int(i,K) + dRho_int(i,K+1)) / &
-                  (h(i,j,k) + H_neglect)
-  enddo ; enddo
-  do i=is,ie ; N2_int(i,1) = 0.0 ; N2_int(i,nz+1) = 0.0 ; enddo
-  do K=2,nz ; do i=is,ie
-    N2_int(i,K) = G_Rho0 * dRho_int(i,K) / &
-                  (0.5*(h(i,j,k-1) + h(i,j,k) + H_neglect))
-  enddo ; enddo
+  do k=1,nz
+    do j=jstart,jend ; jj = j - jstart + 1
+      do i=is,ie
+        N2_lay(i,k,jj) = G_Rho0 * 0.5*(dRho_int(i,K,jj) + dRho_int(i,K+1,jj)) / &
+                         (h(i,j,k) + H_neglect)
+      enddo
+    enddo
+  enddo
+  do j=jstart,jend ; jj = j - jstart + 1
+    do i=is,ie ; N2_int(i,1,jj) = 0.0 ; N2_int(i,nz+1,jj) = 0.0 ; enddo
+  enddo
+  do K=2,nz
+    do j=jstart,jend ; jj = j - jstart + 1
+      do i=is,ie
+        N2_int(i,K,jj) = G_Rho0 * dRho_int(i,K,jj) / &
+                         (0.5*(h(i,j,k-1) + h(i,j,k) + H_neglect))
+      enddo
+    enddo
+  enddo
 
   ! Find the bottom boundary layer stratification, and use this in the deepest layers.
-  do i=is,ie
-    hb(i) = 0.0 ; dRho_bot(i) = 0.0 ; h_amp(i) = 0.0
-    z_from_bot(i) = 0.5*dz(i,nz)
-    do_i(i) = (G%mask2dT(i,j) > 0.0)
+  do j=jstart,jend ; jj = j - jstart + 1
+    do i=is,ie
+      hb(i,jj) = 0.0 ; dRho_bot(i,jj) = 0.0 ; h_amp(i,jj) = 0.0
+      z_from_bot(i,jj) = 0.5*dz(i,nz,jj)
+      do_i(i,jj) = (G%mask2dT(i,j) > 0.0)
+    enddo
   enddo
-  if (CS%use_tidal_mixing) call tidal_mixing_h_amp(h_amp, G, j, CS%tidal_mixing)
+  if (CS%use_tidal_mixing) then
+    do j=jstart,jend ; jj = j - jstart + 1
+      call tidal_mixing_h_amp(h_amp(:,jj), G, j, CS%tidal_mixing)
+    enddo
+  endif
 
   do k=nz,2,-1
     do_any = .false.
-    do i=is,ie ; if (do_i(i)) then
-      dz_int = 0.5*(dz(i,k) + dz(i,k-1))
-      z_from_bot(i) = z_from_bot(i) + dz_int ! middle of the layer above
+    do j=jstart,jend ; jj = j - jstart + 1
+      do i=is,ie ; if (do_i(i,jj)) then
+        dz_int = 0.5*(dz(i,k,jj) + dz(i,k-1,jj))
+        z_from_bot(i,jj) = z_from_bot(i,jj) + dz_int ! middle of the layer above
 
-      hb(i) = hb(i) + 0.5*(h(i,j,k) + h(i,j,k-1))
-      drho_bot(i) = drho_bot(i) + dRho_int(i,K)
+        hb(i,jj) = hb(i,jj) + 0.5*(h(i,j,k) + h(i,j,k-1))
+        drho_bot(i,jj) = drho_bot(i,jj) + dRho_int(i,K,jj)
 
-      if (z_from_bot(i) > h_amp(i)) then
-        if (k>2) then
-          ! Always include at least one full layer.
-          hb(i) = hb(i) + 0.5*(h(i,j,k-1) + h(i,j,k-2))
-          drho_bot(i) = drho_bot(i) + dRho_int(i,K-1)
+        if (z_from_bot(i,jj) > h_amp(i,jj)) then
+          if (k>2) then
+            ! Always include at least one full layer.
+            hb(i,jj) = hb(i,jj) + 0.5*(h(i,j,k-1) + h(i,j,k-2))
+            drho_bot(i,jj) = drho_bot(i,jj) + dRho_int(i,K-1,jj)
+          endif
+          do_i(i,jj) = .false.
+        else
+          do_any = .true.
         endif
-        do_i(i) = .false.
-      else
-        do_any = .true.
-      endif
-    endif ; enddo
+      endif ; enddo
+    enddo
     if (.not.do_any) exit
   enddo
 
-  do i=is,ie
-    if (hb(i) > 0.0) then
-      N2_bot(i) = (G_Rho0 * drho_bot(i)) / hb(i)
-    else ;  N2_bot(i) = 0.0 ; endif
-    z_from_bot(i) = 0.5*dz(i,nz)
-    do_i(i) = (G%mask2dT(i,j) > 0.0)
+  do j=jstart,jend ; jj = j - jstart + 1
+    do i=is,ie
+      if (hb(i,jj) > 0.0) then
+        N2_bot(i,jj) = (G_Rho0 * drho_bot(i,jj)) / hb(i,jj)
+      else ;  N2_bot(i,jj) = 0.0 ; endif
+      z_from_bot(i,jj) = 0.5*dz(i,nz,jj)
+      do_i(i,jj) = (G%mask2dT(i,j) > 0.0)
+    enddo
   enddo
 
   do k=nz,2,-1
     do_any = .false.
-    do i=is,ie ; if (do_i(i)) then
-      dz_int = 0.5*(dz(i,k) + dz(i,k-1))
-      z_from_bot(i) = z_from_bot(i) + dz_int ! middle of the layer above
+    do j=jstart,jend ; jj = j - jstart + 1
+      do i=is,ie ; if (do_i(i,jj)) then
+        dz_int = 0.5*(dz(i,k,jj) + dz(i,k-1,jj))
+        z_from_bot(i,jj) = z_from_bot(i,jj) + dz_int ! middle of the layer above
 
-      N2_int(i,K) = N2_bot(i)
-      if (k>2) N2_lay(i,k-1) = N2_bot(i)
+        N2_int(i,K,jj) = N2_bot(i,jj)
+        if (k>2) N2_lay(i,k-1,jj) = N2_bot(i,jj)
 
-      if (z_from_bot(i) > h_amp(i)) then
-        if (k>2) N2_int(i,K-1) = N2_bot(i)
-        do_i(i) = .false.
-      else
-        do_any = .true.
-      endif
-    endif ; enddo
+        if (z_from_bot(i,jj) > h_amp(i,jj)) then
+          if (k>2) N2_int(i,K-1,jj) = N2_bot(i,jj)
+          do_i(i,jj) = .false.
+        else
+          do_any = .true.
+        endif
+      endif ; enddo
+    enddo
     if (.not.do_any) exit
   enddo
 
   if (associated(tv%eqn_of_state)) then
-    do K=1,nz+1 ; do i=is,ie
-      dRho_int(i,K) = dRho_int_unfilt(i,K)
-    enddo ; enddo
+    do K=1,nz+1
+      do j=jstart,jend ; jj = j - jstart + 1
+        do i=is,ie
+          dRho_int(i,K,jj) = dRho_int_unfilt(i,jj,K)
+        enddo
+      enddo
+    enddo
   endif
 
   ! Average over the larger of the envelope of the topography or a minimal distance.
-  do i=is,ie ; dz_BBL_avg(i) = max(h_amp(i), CS%dz_BBL_avg_min) ; enddo
-  call find_rho_bottom(G, GV, US, tv, h, dz, pres, dz_BBL_avg, j, Rho_bot, h_bot, k_bot)
+  do j=jstart,jend ; jj = j - jstart + 1
+    do i=is,ie ; dz_BBL_avg(i,jj) = max(h_amp(i,jj), CS%dz_BBL_avg_min) ; enddo
+  enddo
+
+  call find_rho_bottom(G, GV, US, tv, h, dz, pres, dz_BBL_avg, jstart, jend, nj, Rho_bot, h_bot, k_bot)
 
 end subroutine find_N2
 
@@ -1361,7 +1469,7 @@ subroutine double_diffusion(tv, h, T_f, S_f, j, G, GV, US, CS, Kd_T_dd, Kd_S_dd)
 end subroutine double_diffusion
 
 !> This routine adds diffusion sustained by flow energy extracted by bottom drag.
-subroutine add_drag_diffusivity(h, u, v, tv, fluxes, visc, j, TKE_to_Kd, maxTKE, &
+subroutine add_drag_diffusivity(h, u, v, tv, fluxes, visc, jstart, jend, nj, TKE_to_Kd, maxTKE, &
                                 kb, rho_bot, G, GV, US, CS, Kd_lay, Kd_int, Kd_BBL)
   type(ocean_grid_type),            intent(in)    :: G    !< The ocean's grid structure
   type(verticalGrid_type),          intent(in)    :: GV   !< The ocean's vertical grid structure
@@ -1377,22 +1485,24 @@ subroutine add_drag_diffusivity(h, u, v, tv, fluxes, visc, j, TKE_to_Kd, maxTKE,
   type(forcing),                    intent(in)    :: fluxes !< A structure of thermodynamic surface fluxes
   type(vertvisc_type),              intent(in)    :: visc !< Structure containing vertical viscosities, bottom
                                                           !! boundary layer properties and related fields
-  integer,                          intent(in)    :: j    !< j-index of row to work on
-  real, dimension(SZI_(G),SZK_(GV)), intent(in)   :: TKE_to_Kd !< The conversion rate between the TKE
+  integer,                          intent(in)    :: jstart !< j-index of first row to work on
+  integer,                          intent(in)    :: jend   !< j-index of last row to work on
+  integer,                          intent(in)    :: nj     !< Number of j-rows in a j-block
+  real, dimension(SZI_(G),SZK_(GV),nj), intent(in) :: TKE_to_Kd !< The conversion rate between the TKE
                                                           !! TKE dissipated within a layer and the
                                                           !! diapycnal diffusivity within that layer,
                                                           !! usually (~Rho_0 / (G_Earth * dRho_lay))
                                                           !! [T2 Z-1 ~> s2 m-1]
-  real, dimension(SZI_(G),SZK_(GV)), intent(in)   :: maxTKE !< The energy required to for a layer to entrain to its
+  real, dimension(SZI_(G),SZK_(GV),nj), intent(in) :: maxTKE !< The energy required to for a layer to entrain to its
                                                           !! maximum-realizable thickness [H Z2 T-3 ~> m3 s-3 or W m-2]
-  integer, dimension(SZI_(G)),      intent(in)    :: kb   !< Index of lightest layer denser than the buffer
+  integer, dimension(SZI_(G),nj),   intent(in)    :: kb   !< Index of lightest layer denser than the buffer
                                                           !! layer, or -1 without a bulk mixed layer
-  real, dimension(SZI_(G)),         intent(in)    :: rho_bot !< In situ density averaged over a near-bottom
+  real, dimension(SZI_(G),nj),      intent(in)    :: rho_bot !< In situ density averaged over a near-bottom
                                                           !! region [R ~> kg m-3]
   type(set_diffusivity_CS),         pointer       :: CS   !< Diffusivity control structure
-  real, dimension(SZI_(G),SZK_(GV)), intent(inout) :: Kd_lay !< The diapycnal diffusivity in layers,
+  real, dimension(SZI_(G),SZK_(GV),nj), intent(inout) :: Kd_lay !< The diapycnal diffusivity in layers,
                                                             !! [H Z T-1 ~> m2 s-1 or kg m-1 s-1]
-  real, dimension(SZI_(G),SZK_(GV)+1), intent(inout) :: Kd_int !< The diapycnal diffusivity at interfaces,
+  real, dimension(SZI_(G),SZK_(GV)+1,nj), intent(inout) :: Kd_int !< The diapycnal diffusivity at interfaces,
                                                             !! [H Z T-1 ~> m2 s-1 or kg m-1 s-1]
   real, dimension(:,:,:),           pointer       :: Kd_BBL !< Interface BBL diffusivity
                                                             !! [H Z T-1 ~> m2 s-1 or kg m-1 s-1]
@@ -1401,7 +1511,7 @@ subroutine add_drag_diffusivity(h, u, v, tv, fluxes, visc, j, TKE_to_Kd, maxTKE,
 
   real, dimension(SZK_(GV)+1) :: &
     Rint          ! coordinate density of an interface [R ~> kg m-3]
-  real, dimension(SZI_(G)) :: &
+  real, dimension(SZI_(G),nj) :: &
     htot, &       ! total thickness above or below a layer, or the
                   ! integrated thickness in the BBL [H ~> m or kg m-2].
     rho_htot, &   ! running integral with depth of density [R H ~> kg m-2 or kg2 m-5]
@@ -1426,10 +1536,10 @@ subroutine add_drag_diffusivity(h, u, v, tv, fluxes, visc, j, TKE_to_Kd, maxTKE,
                             ! defined in visc, on the assumption that this
                             ! extracted energy also drives diapycnal mixing.
 
-  logical :: domore, do_i(SZI_(G))
+  logical :: domore, do_i(SZI_(G),nj)
   logical :: do_diag_Kd_BBL
 
-  integer :: i, k, is, ie, nz, i_rem, kb_min
+  integer :: i, j, k, is, ie, nz, i_rem, kb_min, jj
   is = G%isc ; ie = G%iec ; nz = GV%ke
 
   do_diag_Kd_BBL = associated(Kd_BBL)
@@ -1449,11 +1559,11 @@ subroutine add_drag_diffusivity(h, u, v, tv, fluxes, visc, j, TKE_to_Kd, maxTKE,
   ! The turbulence decay scale is 0.5*ustar/f from K&E & MOM_vertvisc.F90
   ! Any turbulence that makes it into the mixed layers is assumed
   ! to be relatively small and is discarded.
-  do i=is,ie
+  do j=jstart,jend ; jj = j - jstart + 1 ; do i=is,ie
     ustar_h = visc%ustar_BBL(i,j)
     if (associated(fluxes%ustar_tidal)) then
       if (allocated(tv%SpV_avg)) then
-        ustar_h = ustar_h + GV%RZ_to_H*rho_bot(i) * fluxes%ustar_tidal(i,j)
+        ustar_h = ustar_h + GV%RZ_to_H*rho_bot(i,jj) * fluxes%ustar_tidal(i,j)
       else
         ustar_h = ustar_h + GV%Z_to_H * fluxes%ustar_tidal(i,j)
       endif
@@ -1461,142 +1571,146 @@ subroutine add_drag_diffusivity(h, u, v, tv, fluxes, visc, j, TKE_to_Kd, maxTKE,
     absf = 0.25 * ((abs(G%CoriolisBu(I-1,J-1)) + abs(G%CoriolisBu(I,J))) + &
                    (abs(G%CoriolisBu(I-1,J)) + abs(G%CoriolisBu(I,J-1))))
     if ((ustar_h > 0.0) .and. (absf > 0.5*CS%IMax_decay*ustar_h))  then
-      I2decay(i) = absf / ustar_h
+      I2decay(i,jj) = absf / ustar_h
     else
       ! The maximum decay scale should be something of order 200 m.
       ! If ustar_h = 0, this is land so this value doesn't matter.
-      I2decay(i) = 0.5*CS%IMax_decay
+      I2decay(i,jj) = 0.5*CS%IMax_decay
     endif
     if (CS%drag_diff_answer_date <= 20250301) then
-      TKE(i) = ((CS%BBL_effic * cdrag_sqrt) * exp(-I2decay(i)*h(i,j,nz)) ) * visc%BBL_meanKE_loss_sqrtCd(i,j)
+      TKE(i,jj) = ((CS%BBL_effic * cdrag_sqrt) * exp(-I2decay(i,jj)*h(i,j,nz)) ) * visc%BBL_meanKE_loss_sqrtCd(i,j)
     else
-      TKE(i) = (CS%BBL_effic * exp(-I2decay(i)*h(i,j,nz)) ) * visc%BBL_meanKE_loss(i,j)
+      TKE(i,jj) = (CS%BBL_effic * exp(-I2decay(i,jj)*h(i,j,nz)) ) * visc%BBL_meanKE_loss(i,j)
     endif
 
     if (associated(fluxes%BBL_tidal_dis)) &
-      TKE(i) = TKE(i) + fluxes%BBL_tidal_dis(i,j) * GV%RZ_to_H * &
-           (CS%BBL_effic * exp(-I2decay(i)*h(i,j,nz)))
+      TKE(i,jj) = TKE(i,jj) + fluxes%BBL_tidal_dis(i,j) * GV%RZ_to_H * &
+           (CS%BBL_effic * exp(-I2decay(i,jj)*h(i,j,nz)))
 
     ! Distribute the work over a BBL of depth 20^2 ustar^2 / g' following
     ! Killworth & Edwards (1999) and Zilitikevich & Mironov (1996).
     ! Rho_top is determined by finding the density where
     ! integral(bottom, Z) (rho(z') - rho(Z)) dz' = rho_0 400 ustar^2 / g
 
-    gh_sum_top(i) = R0_g * 400.0 * ustar_h**2
+    gh_sum_top(i,jj) = R0_g * 400.0 * ustar_h**2
 
-    do_i(i) = (G%mask2dT(i,j) > 0.0)
-    htot(i) = h(i,j,nz)
-    rho_htot(i) = GV%Rlay(nz)*(h(i,j,nz))
-    Rho_top(i) = GV%Rlay(1)
-    if (CS%bulkmixedlayer .and. do_i(i)) Rho_top(i) = GV%Rlay(kb(i)-1)
+    do_i(i,jj) = (G%mask2dT(i,j) > 0.0)
+    htot(i,jj) = h(i,j,nz)
+    rho_htot(i,jj) = GV%Rlay(nz)*(h(i,j,nz))
+    Rho_top(i,jj) = GV%Rlay(1)
+    if (CS%bulkmixedlayer .and. do_i(i,jj)) Rho_top(i,jj) = GV%Rlay(kb(i,jj)-1)
+  enddo ; enddo
+
+  do j=jstart,jend ; jj = j - jstart + 1
+    do k=nz-1,2,-1 ; domore = .false.
+      do i=is,ie ; if (do_i(i,jj)) then
+        htot(i,jj) = htot(i,jj) + h(i,j,k)
+        rho_htot(i,jj) = rho_htot(i,jj) + GV%Rlay(k)*(h(i,j,k))
+        if (htot(i,jj)*GV%Rlay(k-1) <= (rho_htot(i,jj) - gh_sum_top(i,jj))) then
+          ! The top of the mixing is in the interface atop the current layer.
+          Rho_top(i,jj) = (rho_htot(i,jj) - gh_sum_top(i,jj)) / htot(i,jj)
+          do_i(i,jj) = .false.
+        elseif (k <= kb(i,jj)) then ; do_i(i,jj) = .false.
+        else ; domore = .true. ; endif
+      endif ; enddo
+      if (.not.domore) exit
+    enddo ! k-loop
   enddo
 
-  do k=nz-1,2,-1 ; domore = .false.
-    do i=is,ie ; if (do_i(i)) then
-      htot(i) = htot(i) + h(i,j,k)
-      rho_htot(i) = rho_htot(i) + GV%Rlay(k)*(h(i,j,k))
-      if (htot(i)*GV%Rlay(k-1) <= (rho_htot(i) - gh_sum_top(i))) then
-        ! The top of the mixing is in the interface atop the current layer.
-        Rho_top(i) = (rho_htot(i) - gh_sum_top(i)) / htot(i)
-        do_i(i) = .false.
-      elseif (k <= kb(i)) then ; do_i(i) = .false.
-      else ; domore = .true. ; endif
-    endif ; enddo
-    if (.not.domore) exit
-  enddo ! k-loop
+  do j=jstart,jend ; jj = j - jstart + 1
+    do i=is,ie ; do_i(i,jj) = (G%mask2dT(i,j) > 0.0) ; enddo
+    do k=nz-1,kb_min,-1
+      i_rem = 0
+      do i=is,ie ; if (do_i(i,jj)) then
+        if (k<kb(i,jj)) then ; do_i(i,jj) = .false. ; cycle ; endif
+        i_rem = i_rem + 1  ! Count the i-rows that are still being worked on.
+        !   Apply vertical decay of the turbulent energy.  This energy is
+        ! simply lost.
+        TKE(i,jj) = TKE(i,jj) * exp(-I2decay(i,jj) * (h(i,j,k) + h(i,j,k+1)))
 
-  do i=is,ie ; do_i(i) = (G%mask2dT(i,j) > 0.0) ; enddo
-  do k=nz-1,kb_min,-1
-    i_rem = 0
-    do i=is,ie ; if (do_i(i)) then
-      if (k<kb(i)) then ; do_i(i) = .false. ; cycle ; endif
-      i_rem = i_rem + 1  ! Count the i-rows that are still being worked on.
-      !   Apply vertical decay of the turbulent energy.  This energy is
-      ! simply lost.
-      TKE(i) = TKE(i) * exp(-I2decay(i) * (h(i,j,k) + h(i,j,k+1)))
+        if (maxTKE(i,k,jj) <= 0.0) cycle
 
-      if (maxTKE(i,k) <= 0.0) cycle
-
-  ! This is an analytic integral where diffusivity is a quadratic function of
-  ! rho that goes asymptotically to 0 at Rho_top (vaguely following KPP?).
-      if (TKE(i) > 0.0) then
-        if (Rint(K) <= Rho_top(i)) then
-          TKE_to_layer = TKE(i)
-        else
-          dRl = Rint(K+1) - Rint(K) ; dRbot = Rint(K+1) - Rho_top(i)
-          TKE_to_layer = TKE(i) * dRl * &
-              (3.0*dRbot*(Rint(K) - Rho_top(i)) + dRl**2) / (dRbot**3)
-        endif
-      else ; TKE_to_layer = 0.0 ; endif
-
-      ! TKE_Ray has been initialized to 0 above.
-      if (Rayleigh_drag) TKE_Ray = 0.5*CS%BBL_effic * G%IareaT(i,j) * &
-            (((G%areaCu(I-1,j) * visc%Ray_u(I-1,j,k) * u(I-1,j,k)**2) + &
-              (G%areaCu(I,j)   * visc%Ray_u(I,j,k)   * u(I,j,k)**2)) + &
-             ((G%areaCv(i,J-1) * visc%Ray_v(i,J-1,k) * v(i,J-1,k)**2) + &
-              (G%areaCv(i,J)   * visc%Ray_v(i,J,k)   * v(i,J,k)**2)))
-
-      if (TKE_to_layer + TKE_Ray > 0.0) then
-        if (CS%BBL_mixing_as_max) then
-          if (TKE_to_layer + TKE_Ray > maxTKE(i,k)) &
-              TKE_to_layer = maxTKE(i,k) - TKE_Ray
-
-          TKE(i) = TKE(i) - TKE_to_layer
-
-          if (Kd_lay(i,k) < (TKE_to_layer + TKE_Ray) * TKE_to_Kd(i,k)) then
-            delta_Kd = (TKE_to_layer + TKE_Ray) * TKE_to_Kd(i,k) - Kd_lay(i,k)
-            if ((CS%Kd_max >= 0.0) .and. (delta_Kd > CS%Kd_max)) then
-              delta_Kd = CS%Kd_max
-              Kd_lay(i,k) = Kd_lay(i,k) + delta_Kd
-            else
-              Kd_lay(i,k) =  (TKE_to_layer + TKE_Ray) * TKE_to_Kd(i,k)
-            endif
-            Kd_int(i,K)   = Kd_int(i,K)   + 0.5 * delta_Kd
-            Kd_int(i,K+1) = Kd_int(i,K+1) + 0.5 * delta_Kd
-            if (do_diag_Kd_BBL) then
-              Kd_BBL(i,j,K) = Kd_BBL(i,j,K) + 0.5 * delta_Kd
-              Kd_BBL(i,j,K+1) = Kd_BBL(i,j,K+1) + 0.5 * delta_Kd
-            endif
-          endif
-        else
-          if (Kd_lay(i,k) >= maxTKE(i,k) * TKE_to_Kd(i,k)) then
-            TKE_here = 0.0
-            TKE(i) = TKE(i) + TKE_Ray
-          elseif (Kd_lay(i,k) + (TKE_to_layer + TKE_Ray) * TKE_to_Kd(i,k) > &
-                  maxTKE(i,k) * TKE_to_Kd(i,k)) then
-            TKE_here = ((TKE_to_layer + TKE_Ray) + Kd_lay(i,k) / TKE_to_Kd(i,k)) - maxTKE(i,k)
-            TKE(i) = (TKE(i) - TKE_here) + TKE_Ray
+    ! This is an analytic integral where diffusivity is a quadratic function of
+    ! rho that goes asymptotically to 0 at Rho_top (vaguely following KPP?).
+        if (TKE(i,jj) > 0.0) then
+          if (Rint(K) <= Rho_top(i,jj)) then
+            TKE_to_layer = TKE(i,jj)
           else
-            TKE_here = TKE_to_layer + TKE_Ray
-            TKE(i) = TKE(i) - TKE_to_layer
+            dRl = Rint(K+1) - Rint(K) ; dRbot = Rint(K+1) - Rho_top(i,jj)
+            TKE_to_layer = TKE(i,jj) * dRl * &
+                (3.0*dRbot*(Rint(K) - Rho_top(i,jj)) + dRl**2) / (dRbot**3)
           endif
-          if (TKE(i) < 0.0) TKE(i) = 0.0 ! This should be unnecessary?
+        else ; TKE_to_layer = 0.0 ; endif
 
-          if (TKE_here > 0.0) then
-            delta_Kd = TKE_here * TKE_to_Kd(i,k)
-            if (CS%Kd_max >= 0.0) delta_Kd = min(delta_Kd, CS%Kd_max)
-            Kd_lay(i,k) = Kd_lay(i,k) + delta_Kd
-            Kd_int(i,K)   = Kd_int(i,K)   + 0.5 * delta_Kd
-            Kd_int(i,K+1) = Kd_int(i,K+1) + 0.5 * delta_Kd
-            if (do_diag_Kd_BBL) then
-              Kd_BBL(i,j,K) = Kd_BBL(i,j,K) + 0.5 * delta_Kd
-              Kd_BBL(i,j,K+1) = Kd_BBL(i,j,K+1) + 0.5 * delta_Kd
+        ! TKE_Ray has been initialized to 0 above.
+        if (Rayleigh_drag) TKE_Ray = 0.5*CS%BBL_effic * G%IareaT(i,j) * &
+              (((G%areaCu(I-1,j) * visc%Ray_u(I-1,j,k) * u(I-1,j,k)**2) + &
+                (G%areaCu(I,j)   * visc%Ray_u(I,j,k)   * u(I,j,k)**2)) + &
+               ((G%areaCv(i,J-1) * visc%Ray_v(i,J-1,k) * v(i,J-1,k)**2) + &
+                (G%areaCv(i,J)   * visc%Ray_v(i,J,k)   * v(i,J,k)**2)))
+
+        if (TKE_to_layer + TKE_Ray > 0.0) then
+          if (CS%BBL_mixing_as_max) then
+            if (TKE_to_layer + TKE_Ray > maxTKE(i,k,jj)) &
+                TKE_to_layer = maxTKE(i,k,jj) - TKE_Ray
+
+            TKE(i,jj) = TKE(i,jj) - TKE_to_layer
+
+            if (Kd_lay(i,k,jj) < (TKE_to_layer + TKE_Ray) * TKE_to_Kd(i,k,jj)) then
+              delta_Kd = (TKE_to_layer + TKE_Ray) * TKE_to_Kd(i,k,jj) - Kd_lay(i,k,jj)
+              if ((CS%Kd_max >= 0.0) .and. (delta_Kd > CS%Kd_max)) then
+                delta_Kd = CS%Kd_max
+                Kd_lay(i,k,jj) = Kd_lay(i,k,jj) + delta_Kd
+              else
+                Kd_lay(i,k,jj) =  (TKE_to_layer + TKE_Ray) * TKE_to_Kd(i,k,jj)
+              endif
+              Kd_int(i,K,jj)   = Kd_int(i,K,jj)   + 0.5 * delta_Kd
+              Kd_int(i,K+1,jj) = Kd_int(i,K+1,jj) + 0.5 * delta_Kd
+              if (do_diag_Kd_BBL) then
+                Kd_BBL(i,j,K) = Kd_BBL(i,j,K) + 0.5 * delta_Kd
+                Kd_BBL(i,j,K+1) = Kd_BBL(i,j,K+1) + 0.5 * delta_Kd
+              endif
+            endif
+          else
+            if (Kd_lay(i,k,jj) >= maxTKE(i,k,jj) * TKE_to_Kd(i,k,jj)) then
+              TKE_here = 0.0
+              TKE(i,jj) = TKE(i,jj) + TKE_Ray
+            elseif (Kd_lay(i,k,jj) + (TKE_to_layer + TKE_Ray) * TKE_to_Kd(i,k,jj) > &
+                    maxTKE(i,k,jj) * TKE_to_Kd(i,k,jj)) then
+              TKE_here = ((TKE_to_layer + TKE_Ray) + Kd_lay(i,k,jj) / TKE_to_Kd(i,k,jj)) - maxTKE(i,k,jj)
+              TKE(i,jj) = (TKE(i,jj) - TKE_here) + TKE_Ray
+            else
+              TKE_here = TKE_to_layer + TKE_Ray
+              TKE(i,jj) = TKE(i,jj) - TKE_to_layer
+            endif
+            if (TKE(i,jj) < 0.0) TKE(i,jj) = 0.0 ! This should be unnecessary?
+
+            if (TKE_here > 0.0) then
+              delta_Kd = TKE_here * TKE_to_Kd(i,k,jj)
+              if (CS%Kd_max >= 0.0) delta_Kd = min(delta_Kd, CS%Kd_max)
+              Kd_lay(i,k,jj) = Kd_lay(i,k,jj) + delta_Kd
+              Kd_int(i,K,jj)   = Kd_int(i,K,jj)   + 0.5 * delta_Kd
+              Kd_int(i,K+1,jj) = Kd_int(i,K+1,jj) + 0.5 * delta_Kd
+              if (do_diag_Kd_BBL) then
+                Kd_BBL(i,j,K) = Kd_BBL(i,j,K) + 0.5 * delta_Kd
+                Kd_BBL(i,j,K+1) = Kd_BBL(i,j,K+1) + 0.5 * delta_Kd
+              endif
             endif
           endif
         endif
-      endif
 
-      ! This may be risky - in the case that there are exactly zero
-      ! velocities at 4 neighboring points, but nonzero velocities
-      ! above the iterations would stop too soon. I don't see how this
-      ! could happen in practice. RWH
-      if ((TKE(i)<= 0.0) .and. (TKE_Ray == 0.0)) then
-        do_i(i) = .false. ; i_rem = i_rem - 1
-      endif
+        ! This may be risky - in the case that there are exactly zero
+        ! velocities at 4 neighboring points, but nonzero velocities
+        ! above the iterations would stop too soon. I don't see how this
+        ! could happen in practice. RWH
+        if ((TKE(i,jj)<= 0.0) .and. (TKE_Ray == 0.0)) then
+          do_i(i,jj) = .false. ; i_rem = i_rem - 1
+        endif
 
-    endif ; enddo
-    if (i_rem == 0) exit
-  enddo ! k-loop
+      endif ; enddo
+      if (i_rem == 0) exit
+    enddo ! k-loop
+  enddo
 
 end subroutine add_drag_diffusivity
 
@@ -1604,7 +1718,7 @@ end subroutine add_drag_diffusivity
 !! wall turbulent viscosity, up to a BBL height where the energy used for mixing has
 !! consumed the mechanical TKE input.
 subroutine add_LOTW_BBL_diffusivity(h, u, v, tv, fluxes, visc, j, N2_int, Rho_bot, Kd_int, &
-                                    G, GV, US, CS, Kd_BBL, Kd_lay)
+                                    G, GV, US, CS, Kd_BBL, Kd_lay, dz)
   type(ocean_grid_type),    intent(in)    :: G  !< Grid structure
   type(verticalGrid_type),  intent(in)    :: GV !< Vertical grid structure
   type(unit_scale_type),    intent(in)    :: US !< A dimensional unit scaling type
@@ -1629,10 +1743,10 @@ subroutine add_LOTW_BBL_diffusivity(h, u, v, tv, fluxes, visc, j, N2_int, Rho_bo
   type(set_diffusivity_CS), pointer       :: CS !< Diffusivity control structure
   real, dimension(:,:,:),   pointer       :: Kd_BBL !< Interface BBL diffusivity [H Z T-1 ~> m2 s-1 or kg m-1 s-1]
   real, dimension(SZI_(G),SZK_(GV)), &
-                  optional, intent(inout) :: Kd_lay !< Layer net diffusivity [H Z T-1 ~> m2 s-1 or kg m-1 s-1]
+                  optional, intent(inout) :: Kd_lay  !< Layer net diffusivity [H Z T-1 ~> m2 s-1 or kg m-1 s-1]
+  real, dimension(SZI_(G),SZK_(GV)), intent(in) :: dz !< Height change across layers [Z ~> m]
 
   ! Local variables
-  real :: dz(SZI_(G),SZK_(GV)) ! Height change across layers [Z ~> m]
   real :: dz_above(SZK_(GV)+1) ! Distance from each interface to the surface [Z ~> m]
   real :: TKE_column       ! net TKE input into the column [H Z2 T-3 ~> m3 s-3 or W m-2]
   real :: BBL_meanKE_dis   ! Sum of tidal and mean kinetic energy dissipation in the bottom boundary layer, which
@@ -1670,9 +1784,6 @@ subroutine add_LOTW_BBL_diffusivity(h, u, v, tv, fluxes, visc, j, N2_int, Rho_bo
   Rayleigh_drag = .false.
   if (allocated(visc%Ray_u) .and. allocated(visc%Ray_v)) Rayleigh_drag = .true.
   cdrag_sqrt = sqrt(CS%cdrag)
-
-  ! Find the vertical distances across layers.
-  call thickness_to_dz(h, tv, dz, j, G, GV)
 
   do i=G%isc,G%iec ! Developed in single-column mode
 
@@ -2151,7 +2262,7 @@ subroutine set_BBL_TKE(u, v, h, tv, fluxes, visc, G, GV, US, CS, OBC)
 
 end subroutine set_BBL_TKE
 
-subroutine set_density_ratios(h, tv, kb, G, GV, US, CS, j, ds_dsp1, rho_0)
+subroutine set_density_ratios(h, tv, kb, G, GV, US, CS, jstart, jend, nj, ds_dsp1, rho_0)
   type(ocean_grid_type),            intent(in)   :: G  !< The ocean's grid structure.
   type(verticalGrid_type),          intent(in)   :: GV !< The ocean's vertical grid structure.
   real, dimension(SZI_(G),SZJ_(G),SZK_(GV)), &
@@ -2159,17 +2270,19 @@ subroutine set_density_ratios(h, tv, kb, G, GV, US, CS, j, ds_dsp1, rho_0)
   type(thermo_var_ptrs),            intent(in)   :: tv !< Structure containing pointers to any
                                                        !! available thermodynamic fields; absent
                                                        !! fields have NULL ptrs.
-  integer, dimension(SZI_(G)),      intent(in)   :: kb !< Index of lightest layer denser than the buffer
+  integer, dimension(SZI_(G),nj),   intent(in)   :: kb !< Index of lightest layer denser than the buffer
                                                        !! layer, or -1 without a bulk mixed layer.
   type(unit_scale_type),            intent(in)   :: US !< A dimensional unit scaling type
   type(set_diffusivity_CS),         pointer      :: CS !< Control structure returned by previous
                                                        !! call to diabatic_entrain_init.
-  integer,                          intent(in)   :: j  !< Meridional index upon which to work.
-  real, dimension(SZI_(G),SZK_(GV)), intent(out) :: ds_dsp1 !< Coordinate variable (sigma-2)
+  integer,                          intent(in)   :: jstart !< Start j-index of the j-block
+  integer,                          intent(in)   :: jend   !< End j-index of the j-block
+  integer,                          intent(in)   :: nj     !< Number of j-rows in the block
+  real, dimension(SZI_(G),nj,SZK_(GV)), intent(out) :: ds_dsp1 !< Coordinate variable (sigma-2)
                                                        !! difference across an interface divided by
                                                        !! the difference across the interface below
                                                        !! it [nondim]
-  real, dimension(SZI_(G),SZK_(GV)), &
+  real, dimension(SZI_(G),nj,SZK_(GV)), &
                           optional, intent(in)   :: rho_0 !< Layer potential densities relative to
                                                        !! surface press [R ~> kg m-3].
 
@@ -2177,47 +2290,43 @@ subroutine set_density_ratios(h, tv, kb, G, GV, US, CS, j, ds_dsp1, rho_0)
   real :: g_R0                     ! g_R0 is a rescaled version of g/Rho [L2 Z-1 R-1 T-2 ~> m4 kg-1 s-2]
   real :: eps, tmp                 ! nondimensional temporary variables [nondim]
   real :: a(SZK_(GV)), a_0(SZK_(GV)) ! nondimensional temporary variables [nondim]
-  real :: p_ref(SZI_(G))           ! an array of tv%P_Ref pressures [R L2 T-2 ~> Pa]
-  real :: Rcv(SZI_(G),SZK_(GV))    ! coordinate density in the mixed and buffer layers [R ~> kg m-3]
+  real :: p_ref(SZI_(G),nj)        ! an array of tv%P_Ref pressures [R L2 T-2 ~> Pa]
+  real :: Rcv(SZI_(G),nj,SZK_(GV)) ! coordinate density in the mixed and buffer layers [R ~> kg m-3]
   real :: I_Drho                   ! The inverse of the coordinate density difference between
                                    ! layers [R-1 ~> m3 kg-1]
 
   integer, dimension(2) :: EOSdom ! The i-computational domain for the equation of state
-  integer :: i, k, k3, is, ie, nz, kmb
+  integer :: i, j, k, k3, is, ie, nz, kmb, jj
   is = G%isc ; ie = G%iec ; nz = GV%ke
 
-  do k=2,nz-1
+  do j=jstart,jend ; jj = j - jstart + 1 ; do k=2,nz-1 ; do i=is,ie
     if (GV%g_prime(k+1) /= 0.0) then
       if (GV%Boussinesq .or. GV%Semi_Boussinesq) then
-        do i=is,ie
-          ds_dsp1(i,k) = GV%g_prime(k) / GV%g_prime(k+1)
-        enddo
+        ds_dsp1(i,jj,k) = GV%g_prime(k) / GV%g_prime(k+1)
       else  ! Use a mathematically equivalent form that avoids any dependency on RHO_0.
-        do i=is,ie
-          ds_dsp1(i,k) = (GV%Rlay(k) - GV%Rlay(k-1)) / (GV%Rlay(k+1) - GV%Rlay(k))
-        enddo
+        ds_dsp1(i,jj,k) = (GV%Rlay(k) - GV%Rlay(k-1)) / (GV%Rlay(k+1) - GV%Rlay(k))
       endif
     else
-      do i=is,ie
-        ds_dsp1(i,k) = 1.
-      enddo
+      ds_dsp1(i,jj,k) = 1.
     endif
-  enddo
+  enddo ; enddo ; enddo
 
   if (CS%bulkmixedlayer) then
     g_R0 = GV%g_Earth / (GV%Rho0)
     kmb = GV%nk_rho_varies
     eps = 0.1
-    do i=is,ie ; p_ref(i) = tv%P_Ref ; enddo
     EOSdom(:) = EOS_domain(G%HI)
-    do k=1,kmb
-      call calculate_density(tv%T(:,j,k), tv%S(:,j,k), p_ref, Rcv(:,k), tv%eqn_of_state, EOSdom)
-    enddo
-    do i=is,ie
-      if (kb(i) <= nz-1) then
+    do j=jstart,jend ; jj = j - jstart + 1 ; do i=is,ie
+      p_ref(i,jj) = tv%P_Ref
+    enddo ; enddo
+    do k=1,kmb ; do j=jstart,jend ; jj = j - jstart + 1
+      call calculate_density(tv%T(:,j,k), tv%S(:,j,k), p_ref(:,jj), Rcv(:,jj,k), tv%eqn_of_state, EOSdom)
+    enddo ; enddo
+    do j=jstart,jend ; jj = j - jstart + 1 ; do i=is,ie
+      if (kb(i,jj) <= nz-1) then
 !   Set up appropriately limited ratios of the reduced gravities of the
 ! interfaces above and below the buffer layer and the next denser layer.
-        k = kb(i)
+        k = kb(i,jj)
 
         if (GV%Boussinesq .or. GV%Semi_Boussinesq) then
           I_Drho = g_R0 / GV%g_prime(k+1)
@@ -2226,44 +2335,44 @@ subroutine set_density_ratios(h, tv, kb, G, GV, US, CS, j, ds_dsp1, rho_0)
         endif
         ! The indexing convention for a is appropriate for the interfaces.
         do k3=1,kmb
-          a(k3+1) = (GV%Rlay(k) - Rcv(i,k3)) * I_Drho
+          a(k3+1) = (GV%Rlay(k) - Rcv(i,k3,jj)) * I_Drho
         enddo
-        if ((present(rho_0)) .and. (a(kmb+1) < 2.0*eps*ds_dsp1(i,k))) then
+        if ((present(rho_0)) .and. (a(kmb+1) < 2.0*eps*ds_dsp1(i,jj,k))) then
 !   If the buffer layer nearly matches the density of the layer below in the
 ! coordinate variable (sigma-2), use the sigma-0-based density ratio if it is
 ! greater (and stable).
-          if ((rho_0(i,k) > rho_0(i,kmb)) .and. &
-              (rho_0(i,k+1) > rho_0(i,k))) then
-            I_Drho = 1.0 / (rho_0(i,k+1)-rho_0(i,k))
-            a_0(kmb+1) = min((rho_0(i,k)-rho_0(i,kmb)) * I_Drho, ds_dsp1(i,k))
+          if ((rho_0(i,jj,k) > rho_0(i,jj,kmb)) .and. &
+              (rho_0(i,jj,k+1) > rho_0(i,jj,k))) then
+            I_Drho = 1.0 / (rho_0(i,jj,k+1)-rho_0(i,jj,k))
+            a_0(kmb+1) = min((rho_0(i,jj,k)-rho_0(i,jj,kmb)) * I_Drho, ds_dsp1(i,jj,k))
             if (a_0(kmb+1) > a(kmb+1)) then
               do k3=2,kmb
-                a_0(k3) = a_0(kmb+1) + (rho_0(i,kmb)-rho_0(i,k3-1)) * I_Drho
+                a_0(k3) = a_0(kmb+1) + (rho_0(i,jj,kmb)-rho_0(i,jj,k3-1)) * I_Drho
               enddo
-              if (a(kmb+1) <= eps*ds_dsp1(i,k)) then
+              if (a(kmb+1) <= eps*ds_dsp1(i,jj,k)) then
                 do k3=2,kmb+1 ; a(k3) = a_0(k3) ; enddo
               else
-! Alternative...  tmp = 0.5*(1.0 - cos(PI*(a(K2+1)/(eps*ds_dsp1(i,k)) - 1.0)) )
-                tmp = a(kmb+1)/(eps*ds_dsp1(i,k)) - 1.0
+! Alternative...  tmp = 0.5*(1.0 - cos(PI*(a(K2+1)/(eps*ds_dsp1(i,jj,k)) - 1.0)) )
+                tmp = a(kmb+1)/(eps*ds_dsp1(i,jj,k)) - 1.0
                 do k3=2,kmb+1 ; a(k3) = tmp*a(k3) + (1.0-tmp)*a_0(k3) ; enddo
               endif
             endif
           endif
         endif
 
-        ds_dsp1(i,k) = MAX(a(kmb+1),1e-5)
+        ds_dsp1(i,jj,k) = MAX(a(kmb+1),1e-5)
 
         do k3=2,kmb
-!           ds_dsp1(i,k3) = MAX(a(k3),1e-5)
+!           ds_dsp1(i,jj,k3) = MAX(a(k3),1e-5)
           ! Deliberately treat convective instabilities of the upper mixed
           ! and buffer layers with respect to the deepest buffer layer as
           ! though they don't exist.  They will be eliminated by the upcoming
           ! call to the mixedlayer code anyway.
           ! The indexing convention is appropriate for the interfaces.
-          ds_dsp1(i,k3) = MAX(a(k3),ds_dsp1(i,k))
+          ds_dsp1(i,jj,k3) = MAX(a(k3),ds_dsp1(i,jj,k))
         enddo
-      endif ! (kb(i) <= nz-1)
-    enddo ! I-loop.
+      endif ! (kb(i,jj) <= nz-1)
+    enddo ; enddo ! i-loop / j-loop
   endif ! bulkmixedlayer
 
 end subroutine set_density_ratios
