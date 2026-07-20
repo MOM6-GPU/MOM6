@@ -15,6 +15,7 @@ use MOM_file_parser,   only : get_param, log_version, param_file_type
 use MOM_forcing_type,  only : mech_forcing
 use MOM_grid,          only : ocean_grid_type
 use MOM_hor_index,     only : hor_index_type
+use MOM_intrinsic_functions, only : exp_reprod, erfc_reprod, log_reprod
 use MOM_io,            only : file_exists, get_var_sizes, read_variable
 use MOM_io,            only : vardesc, var_desc
 use MOM_safe_alloc,    only : safe_alloc_ptr
@@ -1083,7 +1084,7 @@ real function one_minus_exp_x(x)
     ! The Taylor series expression for exp(-x) gives a more accurate expression for 64-bit reals.
     one_minus_exp_x = 1.0 - x * (0.5 - C1_6*x)
   else
-    one_minus_exp_x = (1.0 - exp(-x)) / x
+    one_minus_exp_x = (1.0 - exp_reprod(-x)) / x
   endif
 end function one_minus_exp_x
 
@@ -1452,9 +1453,8 @@ subroutine get_StokesSL_LiFoxKemper(ustar, hbl, GV, US, CS, UStokes_SL, LA)
   real :: root_2kz ! The square root of twice the peak wavenumber times the
                    ! boundary layer depth [nondim]
   real :: u10      ! The 10 m wind speed [L T-1 ~> m s-1]
-  real :: PI       ! 3.1415926535... [nondim]
+  real, parameter :: PI = 3.14159265358979323846 ! 3.1415926535... [nondim]
 
-  PI = 4.0*atan(1.0)
   UStokes_sl = 0.0
   LA = 1.e8
   if (ustar > 0.0) then
@@ -1528,8 +1528,8 @@ subroutine get_StokesSL_LiFoxKemper(ustar, hbl, GV, US, CS, UStokes_SL, LA)
       !   It has been verified that these two expressions for r5 are the same to 6 decimal places for
       ! root_2kz  between 1e-10 and 1e-3, but that the first one degrades for smaller values.
       if (root_2kz > 1e-3) then
-        r5 = sqrt(PI) * (root_2kz * (-0.84 * erfc(root_2kz) + 0.2 * erfc(1.6*root_2kz)) + &
-                         0.1182 * (erfc(1.6*root_2kz) - erfc(root_2kz)) / root_2kz)
+        r5 = sqrt(PI) * (root_2kz * (-0.84 * erfc_reprod(root_2kz) + 0.2 * erfc_reprod(1.6*root_2kz)) + &
+                         0.1182 * (erfc_reprod(1.6*root_2kz) - erfc_reprod(root_2kz)) / root_2kz)
       else
         ! It is more accurate to replace erf with the first two terms of its Taylor series
         !  erf(z) = (2/sqrt(pi)) * z * (1. - (1/3)*z**2 + (1/10)*z**4 - (1/42)*z**6 + ...)
@@ -2203,7 +2203,7 @@ subroutine ust_2_u10_coare3p5(USTair, U10, GV, US, CS)
       alpha = min(CS%Charnock_min, CS%Charnock_slope_U10 * u10 + CS%Charnock_intercept)
       z0rough = alpha * (CS%I_g_Earth * USTair**2) ! Compute z0rough from ustar guess
       z0 = z0sm + z0rough
-      I_sqrtCd = abs(log(z0 * I_ten_m_scale)) * I_vonKar ! Compute Cd from derived roughness
+      I_sqrtCd = abs(log_reprod(z0 * I_ten_m_scale)) * I_vonKar ! Compute Cd from derived roughness
       u10 = US%Z_to_L*USTair * I_sqrtCd  ! Compute new u10 from the derived Cd.
     enddo
 

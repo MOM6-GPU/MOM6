@@ -17,7 +17,7 @@ use MOM_file_parser,    only : get_param, log_param, log_version, param_file_typ
 use MOM_forcing_type,   only : forcing
 use MOM_grid,           only : ocean_grid_type
 use MOM_interface_heights, only : thickness_to_dz
-use MOM_intrinsic_functions, only : cuberoot
+use MOM_intrinsic_functions, only : cuberoot, exp_reprod, log_reprod
 use MOM_string_functions, only : uppercase
 use MOM_unit_scaling,   only : unit_scale_type
 use MOM_variables,      only : thermo_var_ptrs, vertvisc_type
@@ -1508,6 +1508,9 @@ subroutine ePBL_column(h, dz, u, v, T0, S0, dSV_dT, dSV_dS, SpV_dt, TKE_forcing,
           if (CS%MixLenExponent==2.0) then
             MixLen_shape(K) = CS%transLay_scale + (1.0 - CS%transLay_scale) * &
                (max(0.0, (MLD_guess - dz_rsum)*I_MLD) )**2 ! CS%MixLenExponent
+          elseif (CS%MixLenExponent==1.0) then
+            MixLen_shape(K) = CS%transLay_scale + (1.0 - CS%transLay_scale) * &
+               max(0.0, (MLD_guess - dz_rsum)*I_MLD) ! CS%MixLenExponent==1.0 identity
           else
             MixLen_shape(K) = CS%transLay_scale + (1.0 - CS%transLay_scale) * &
                (max(0.0, (MLD_guess - dz_rsum)*I_MLD) )**CS%MixLenExponent
@@ -1551,7 +1554,7 @@ subroutine ePBL_column(h, dz, u, v, T0, S0, dSV_dT, dSV_dS, SpV_dt, TKE_forcing,
         Idecay_len_TKE = (CS%TKE_decay * absf) / (h_dz_int(K) * u_star)
       endif
       exp_kh = 1.0
-      if (Idecay_len_TKE > 0.0) exp_kh = exp(-h(k-1)*Idecay_len_TKE)
+      if (Idecay_len_TKE > 0.0) exp_kh = exp_reprod(-h(k-1)*Idecay_len_TKE)
       if (CS%TKE_diagnostics) &
         eCD%dTKE_mech_decay = eCD%dTKE_mech_decay + (exp_kh-1.0) * mech_TKE * I_dtdiag
       if (present(TKE_diss_stoch)) then ! perturb the TKE destruction
@@ -3242,17 +3245,17 @@ function exp_decay_TKE_adjust(hb, ha, Idecay) result(TKE_to_PE_scale)
     ! TKE_to_PE_scale = (0.5 * (khb + kha)) / &
     !                   ((exp(-khb) - (1.0 - khb)) / khb + (exp(kha) - (1.0 + kha)) / kha)
     TKE_to_PE_scale = (0.5 * (khb + kha) * (kha * khb)) / &
-                      (kha * (exp(-khb) - (1.0 - khb)) + khb * (exp(kha) - (1.0 + kha)))
+                      (kha * (exp_reprod(-khb) - (1.0 - khb)) + khb * (exp_reprod(kha) - (1.0 + kha)))
   elseif (khb > 2.2e-4) then
     ! For small values of kha, approximate (exp(kha) - (1.0 + hha)) by the first two
     ! terms of its Taylor series: 0.5*kha**2 + C1_6*kha**3 + ... + kha**n/n! + ...
     ! which is more accurate when kha**4/24. < 1e-16 or kha < ~ 2.21e-4.
     TKE_to_PE_scale = (0.5 * (khb + kha) * khb) / &
-                      ((exp(-khb) - (1.0 - khb)) + 0.5*(khb * kha) * (1.0 + C1_3*kha))
+                      ((exp_reprod(-khb) - (1.0 - khb)) + 0.5*(khb * kha) * (1.0 + C1_3*kha))
   elseif (kha > 2.2e-4) then
     ! Use a Taylor series expansion for small values of khb
     TKE_to_PE_scale = (0.5 * (khb + kha) * kha) / &
-                      (0.5 * (kha * khb) * (1.0 - C1_3*Khb) + (exp(kha) - (1.0 + kha)))
+                      (0.5 * (kha * khb) * (1.0 - C1_3*Khb) + (exp_reprod(kha) - (1.0 + kha)))
   else ! (kha < 2.2e-4) .and. (khb < 2.2e-4) - use Taylor series approximations for both
     TKE_to_PE_scale = 1.0 / (1.0 + C1_3*(kha - khb))
   endif
@@ -3765,13 +3768,13 @@ subroutine find_mstar(CS, US, Buoyancy_Flux, UStar, &
       mstar_S = CS%mstar_coef*sqrt(max(0.0,Buoyancy_Flux) / UStar**2 / &
                     (Abs_Coriolis + 1.e-10*US%T_to_s) )
       ! The limit for rotation (Ekman length) limited mixing
-      mstar_N =  CS%C_Ek * log( max( 1., UStar / (Abs_Coriolis + 1.e-10*US%T_to_s) / BLD ) )
+      mstar_N =  CS%C_Ek * log_reprod( max( 1., UStar / (Abs_Coriolis + 1.e-10*US%T_to_s) / BLD ) )
     else
       ! The limit for the balance of rotation and stabilizing is f(L_Ekman,L_Obukhov)
       mstar_S = CS%mstar_coef*sqrt(max(0.0, Buoyancy_Flux) / (UStar**2 * max(Abs_Coriolis, 1.e-20*US%T_to_s)))
       ! The limit for rotation (Ekman length) limited mixing
       mstar_N = 0.0
-      if (UStar > Abs_Coriolis * BLD) mstar_N = CS%C_Ek * log(UStar / (Abs_Coriolis * BLD))
+      if (UStar > Abs_Coriolis * BLD) mstar_N = CS%C_Ek * log_reprod(UStar / (Abs_Coriolis * BLD))
     endif
 
     ! Here 1.25 is about .5/von Karman, which gives the Obukhov limit.
@@ -3893,10 +3896,10 @@ subroutine mstar_Langmuir(CS, US, Abs_Coriolis, Buoyancy_Flux, UStar, BLD, Langm
     if (CS%LT_enhance_form == Langmuir_rescale) then
       ! Enhancement is multiplied (added mst_lt set to 0)
       Enhance_mstar = min(CS%Max_Enhance_M, &
-                          (1. + CS%LT_enhance_coef * Convect_Langmuir_Number**CS%LT_enhance_exp) )
+                          (1. + CS%LT_enhance_coef * exp_reprod(CS%LT_enhance_exp*log_reprod(Convect_Langmuir_Number))) )
     elseif (CS%LT_enhance_form == Langmuir_add) then
       ! or Enhancement is additive (multiplied enhance_m set to 1)
-      mstar_LT_add = CS%LT_enhance_coef * Convect_Langmuir_Number**CS%LT_enhance_exp
+      mstar_LT_add = CS%LT_enhance_coef * exp_reprod(CS%LT_enhance_exp*log_reprod(Convect_Langmuir_Number))
     endif
   endif
 
