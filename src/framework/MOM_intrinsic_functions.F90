@@ -11,7 +11,7 @@ use iso_fortran_env, only : int64, real64
 
 implicit none ; private
 
-public :: invcosh, cuberoot, nth_root, exp_reprod, log_reprod
+public :: invcosh, cuberoot, nth_root, exp_reprod, log_reprod, erfc_reprod
 public :: intrinsic_functions_unit_tests
 
 ! Floating point model, if bit layout from high to low is (sign, exp, frac)
@@ -193,6 +193,56 @@ elemental function log_reprod(x) result(lx)
          s2*(a15 + s2*(a17 + s2*(a19 + s2*a21))))))))))
   lx = poly + real(k)*ln2
 end function log_reprod
+
+
+!> Bit-reproducible complementary error function, erfc(x) for x >= 0, suitable for evaluation inside
+!! `!$omp target` / `do concurrent` offloaded regions.
+!!
+!! Same rationale as exp_reprod/log_reprod (intrinsic erfc differs host libm vs CUDA libdevice in the
+!! last bit). Built from +,-,*,/ and exp_reprod only, so bit-identical host vs device under -Mnofma.
+!! Two ranges: for x < 1.5, erf(x) via its Maclaurin series (48 fixed terms) and erfc = 1 - erf; for
+!! x >= 1.5, the incomplete-gamma continued fraction erfc(x) = (x/sqrt(pi))*exp(-x^2)*Q-CF(1/2, x^2)
+!! evaluated by a FIXED-iteration (60) modified-Lentz recurrence (no early exit -- device-safe).
+!! Accuracy is <= 5.8e-14 relative vs the intrinsic over x in (0.01, 26] (the worst case is near
+!! x ~ 24 where erfc ~ 1e-263 is physically zero; ~1e-15 across the physically relevant range). x >= 0
+!! required. Not bit-identical to intrinsic erfc (changes answers on adoption).
+elemental function erfc_reprod(x) result(fc)
+  !$omp declare target
+  real, intent(in) :: x  !< The argument of the complementary error function, x >= 0 [nondim]
+  real :: fc             !< The reproducible complementary error function of x [nondim]
+
+  real, parameter :: two_sqrtpi = 1.12837916709551257390 ! 2/sqrt(pi) [nondim]
+  real, parameter :: inv_sqrtpi = 0.56418958354775628695 ! 1/sqrt(pi) [nondim]
+  real, parameter :: tiny_l = 1.0e-30 ! A floor to avoid division by zero in the Lentz recurrence [nondim]
+  real :: t     ! x*x [nondim]
+  real :: term  ! The running term of the erf Maclaurin series [nondim]
+  real :: sumv  ! The running sum of the erf Maclaurin series [nondim]
+  real :: an, b, c, d, del, h ! Modified-Lentz continued-fraction working variables [nondim]
+  integer :: n
+
+  if (x < 1.5) then
+    ! erf(x) = (2/sqrt(pi)) * sum_{n>=0} (-1)^n x^(2n+1) / (n! (2n+1)); erfc = 1 - erf.
+    term = x ; sumv = x
+    do n = 1, 48
+      term = term * (-(x*x)) * real(2*n-1) / (real(n)*real(2*n+1))
+      sumv = sumv + term
+    enddo
+    fc = 1.0 - two_sqrtpi*sumv
+  else
+    ! erfc(x) = (x/sqrt(pi)) * exp(-x^2) * Q-continued-fraction(a=1/2, z=x^2), modified Lentz.
+    t = x*x
+    b = t + 0.5    ! z + 1 - a
+    c = 1.0/tiny_l ; d = 1.0/b ; h = d
+    do n = 1, 60
+      an = -real(n)*(real(n) - 0.5)   ! -n*(n - a)
+      b = b + 2.0
+      d = an*d + b ; if (abs(d) < tiny_l) d = tiny_l ; d = 1.0/d
+      c = b + an/c ; if (abs(c) < tiny_l) c = tiny_l
+      del = d*c ; h = h*del
+    enddo
+    fc = (x*inv_sqrtpi) * exp_reprod(-t) * h
+  endif
+end function erfc_reprod
 
 
 !> Bit-stable n-th root of x for x in (0, +inf) and integer n >= 1, suitable
@@ -395,6 +445,16 @@ function intrinsic_functions_unit_tests(verbose) result(fail)
   do n=1,6000
     fail = fail .or. Test_log_reprod(v, 10.0**((0.01*real(n)) - 30.0))
   enddo
+
+  v = verbose
+  fail = fail .or. Test_erfc_reprod(v, 0.001)
+  fail = fail .or. Test_erfc_reprod(v, 0.7)
+  fail = fail .or. Test_erfc_reprod(v, 1.0)
+  fail = fail .or. Test_erfc_reprod(v, 3.0)
+  v = .false.
+  do n=1,1000
+    fail = fail .or. Test_erfc_reprod(v, 0.01*real(n))
+  enddo
 end function intrinsic_functions_unit_tests
 
 !> True if the cube of cuberoot(val) does not closely match val. False otherwise.
@@ -453,5 +513,24 @@ logical function Test_log_reprod(verbose, val)
     write(stdout, '("For val = ",ES22.15,", log_reprod relative error = ",ES9.2)') val, relerr
   endif
 end function Test_log_reprod
+
+!> True if erfc_reprod(val) does not closely match the intrinsic erfc(val). False otherwise.
+logical function Test_erfc_reprod(verbose, val)
+  logical, intent(in) :: verbose !< If true, write results to stdout
+  real, intent(in) :: val  !< The real value to test, val >= 0 [nondim]
+  ! Local variables
+  real :: e_ref  ! The intrinsic complementary error function of val [nondim]
+  real :: relerr ! The relative difference between erfc_reprod(val) and erfc(val) [nondim]
+
+  e_ref = erfc(val)
+  relerr = abs(erfc_reprod(val) - e_ref) / abs(e_ref)
+  Test_erfc_reprod = (relerr > 1.0e-12)
+
+  if (Test_erfc_reprod) then
+    write(stdout, '("For val = ",ES22.15,", erfc_reprod relative error = ",ES9.2," <-- FAIL")') val, relerr
+  elseif (verbose) then
+    write(stdout, '("For val = ",ES22.15,", erfc_reprod relative error = ",ES9.2)') val, relerr
+  endif
+end function Test_erfc_reprod
 
 end module MOM_intrinsic_functions
