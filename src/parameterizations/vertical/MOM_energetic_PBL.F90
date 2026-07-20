@@ -326,6 +326,13 @@ end type ePBL_column_diags
 !! same source serves the host and device paths.
 !$omp declare target(exp_decay_TKE_adjust, find_PE_chg, find_PE_chg_orig, find_Kd_from_PE_chg)
 !$omp declare target(find_mstar, mstar_Langmuir)
+!$omp declare target(ePBL_column)
+
+!> GPU port: fixes the per-column private scratch in ePBL_column to a compile-time-constant size on
+!! GPU builds, so each device thread gets stack (local memory) arrays rather than runtime-sized
+!! device-heap automatics (NVFORTRAN-W-0155 / KNOWLEDGE row 21).  Checked against GV%ke in
+!! energetic_PBL_init.  Unused in CPU builds, where the local declarations keep their exact sizes.
+integer, parameter :: GPU_nk_max = 128
 
 contains
 
@@ -972,7 +979,11 @@ subroutine ePBL_column(h, dz, u, v, T0, S0, dSV_dT, dSV_dS, SpV_dt, TKE_forcing,
 ! mixing.
 
   ! Local variables
+#ifdef __NVCOMPILER_OPENMP_GPU
+  real, dimension(GPU_nk_max+1) :: &
+#else
   real, dimension(SZK_(GV)+1) :: &
+#endif
     pres_Z, &       ! Interface pressures with a rescaling factor to convert interface height
                     ! movements into changes in column potential energy [R Z2 T-2 ~> kg m-1 s-2].
     hb_hs           ! The distance from the bottom over the thickness of the
@@ -989,7 +1000,11 @@ subroutine ePBL_column(h, dz, u, v, T0, S0, dSV_dT, dSV_dS, SpV_dt, TKE_forcing,
   real :: Idecay_len_TKE  ! The inverse of a turbulence decay length scale [H-1 ~> m-1 or m2 kg-1].
   real :: dz_sum    ! The total thickness of the water column [Z ~> m].
 
+#ifdef __NVCOMPILER_OPENMP_GPU
+  real, dimension(GPU_nk_max) :: &
+#else
   real, dimension(SZK_(GV)) :: &
+#endif
     dT_to_dColHt, & ! Partial derivative of the total column height with the temperature changes
                     ! within a layer [Z C-1 ~> m degC-1].
     dS_to_dColHt, & ! Partial derivative of the total column height with the salinity changes
@@ -1026,7 +1041,11 @@ subroutine ePBL_column(h, dz, u, v, T0, S0, dSV_dT, dSV_dS, SpV_dt, TKE_forcing,
                     ! mixing effects with other yet lower layers [C H ~> degC m or degC kg m-2].
     Sh_b            ! An effective salinity times a thickness in the layer below, including implicit
                     ! mixing effects with other yet lower layers [S H ~> ppt m or ppt kg m-2].
+#ifdef __NVCOMPILER_OPENMP_GPU
+  real, dimension(GPU_nk_max+1) :: &
+#else
   real, dimension(SZK_(GV)+1) :: &
+#endif
     MixLen_shape, & ! A nondimensional shape factor for the mixing length that
                     ! gives it an appropriate asymptotic value at the bottom of
                     ! the boundary layer [nondim].
@@ -1159,6 +1178,10 @@ subroutine ePBL_column(h, dz, u, v, T0, S0, dSV_dT, dSV_dS, SpV_dt, TKE_forcing,
   real, dimension(20) :: Kddt_h_itt     ! The value of Kddt_h_guess after each iteration [H ~> m or kg m-2]
   real, dimension(20) :: dPEa_dKd_itt   ! The value of dPEc_dKd after each iteration [R Z3 T-2 H-1 ~> J m-3 or J kg-1]
   real, dimension(20) :: MKE_src_itt    ! The value of MKE_src after each iteration [R Z3 T-2 ~> J m-2]
+#ifdef __NVCOMPILER_OPENMP_GPU
+  real, dimension(GPU_nk_max) :: mech_TKE_k, conv_PErel_k, nstar_k, dT_expect, dS_expect
+  integer, dimension(GPU_nk_max) :: num_itts
+#else
   real, dimension(SZK_(GV)) :: mech_TKE_k  ! The mechanically generated turbulent kinetic energy
                     ! available for mixing over a time step for each layer [R Z3 T-2 ~> J m-2].
   real, dimension(SZK_(GV)) :: conv_PErel_k ! The potential energy that has been convectively released
@@ -1168,6 +1191,7 @@ subroutine ePBL_column(h, dz, u, v, T0, S0, dSV_dT, dSV_dS, SpV_dt, TKE_forcing,
   real, dimension(SZK_(GV)) :: dT_expect ! Expected temperature changes [C ~> degC]
   real, dimension(SZK_(GV)) :: dS_expect ! Expected salinity changes [S ~> ppt]
   integer, dimension(SZK_(GV)) :: num_itts
+#endif
 
   integer :: k, nz, itt, max_itt
 
@@ -1321,7 +1345,9 @@ subroutine ePBL_column(h, dz, u, v, T0, S0, dSV_dT, dSV_dS, SpV_dt, TKE_forcing,
       dz_rsum = 0.0
       MixLen_shape(1) = 1.0
       if (CS%eqdisc) then ! update Kd as per Machine Learning equation discovery
+#ifndef __NVCOMPILER_OPENMP_GPU
         call kappa_eqdisc(MixLen_shape, CS, GV, h, absf, B_flux, u_star, MLD_guess)
+#endif
       else
         do K=2,nz+1
           dz_rsum = dz_rsum + dz(k-1)
@@ -1337,11 +1363,13 @@ subroutine ePBL_column(h, dz, u, v, T0, S0, dSV_dT, dSV_dS, SpV_dt, TKE_forcing,
     endif
 
     v0_ML_turb_vel_scale = 0.0 ! a variable that gets passed on to get_eqdisc_v0 & get_eqdisc_v0h
+#ifndef __NVCOMPILER_OPENMP_GPU
     if (CS%eqdisc_v0) then
       call get_eqdisc_v0(CS,absf,B_flux,u_star,v0_ML_turb_vel_scale)
     elseif (CS%eqdisc_v0h) then
       call get_eqdisc_v0h(CS,B_flux,u_star,MLD_guess,v0_ML_turb_vel_scale)
     endif
+#endif
 
     Kd(1) = 0.0 ; Kddt_h(1) = 0.0
     hp_a(1) = h(1)
@@ -2027,7 +2055,11 @@ subroutine ePBL_BBL_column(h, dz, u, v, T0, S0, dSV_dT, dSV_dS, SpV_dt, absf, &
 !  energy that is supplied as an argument to this routine.
 
   ! Local variables
+#ifdef __NVCOMPILER_OPENMP_GPU
+  real, dimension(GPU_nk_max+1) :: &
+#else
   real, dimension(SZK_(GV)+1) :: &
+#endif
     pres_Z, &       ! Interface pressures with a rescaling factor to convert interface height
                     ! movements into changes in column potential energy [R Z2 T-2 ~> kg m-1 s-2].
     dztop_dztot     ! The distance from the surface divided by the thickness of the
@@ -2045,7 +2077,11 @@ subroutine ePBL_BBL_column(h, dz, u, v, T0, S0, dSV_dT, dSV_dS, SpV_dt, absf, &
   real :: Idecay_len_TKE  ! The inverse of a turbulence decay length scale [H-1 ~> m-1 or m2 kg-1].
   real :: dz_sum    ! The total thickness of the water column [Z ~> m].
 
+#ifdef __NVCOMPILER_OPENMP_GPU
+  real, dimension(GPU_nk_max) :: &
+#else
   real, dimension(SZK_(GV)) :: &
+#endif
     dT_to_dColHt, & ! Partial derivative of the total column height with the temperature changes
                     ! within a layer [Z C-1 ~> m degC-1].
     dS_to_dColHt, & ! Partial derivative of the total column height with the salinity changes
@@ -2095,7 +2131,11 @@ subroutine ePBL_BBL_column(h, dz, u, v, T0, S0, dSV_dT, dSV_dS, SpV_dt, absf, &
                     ! mixing effects with other yet lower layers [C H ~> degC m or degC kg m-2].
     Sh_b            ! An effective salinity times a thickness in the layer below, including implicit
                     ! mixing effects with other yet lower layers [S H ~> ppt m or ppt kg m-2].
+#ifdef __NVCOMPILER_OPENMP_GPU
+  real, dimension(GPU_nk_max+1) :: &
+#else
   real, dimension(SZK_(GV)+1) :: &
+#endif
     MixLen_shape, & ! A nondimensional shape factor for the mixing length that
                     ! gives it an appropriate asymptotic value at the bottom of
                     ! the boundary layer [nondim].
@@ -4436,6 +4476,15 @@ subroutine energetic_PBL_init(Time, G, GV, US, param_file, diag, CS)
 
   call safe_alloc_alloc(CS%ML_depth, isd, ied, jsd, jed)
   call safe_alloc_alloc(CS%BBL_depth, isd, ied, jsd, jed)
+
+#ifdef __NVCOMPILER_OPENMP_GPU
+  ! GPU port guards: ePBL_column runs on the device with fixed-size (GPU_nk_max) per-column scratch,
+  ! and the equation-discovery (eqdisc) mixing-length/velocity paths are not device-callable.
+  if (GV%ke > GPU_nk_max) call MOM_error(FATAL, &
+    "energetic_PBL GPU build: GV%ke exceeds GPU_nk_max; increase GPU_nk_max in MOM_energetic_PBL.F90.")
+  if (CS%eqdisc .or. CS%eqdisc_v0 .or. CS%eqdisc_v0h) call MOM_error(FATAL, &
+    "energetic_PBL GPU build: the EPBL_EQD_DIFFUSIVITY (equation-discovery) paths are not device-callable.")
+#endif
 
 end subroutine energetic_PBL_init
 
