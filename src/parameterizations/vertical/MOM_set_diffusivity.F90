@@ -18,6 +18,8 @@ use MOM_diag_mediator,       only : post_data, register_diag_field
 use MOM_diagnose_kdwork,     only : vbf_CS
 use MOM_debugging,           only : hchksum, uvchksum, Bchksum, hchksum_pair
 use MOM_EOS,                 only : calculate_density, calculate_density_derivs, EOS_domain
+use MOM_EOS,                 only : calculate_density_derivs_elem_loc, get_EOS_form_and_scaling
+use MOM_EOS,                 only : EOS_ROQUET_RHO, EOS_WRIGHT
 use MOM_error_handler,       only : MOM_error, is_root_pe, FATAL, WARNING, NOTE
 use MOM_error_handler,       only : callTree_showQuery
 use MOM_error_handler,       only : callTree_enter, callTree_leave, callTree_waypoint
@@ -479,6 +481,16 @@ subroutine set_diffusivity(u, v, h, u_h, v_h, tv, fluxes, optics, visc, dt, Kd_i
   ! be an appropriate place to add a depth-dependent parameterization or another explicit
   ! parameterization of Kd.
 
+  ! GPU port: map the full-domain EOS inputs (T_f/S_f and the tv descriptor) once for the whole
+  ! j-loop and refresh the diabatic-mutated tv%T/tv%S here.  find_N2 offloads per block (njblock=1),
+  ! so mapping/refreshing these inside it would re-copy full-domain arrays on every j-row and dominate
+  ! the runtime.  h is already persistently device-resident.
+  !$omp target enter data map(to: T_f, S_f)
+  if (associated(tv%eqn_of_state)) then
+    !$omp target enter data map(to: tv, tv%T, tv%S)
+    !$omp target update to(tv%T, tv%S)
+  endif
+
   do jstart=js,je,njblock
     jend = min(jstart+njblock-1, je)
 
@@ -806,6 +818,11 @@ subroutine set_diffusivity(u, v, h, u_h, v_h, tv, fluxes, optics, visc, dt, Kd_i
       enddo
     endif
   enddo ! jstart-loop
+
+  !$omp target exit data map(release: T_f, S_f)
+  if (associated(tv%eqn_of_state)) then
+    !$omp target exit data map(release: tv, tv%T, tv%S)
+  endif
 
   if (CS%user_change_diff) then
     call user_change_diff(h, tv, G, GV, US, CS%user_change_diff_CSp, Kd_lay, Kd_int, &
@@ -1217,83 +1234,41 @@ subroutine find_N2(h, tv, T_f, S_f, fluxes, nj, jstart, jend, G, GV, US, CS, dRh
   logical :: do_i(SZI_(G),nj), do_any
   integer, dimension(2) :: EOSdom ! The i-computational domain for the equation of state
   integer :: i, j, k, is, ie, nz, jj
+  ! GPU port: EOS form + unit scaling resolved once on the host so the density derivatives can be
+  ! evaluated on the device through the declare-target dispatcher; per-interface scalar scratch.
+  integer :: eos_form
+  real :: eos_kg_m3_to_R, eos_C_to_degC, eos_S_to_ppt, eos_RL2_T2_to_Pa
+  real :: T_int_s, S_int_s, dRdT_s, dRdS_s
+  real :: dz_BBL_min_l ! A host copy of CS%dz_BBL_avg_min, for use in a device region [Z ~> m]
+  logical :: have_p_surf
 
   is = G%isc ; ie = G%iec ; nz = GV%ke
   G_Rho0    = GV%g_Earth_Z_T2 / GV%H_to_RZ
   H_neglect = GV%H_subroundoff
 
-  ! Find the (limited) density jump across each interface.
-  do j=jstart,jend ; jj = j - jstart + 1
-    do i=is,ie
-      dRho_int(i,1,jj) = 0.0 ; dRho_int(i,nz+1,jj) = 0.0
-      dRho_int_unfilt(i,jj,1) = 0.0 ; dRho_int_unfilt(i,jj,nz+1) = 0.0
-    enddo
-  enddo
+  ! GPU port: resolve the EOS form + unit scaling on the host (the accessor is not device-callable).
+  eos_form = -1
+  eos_kg_m3_to_R = 1.0 ; eos_C_to_degC = 1.0 ; eos_S_to_ppt = 1.0 ; eos_RL2_T2_to_Pa = 1.0
   if (associated(tv%eqn_of_state)) then
-    if (associated(fluxes%p_surf)) then
-      do j=jstart,jend ; jj = j - jstart + 1
-        do i=is,ie ; pres(i,jj,1) = fluxes%p_surf(i,j) ; enddo
-      enddo
-    else
-      do j=jstart,jend ; jj = j - jstart + 1
-        do i=is,ie ; pres(i,jj,1) = 0.0 ; enddo
-      enddo
-    endif
-    EOSdom(:) = EOS_domain(G%HI)
-    do K=2,nz
-      do j=jstart,jend ; jj = j - jstart + 1
-        do i=is,ie
-          pres(i,jj,K) = pres(i,jj,K-1) + (GV%g_Earth*GV%H_to_RZ)*h(i,j,k-1)
-          Temp_Int(i,jj) = 0.5 * (T_f(i,j,k) + T_f(i,j,k-1))
-          Salin_Int(i,jj) = 0.5 * (S_f(i,j,k) + S_f(i,j,k-1))
-        enddo
-        call calculate_density_derivs(Temp_int(:,jj), Salin_int(:,jj), pres(:,jj,K), dRho_dT(:,jj,K), dRho_dS(:,jj,K), &
-                                      tv%eqn_of_state, EOSdom)
-        do i=is,ie
-          dRho_int(i,K,jj) = max(dRho_dT(i,jj,K)*(T_f(i,j,k) - T_f(i,j,k-1)) + &
-                                 dRho_dS(i,jj,K)*(S_f(i,j,k) - S_f(i,j,k-1)), 0.0)
-          dRho_int_unfilt(i,jj,K) = max(dRho_dT(i,jj,K)*(tv%T(i,j,k) - tv%T(i,j,k-1)) + &
-                                        dRho_dS(i,jj,K)*(tv%S(i,j,k) - tv%S(i,j,k-1)), 0.0)
-        enddo
-      enddo
-    enddo
-  else
-    do j=jstart,jend ; jj = j - jstart + 1
-      do K=2,nz
-        do i=is,ie
-          dRho_int(i,K,jj) = GV%Rlay(k) - GV%Rlay(k-1)
-        enddo
-      enddo
-    enddo
+    call get_EOS_form_and_scaling(tv%eqn_of_state, eos_form, eos_kg_m3_to_R, eos_C_to_degC, &
+                                  eos_S_to_ppt, eos_RL2_T2_to_Pa)
+#ifdef __NVCOMPILER_OPENMP_GPU
+    if ((eos_form /= EOS_ROQUET_RHO) .and. (eos_form /= EOS_WRIGHT)) call MOM_error(FATAL, &
+      "find_N2 GPU build: EQN_OF_STATE has no device-callable density-derivs kernel "// &
+      "(only ROQUET_RHO and WRIGHT are supported); use a CPU build or add a _loc kernel.")
+#endif
   endif
+  have_p_surf = associated(fluxes%p_surf)
+  dz_BBL_min_l = CS%dz_BBL_avg_min
 
-  ! Set the buoyancy frequencies.
-  do k=1,nz
-    do j=jstart,jend ; jj = j - jstart + 1
-      do i=is,ie
-        N2_lay(i,k,jj) = G_Rho0 * 0.5*(dRho_int(i,K,jj) + dRho_int(i,K+1,jj)) / &
-                         (h(i,j,k) + H_neglect)
-      enddo
-    enddo
-  enddo
-  do j=jstart,jend ; jj = j - jstart + 1
-    do i=is,ie ; N2_int(i,1,jj) = 0.0 ; N2_int(i,nz+1,jj) = 0.0 ; enddo
-  enddo
-  do K=2,nz
-    do j=jstart,jend ; jj = j - jstart + 1
-      do i=is,ie
-        N2_int(i,K,jj) = G_Rho0 * dRho_int(i,K,jj) / &
-                         (0.5*(h(i,j,k-1) + h(i,j,k) + H_neglect))
-      enddo
-    enddo
-  enddo
-
-  ! Find the bottom boundary layer stratification, and use this in the deepest layers.
+  ! GPU port: the surface pressure (K=1, from the possibly-null p_surf pointer) and the topographic
+  ! roughness h_amp (set by the host tidal_mixing_h_amp when active) are computed on the host and
+  ! mapped in; the per-column pressure recurrence + density derivatives + buoyancy frequencies then
+  ! run on the device.  One device data region brackets all of find_N2's per-column loops.
   do j=jstart,jend ; jj = j - jstart + 1
     do i=is,ie
-      hb(i,jj) = 0.0 ; dRho_bot(i,jj) = 0.0 ; h_amp(i,jj) = 0.0
-      z_from_bot(i,jj) = 0.5*dz(i,nz,jj)
-      do_i(i,jj) = (G%mask2dT(i,j) > 0.0)
+      if (have_p_surf) then ; pres(i,jj,1) = fluxes%p_surf(i,j) ; else ; pres(i,jj,1) = 0.0 ; endif
+      h_amp(i,jj) = 0.0
     enddo
   enddo
   if (CS%use_tidal_mixing) then
@@ -1302,76 +1277,143 @@ subroutine find_N2(h, tv, T_f, S_f, fluxes, nj, jstart, jend, G, GV, US, CS, dRh
     enddo
   endif
 
-  do k=nz,2,-1
-    do_any = .false.
-    do j=jstart,jend ; jj = j - jstart + 1
-      do i=is,ie ; if (do_i(i,jj)) then
-        dz_int = 0.5*(dz(i,k,jj) + dz(i,k-1,jj))
-        z_from_bot(i,jj) = z_from_bot(i,jj) + dz_int ! middle of the layer above
+  ! h, T_f, S_f and tv/tv%T/tv%S are mapped/refreshed once by the caller (set_diffusivity) around the
+  ! whole jstart loop -- doing it here would re-copy full-domain arrays on every block (njblock=1 => a
+  ! per-j-row copy), which dominates the runtime.  Only the per-block scratch is mapped here.
+  !$omp target enter data map(to: dz, pres, h_amp) &
+  !$omp   map(alloc: dRho_int, dRho_int_unfilt, N2_int, N2_lay, N2_bot, hb, drho_bot, z_from_bot, do_i, dz_BBL_avg)
 
-        hb(i,jj) = hb(i,jj) + 0.5*(h(i,j,k) + h(i,j,k-1))
-        drho_bot(i,jj) = drho_bot(i,jj) + dRho_int(i,K,jj)
-
-        if (z_from_bot(i,jj) > h_amp(i,jj)) then
-          if (k>2) then
-            ! Always include at least one full layer.
-            hb(i,jj) = hb(i,jj) + 0.5*(h(i,j,k-1) + h(i,j,k-2))
-            drho_bot(i,jj) = drho_bot(i,jj) + dRho_int(i,K-1,jj)
-          endif
-          do_i(i,jj) = .false.
-        else
-          do_any = .true.
-        endif
-      endif ; enddo
+  ! Find the (limited) density jump across each interface.
+  do concurrent (jj=1:nj, i=is:ie)
+    dRho_int(i,1,jj) = 0.0 ; dRho_int(i,nz+1,jj) = 0.0
+    dRho_int_unfilt(i,jj,1) = 0.0 ; dRho_int_unfilt(i,jj,nz+1) = 0.0
+  enddo
+  if (associated(tv%eqn_of_state)) then
+    ! Per-column pressure recurrence (serial in K) + density derivatives via the device-callable
+    ! EOS dispatcher.  The unit-scaling is always applied; for the unscaled (unity) case the factors
+    ! are exactly 1.0, so this reproduces the former array calculate_density_derivs call bit-for-bit.
+    !$omp target teams loop collapse(2) private(jj, K, T_int_s, S_int_s, dRdT_s, dRdS_s)
+    do j=jstart,jend
+      do i=is,ie
+        jj = j - jstart + 1
+        do K=2,nz
+          pres(i,jj,K) = pres(i,jj,K-1) + (GV%g_Earth*GV%H_to_RZ)*h(i,j,K-1)
+          T_int_s = 0.5 * (T_f(i,j,K) + T_f(i,j,K-1))
+          S_int_s = 0.5 * (S_f(i,j,K) + S_f(i,j,K-1))
+          call calculate_density_derivs_elem_loc(eos_form, eos_C_to_degC*T_int_s, &
+                     eos_S_to_ppt*S_int_s, eos_RL2_T2_to_Pa*pres(i,jj,K), dRdT_s, dRdS_s)
+          dRdT_s = (eos_kg_m3_to_R*eos_C_to_degC) * dRdT_s
+          dRdS_s = (eos_kg_m3_to_R*eos_S_to_ppt) * dRdS_s
+          dRho_int(i,K,jj) = max(dRdT_s*(T_f(i,j,K) - T_f(i,j,K-1)) + &
+                                 dRdS_s*(S_f(i,j,K) - S_f(i,j,K-1)), 0.0)
+          dRho_int_unfilt(i,jj,K) = max(dRdT_s*(tv%T(i,j,K) - tv%T(i,j,K-1)) + &
+                                        dRdS_s*(tv%S(i,j,K) - tv%S(i,j,K-1)), 0.0)
+        enddo
+      enddo
     enddo
-    if (.not.do_any) exit
+  else
+    do concurrent (jj=1:nj, K=2:nz, i=is:ie)
+      dRho_int(i,K,jj) = GV%Rlay(K) - GV%Rlay(K-1)
+    enddo
+  endif
+
+  ! Set the buoyancy frequencies.
+  do concurrent (k=1:nz, jj=1:nj, i=is:ie)
+    N2_lay(i,k,jj) = G_Rho0 * 0.5*(dRho_int(i,k,jj) + dRho_int(i,k+1,jj)) / &
+                     (h(i,jstart+jj-1,k) + H_neglect)
+  enddo
+  do concurrent (jj=1:nj, i=is:ie)
+    N2_int(i,1,jj) = 0.0 ; N2_int(i,nz+1,jj) = 0.0
+  enddo
+  do concurrent (K=2:nz, jj=1:nj, i=is:ie)
+    N2_int(i,K,jj) = G_Rho0 * dRho_int(i,K,jj) / &
+                     (0.5*(h(i,jstart+jj-1,K-1) + h(i,jstart+jj-1,K) + H_neglect))
   enddo
 
-  do j=jstart,jend ; jj = j - jstart + 1
+  ! Find the bottom boundary layer stratification, and use this in the deepest layers.
+  ! (h_amp was set on the host above, including the tidal_mixing_h_amp path.)
+  do concurrent (jj=1:nj, i=is:ie)
+    hb(i,jj) = 0.0 ; dRho_bot(i,jj) = 0.0
+    z_from_bot(i,jj) = 0.5*dz(i,nz,jj)
+    do_i(i,jj) = (G%mask2dT(i,jstart+jj-1) > 0.0)
+  enddo
+
+  ! Accumulate the near-bottom thickness/density difference per column (serial down-K); the former
+  ! cross-column do_any/exit early-out is dropped -- each device thread runs its own K loop and stops
+  ! via its do_i flag, which is bit-for-bit equivalent to the original.
+  !$omp target teams loop collapse(2) private(jj, k, dz_int)
+  do j=jstart,jend
     do i=is,ie
-      if (hb(i,jj) > 0.0) then
-        N2_bot(i,jj) = (G_Rho0 * drho_bot(i,jj)) / hb(i,jj)
-      else ;  N2_bot(i,jj) = 0.0 ; endif
-      z_from_bot(i,jj) = 0.5*dz(i,nz,jj)
-      do_i(i,jj) = (G%mask2dT(i,j) > 0.0)
+      jj = j - jstart + 1
+      do k=nz,2,-1
+        if (do_i(i,jj)) then
+          dz_int = 0.5*(dz(i,k,jj) + dz(i,k-1,jj))
+          z_from_bot(i,jj) = z_from_bot(i,jj) + dz_int ! middle of the layer above
+
+          hb(i,jj) = hb(i,jj) + 0.5*(h(i,j,k) + h(i,j,k-1))
+          drho_bot(i,jj) = drho_bot(i,jj) + dRho_int(i,k,jj)
+
+          if (z_from_bot(i,jj) > h_amp(i,jj)) then
+            if (k>2) then
+              ! Always include at least one full layer.
+              hb(i,jj) = hb(i,jj) + 0.5*(h(i,j,k-1) + h(i,j,k-2))
+              drho_bot(i,jj) = drho_bot(i,jj) + dRho_int(i,k-1,jj)
+            endif
+            do_i(i,jj) = .false.
+          endif
+        endif
+      enddo
     enddo
   enddo
 
-  do k=nz,2,-1
-    do_any = .false.
-    do j=jstart,jend ; jj = j - jstart + 1
-      do i=is,ie ; if (do_i(i,jj)) then
-        dz_int = 0.5*(dz(i,k,jj) + dz(i,k-1,jj))
-        z_from_bot(i,jj) = z_from_bot(i,jj) + dz_int ! middle of the layer above
+  do concurrent (jj=1:nj, i=is:ie)
+    if (hb(i,jj) > 0.0) then
+      N2_bot(i,jj) = (G_Rho0 * drho_bot(i,jj)) / hb(i,jj)
+    else ; N2_bot(i,jj) = 0.0 ; endif
+    z_from_bot(i,jj) = 0.5*dz(i,nz,jj)
+    do_i(i,jj) = (G%mask2dT(i,jstart+jj-1) > 0.0)
+  enddo
 
-        N2_int(i,K,jj) = N2_bot(i,jj)
-        if (k>2) N2_lay(i,k-1,jj) = N2_bot(i,jj)
+  ! Overwrite the near-bottom interface/layer N2 with the bottom-BL value (serial down-K per column;
+  ! cross-column do_any/exit dropped, per-column do_i flag preserves bit-for-bit behaviour).
+  !$omp target teams loop collapse(2) private(jj, k, dz_int)
+  do j=jstart,jend
+    do i=is,ie
+      jj = j - jstart + 1
+      do k=nz,2,-1
+        if (do_i(i,jj)) then
+          dz_int = 0.5*(dz(i,k,jj) + dz(i,k-1,jj))
+          z_from_bot(i,jj) = z_from_bot(i,jj) + dz_int ! middle of the layer above
 
-        if (z_from_bot(i,jj) > h_amp(i,jj)) then
-          if (k>2) N2_int(i,K-1,jj) = N2_bot(i,jj)
-          do_i(i,jj) = .false.
-        else
-          do_any = .true.
+          N2_int(i,k,jj) = N2_bot(i,jj)
+          if (k>2) N2_lay(i,k-1,jj) = N2_bot(i,jj)
+
+          if (z_from_bot(i,jj) > h_amp(i,jj)) then
+            if (k>2) N2_int(i,k-1,jj) = N2_bot(i,jj)
+            do_i(i,jj) = .false.
+          endif
         endif
-      endif ; enddo
+      enddo
     enddo
-    if (.not.do_any) exit
   enddo
 
   if (associated(tv%eqn_of_state)) then
-    do K=1,nz+1
-      do j=jstart,jend ; jj = j - jstart + 1
-        do i=is,ie
-          dRho_int(i,K,jj) = dRho_int_unfilt(i,jj,K)
-        enddo
-      enddo
+    do concurrent (K=1:nz+1, jj=1:nj, i=is:ie)
+      dRho_int(i,K,jj) = dRho_int_unfilt(i,jj,K)
     enddo
   endif
 
   ! Average over the larger of the envelope of the topography or a minimal distance.
-  do j=jstart,jend ; jj = j - jstart + 1
-    do i=is,ie ; dz_BBL_avg(i,jj) = max(h_amp(i,jj), CS%dz_BBL_avg_min) ; enddo
+  do concurrent (jj=1:nj, i=is:ie)
+    dz_BBL_avg(i,jj) = max(h_amp(i,jj), dz_BBL_min_l)
   enddo
+
+  ! GPU port: copy the device results back for the host find_rho_bottom and the (host) set_diffusivity
+  ! consumers (dRho_int/N2_int/N2_lay/N2_bot are find_N2's outputs; pres/dz_BBL_avg feed find_rho_bottom),
+  ! then close the device data region.
+  !$omp target update from(dRho_int, N2_int, N2_lay, N2_bot, pres, dz_BBL_avg)
+  !$omp target exit data map(release: dz, pres, h_amp, hb, drho_bot, z_from_bot, do_i, &
+  !$omp   dRho_int, dRho_int_unfilt, N2_int, N2_lay, N2_bot, dz_BBL_avg)
 
   call find_rho_bottom(G, GV, US, tv, h, dz, pres, dz_BBL_avg, jstart, jend, nj, Rho_bot, h_bot, k_bot)
 
