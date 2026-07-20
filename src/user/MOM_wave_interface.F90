@@ -15,6 +15,7 @@ use MOM_file_parser,   only : get_param, log_version, param_file_type
 use MOM_forcing_type,  only : mech_forcing
 use MOM_grid,          only : ocean_grid_type
 use MOM_hor_index,     only : hor_index_type
+use MOM_intrinsic_functions, only : exp_reprod, erfc_reprod, log_reprod
 use MOM_io,            only : file_exists, get_var_sizes, read_variable
 use MOM_io,            only : vardesc, var_desc
 use MOM_safe_alloc,    only : safe_alloc_ptr
@@ -37,6 +38,8 @@ public Update_Stokes_Drift ! Public interface to update the Stokes drift profile
                            ! called in step_mom.
 public get_Langmuir_Number ! Public interface to compute Langmuir number called from
                            ! ePBL or KPP routines.
+public get_Langmuir_Number_LF17 ! Device-callable LF17-only Langmuir-number kernel (GPU offload).
+public set_wave_LF17_params ! Populate a device-mappable wave_LF17_params bundle from a Waves CS.
 public Stokes_PGF ! Public interface to compute Stokes-shear induced pressure gradient force anomaly
 public StokesMixing ! NOT READY - Public interface to add down-Stokes gradient
                     ! momentum mixing (e.g. the approach of Harcourt 2013/2015)
@@ -260,6 +263,26 @@ type, public :: wave_parameters_CS ; private
 
 end type wave_parameters_CS
 
+!> A small, allocatable-free bundle of the loop-invariant wave_parameters_CS scalars needed by the
+!! LF17 statistical-wave Langmuir path.  Unlike the wave_parameters_CS pointer (whose allocatable
+!! components do not attach under nvfortran `-gpu=mem:separate`), a plain scalar derived type maps to
+!! the device cleanly, so the on-device LF17 chain reads these instead of dereferencing Waves.
+type, public :: wave_LF17_params
+  real    :: LA_FracHBL        !< Fraction of OSBL for averaging Langmuir number [nondim]
+  real    :: rho_air           !< A typical density of air at sea level [R ~> kg m-3]
+  real    :: nu_air            !< The viscosity of air [Z2 T-1 ~> m2 s-1]
+  real    :: rho_ocn           !< A typical surface density of seawater [R ~> kg m-3]
+  real    :: SWH_from_u10sq    !< Factor converting the square of the 10 m wind speed to
+                               !! significant wave height [Z T2 L-2 ~> s2 m-1]
+  real    :: vonKar            !< The von Karman coefficient as used in the wave code [nondim]
+  real    :: Charnock_slope_U10 !< Slope of the Charnock coefficient/U10 relationship [T L-1 ~> s m-1]
+  real    :: Charnock_min      !< Minimum value of the Charnock coefficient [nondim]
+  real    :: Charnock_intercept !< Intercept of the Charnock coefficient/U10 relationship [nondim]
+  real    :: I_g_Earth         !< The inverse of the gravitational acceleration [T2 Z L-2 ~> s2 m-1]
+  integer :: answer_date       !< The vintage of the order of arithmetic and expressions in the
+                               !! wave calculations.
+end type wave_LF17_params
+
 ! Switches needed in import_stokes_drift
 !>@{ Enumeration values for the wave method
 integer, parameter :: TESTPROF = 0, SURFBANDS = 1, DHH85 = 2, LF17 = 3, EFACTOR = 4, NULL_WaveMethod = -99
@@ -275,6 +298,18 @@ character*(13), parameter :: SURFBANDS_STRING = "SURFACE_BANDS" !< surface bands
 character*(5), parameter  :: DHH85_STRING     = "DHH85"         !< DHH85 wave method string
 character*(4), parameter  :: LF17_STRING      = "LF17"          !< LF17 wave method string
 character*(7), parameter  :: EFACTOR_STRING   = "EFACTOR"       !< EFACTOR (based on vr12-ma) wave method string
+
+!> GPU port: the Li & Fox-Kemper statistical-wave Langmuir-number kernels are device-callable so the
+!! ePBL column solver can evaluate the Langmuir number on the device; on GPU builds only the LF17
+!! (USE_LA_LI2016) statistical-wave path is compiled (the wave-model branches are host-only).
+!$omp declare target(get_StokesSL_LiFoxKemper, ust_2_u10_coare3p5)
+
+! RESOLVED(gpu-bitwise-repro) 2026-07-20: this LF17 Langmuir chain runs on-device (called from
+! ePBL_column); its transcendentals are now the reproducible kernels -- one_minus_exp_x exp() ->
+! exp_reprod; get_StokesSL_LiFoxKemper r5 erfc() -> erfc_reprod; ust_2_u10_coare3p5 COARE-Cd log() ->
+! log_reprod; PI = 4*atan(1) -> a literal. (sqrt() is IEEE-exact.) With these + the ePBL side, the GPU
+! and a same-source nvfortran-CPU build reproduce benchmark_ALE bit-for-bit. Prototype kernels;
+! coordinate with Marshall's transcendental-repro pass. See MOM_energetic_PBL.F90's resolved audit.
 
 contains
 
@@ -1048,7 +1083,7 @@ real function one_minus_exp_x(x)
     ! The Taylor series expression for exp(-x) gives a more accurate expression for 64-bit reals.
     one_minus_exp_x = 1.0 - x * (0.5 - C1_6*x)
   else
-    one_minus_exp_x = (1.0 - exp(-x)) / x
+    one_minus_exp_x = (1.0 - exp_reprod(-x)) / x
   endif
 end function one_minus_exp_x
 
@@ -1216,11 +1251,13 @@ subroutine get_Langmuir_Number( LA, G, GV, US, HBL, ustar, i, j, dz, Waves, &
 
 
 !Local Variables
+  real :: LA_STK ! Surface-layer averaged Stokes drift magnitude [L T-1 ~> m s-1]
+  type(wave_LF17_params) :: p_lf17 ! Device-mappable bundle of LF17 wave scalars (for the LF17 branch)
   real :: Top, Bottom, MidPoint  ! Positions within each layer [Z ~> m]
   real :: Dpt_LASL         ! Averaging depth for Stokes drift [Z ~> m]
   real :: ShearDirection   ! Shear angular direction from atan2 [radians]
   real :: WaveDirection    ! Wave angular direction from atan2 [radians]
-  real :: LA_STKx, LA_STKy, LA_STK ! Stokes velocities in [L T-1 ~> m s-1]
+  real :: LA_STKx, LA_STKy ! Stokes velocities in [L T-1 ~> m s-1]
   logical :: ContinueLoop, USE_MA
   real, dimension(SZK_(GV)) :: US_H, VS_H ! Profiles of Stokes velocities [L T-1 ~> m s-1]
   real, allocatable :: StkBand_X(:), StkBand_Y(:) ! Stokes drifts by band [L T-1 ~> m s-1]
@@ -1286,7 +1323,8 @@ subroutine get_Langmuir_Number( LA, G, GV, US, HBL, ustar, i, j, dz, Waves, &
     call Get_SL_Average_Prof( GV, Dpt_LASL, dz, VS_H, LA_STKy)
     LA_STK = sqrt((LA_STKX**2) + (LA_STKY**2))
   elseif (Waves%WaveMethod==LF17) then
-    call get_StokesSL_LiFoxKemper(ustar, HBL*Waves%LA_FracHBL, GV, US, Waves, LA_STK, LA)
+    call set_wave_LF17_params(Waves, p_lf17)
+    call get_StokesSL_LiFoxKemper(ustar, HBL*Waves%LA_FracHBL, GV, US, p_lf17, LA_STK, LA)
   elseif (Waves%WaveMethod==Null_WaveMethod) then
     call MOM_error(FATAL, "Get_Langmuir_number called without defining a WaveMethod. "//&
                           "Suggest to make sure USE_LT is set/overridden to False or choose "//&
@@ -1306,6 +1344,43 @@ subroutine get_Langmuir_Number( LA, G, GV, US, HBL, ustar, i, j, dz, Waves, &
   endif
 
 end subroutine get_Langmuir_Number
+
+!> Device-callable Langmuir-number kernel for the LF17 statistical-wave method (USE_LA_LI2016).
+!! This is the GPU-offload entry point (e.g. from ePBL_column): it has no optional arguments — which
+!! nvfortran cannot emit `declare target` device code for — and covers only the LF17 path, which is
+!! the only WaveMethod supported on the GPU port.  It is bit-for-bit the LF17 branch of
+!! get_Langmuir_Number (get_StokesSL_LiFoxKemper sets LA directly; no misalignment is applied).
+subroutine get_Langmuir_Number_LF17(LA, GV, US, HBL, ustar, p)
+  real,                    intent(out) :: LA    !< Langmuir number [nondim]
+  type(verticalGrid_type), intent(in)  :: GV    !< Ocean vertical grid structure
+  type(unit_scale_type),   intent(in)  :: US    !< A dimensional unit scaling type
+  real,                    intent(in)  :: HBL   !< (Positive) thickness of boundary layer [Z ~> m]
+  real,                    intent(in)  :: ustar !< Friction velocity [Z T-1 ~> m s-1]
+  type(wave_LF17_params),  intent(in)  :: p     !< Device-mappable bundle of LF17 wave scalars.
+!$omp declare target
+
+  real :: LA_STK ! Surface-layer averaged Stokes drift magnitude [L T-1 ~> m s-1]
+
+  call get_StokesSL_LiFoxKemper(ustar, HBL*p%LA_FracHBL, GV, US, p, LA_STK, LA)
+end subroutine get_Langmuir_Number_LF17
+
+!> Populate a device-mappable wave_LF17_params bundle from a Waves control structure (host-side).
+subroutine set_wave_LF17_params(Waves, p)
+  type(Wave_parameters_CS), pointer,    intent(in)  :: Waves !< Surface wave control structure.
+  type(wave_LF17_params),               intent(out) :: p     !< The populated scalar bundle.
+
+  p%LA_FracHBL         = Waves%LA_FracHBL
+  p%rho_air            = Waves%rho_air
+  p%nu_air             = Waves%nu_air
+  p%rho_ocn            = Waves%rho_ocn
+  p%SWH_from_u10sq     = Waves%SWH_from_u10sq
+  p%vonKar             = Waves%vonKar
+  p%Charnock_slope_U10 = Waves%Charnock_slope_U10
+  p%Charnock_min       = Waves%Charnock_min
+  p%Charnock_intercept = Waves%Charnock_intercept
+  p%I_g_Earth          = Waves%I_g_Earth
+  p%answer_date        = Waves%answer_date
+end subroutine set_wave_LF17_params
 
 !> function to return the wave method string set in the param file
 function get_wave_method(CS)
@@ -1353,7 +1428,7 @@ subroutine get_StokesSL_LiFoxKemper(ustar, hbl, GV, US, CS, UStokes_SL, LA)
   real, intent(in)  :: hbl   !< boundary layer depth [Z ~> m].
   type(verticalGrid_type), intent(in) :: GV !< Ocean vertical grid structure
   type(unit_scale_type),   intent(in) :: US !< A dimensional unit scaling type
-  type(wave_parameters_CS), pointer   :: CS  !< Wave parameter Control structure
+  type(wave_LF17_params),  intent(in) :: CS  !< Device-mappable bundle of LF17 wave scalars
   real, intent(out) :: UStokes_SL !< Surface layer averaged Stokes drift [L T-1 ~> m s-1]
   real, intent(out) :: LA    !< Langmuir number [nondim]
   ! Local variables
@@ -1377,9 +1452,8 @@ subroutine get_StokesSL_LiFoxKemper(ustar, hbl, GV, US, CS, UStokes_SL, LA)
   real :: root_2kz ! The square root of twice the peak wavenumber times the
                    ! boundary layer depth [nondim]
   real :: u10      ! The 10 m wind speed [L T-1 ~> m s-1]
-  real :: PI       ! 3.1415926535... [nondim]
+  real, parameter :: PI = 3.14159265358979323846 ! 3.1415926535... [nondim]
 
-  PI = 4.0*atan(1.0)
   UStokes_sl = 0.0
   LA = 1.e8
   if (ustar > 0.0) then
@@ -1453,8 +1527,8 @@ subroutine get_StokesSL_LiFoxKemper(ustar, hbl, GV, US, CS, UStokes_SL, LA)
       !   It has been verified that these two expressions for r5 are the same to 6 decimal places for
       ! root_2kz  between 1e-10 and 1e-3, but that the first one degrades for smaller values.
       if (root_2kz > 1e-3) then
-        r5 = sqrt(PI) * (root_2kz * (-0.84 * erfc(root_2kz) + 0.2 * erfc(1.6*root_2kz)) + &
-                         0.1182 * (erfc(1.6*root_2kz) - erfc(root_2kz)) / root_2kz)
+        r5 = sqrt(PI) * (root_2kz * (-0.84 * erfc_reprod(root_2kz) + 0.2 * erfc_reprod(1.6*root_2kz)) + &
+                         0.1182 * (erfc_reprod(1.6*root_2kz) - erfc_reprod(root_2kz)) / root_2kz)
       else
         ! It is more accurate to replace erf with the first two terms of its Taylor series
         !  erf(z) = (2/sqrt(pi)) * z * (1. - (1/3)*z**2 + (1/10)*z**4 - (1/42)*z**6 + ...)
@@ -2064,7 +2138,7 @@ subroutine ust_2_u10_coare3p5(USTair, U10, GV, US, CS)
   real, intent(out)                   :: U10    !< 10-m neutral wind speed [L T-1 ~> m s-1]
   type(verticalGrid_type), intent(in) :: GV     !< vertical grid type
   type(unit_scale_type),   intent(in) :: US     !< A dimensional unit scaling type
-  type(wave_parameters_CS), pointer   :: CS     !< Wave parameter Control structure
+  type(wave_LF17_params),  intent(in) :: CS     !< Device-mappable bundle of LF17 wave scalars
 
   ! Local variables
   real :: z0sm, z0, z0rough  ! Roughness lengths [Z ~> m]
@@ -2084,8 +2158,10 @@ subroutine ust_2_u10_coare3p5(USTair, U10, GV, US, CS)
   ! Note in Edson et al. 2013, eq. 13 m is given as 0.017.  However,
   ! m=0.0017 reproduces the curve in their figure 6.
 
+#ifndef __NVCOMPILER_OPENMP_GPU
   if (CS%vonKar < 0.0) call MOM_error(FATAL, &
     "ust_2_u10_coare3p5 called with a negative value of Waves%vonKar")
+#endif
 
   z0sm = 0.11 * CS%nu_air / USTair ! Compute z0smooth from ustar guess
   u10a = 1000.0*US%m_s_to_L_T ! An insanely large upper bound for u10.
@@ -2126,7 +2202,7 @@ subroutine ust_2_u10_coare3p5(USTair, U10, GV, US, CS)
       alpha = min(CS%Charnock_min, CS%Charnock_slope_U10 * u10 + CS%Charnock_intercept)
       z0rough = alpha * (CS%I_g_Earth * USTair**2) ! Compute z0rough from ustar guess
       z0 = z0sm + z0rough
-      I_sqrtCd = abs(log(z0 * I_ten_m_scale)) * I_vonKar ! Compute Cd from derived roughness
+      I_sqrtCd = abs(log_reprod(z0 * I_ten_m_scale)) * I_vonKar ! Compute Cd from derived roughness
       u10 = US%Z_to_L*USTair * I_sqrtCd  ! Compute new u10 from the derived Cd.
     enddo
 

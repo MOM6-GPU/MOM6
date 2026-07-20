@@ -13,6 +13,8 @@ use MOM_domains,               only : pass_var, CORNER, pass_vector
 use MOM_error_handler,         only : MOM_error, FATAL, WARNING, is_root_pe
 use MOM_EOS,                   only : calculate_density, calculate_density_derivs, EOS_domain
 use MOM_EOS,                   only : calculate_density_second_derivs
+use MOM_EOS,                   only : calculate_density_derivs_elem_loc, get_EOS_form_and_scaling
+use MOM_EOS,                   only : EOS_ROQUET_RHO, EOS_WRIGHT
 use MOM_file_parser,           only : get_param, log_version, param_file_type
 use MOM_grid,                  only : ocean_grid_type
 use MOM_io,                    only : MOM_read_data, slasher
@@ -706,6 +708,12 @@ subroutine thickness_diffuse_full(h, e, Kh_u, Kh_v, tv, uhD, vhD, cg1, dt, G, GV
     drho_dT_dT_hr ! The second derivative of density with temperature at h (+1) points [R C-2 ~> kg m-3 degC-2]
   real :: uhtot(SZIB_(G),SZJ_(G))  ! The vertical sum of uhD [H L2 T-1 ~> m3 s-1 or kg s-1].
   real :: vhtot(SZI_(G),SZJB_(G))  ! The vertical sum of vhD [H L2 T-1 ~> m3 s-1 or kg s-1].
+  real :: pres_us, T_us, S_us     ! Scalar (per-iteration) pressure, temperature and salinity on the
+                                  ! interface at a u-point, for the fused device-callable EOS path.
+  real :: dT_us, dS_us            ! Scalar density derivatives with T and S at a u-point.
+  real :: pres_vs, T_vs, S_vs     ! Scalar (per-iteration) pressure, temperature and salinity on the
+                                  ! interface at a v-point, for the fused device-callable EOS path.
+  real :: dT_vs, dS_vs            ! Scalar density derivatives with T and S at a v-point.
   real, dimension(SZIB_(G)) :: &
     T_u, &        ! Temperature on the interface at the u-point [C ~> degC].
     S_u, &        ! Salinity on the interface at the u-point [S ~> ppt].
@@ -733,11 +741,11 @@ subroutine thickness_diffuse_full(h, e, Kh_u, Kh_v, tv, uhD, vhD, cg1, dt, G, GV
   real :: drdjA, drdjB  ! Along layer meridional potential density  gradients in the layers above (A)
                         ! and below (B) the interface times the grid spacing [R ~> kg m-3].
   real :: drdkL, drdkR  ! Vertical density differences across an interface [R ~> kg m-3].
-  real :: drdi_u(SZIB_(G),SZK_(GV)) ! Copy of drdi at u-points [R ~> kg m-3].
-  real :: drdj_v(SZI_(G),SZK_(GV)) ! Copy of drdj at v-points [R ~> kg m-3].
-  real :: drdkDe_u(SZIB_(G),SZK_(GV)+1) ! Lateral difference of product of drdk and e at u-points
+  real :: drdi_u(SZIB_(G),SZJ_(G),SZK_(GV)) ! Copy of drdi at u-points [R ~> kg m-3].
+  real :: drdj_v(SZI_(G),SZJB_(G),SZK_(GV)) ! Copy of drdj at v-points [R ~> kg m-3].
+  real :: drdkDe_u(SZIB_(G),SZJ_(G),SZK_(GV)+1) ! Lateral difference of product of drdk and e at u-points
                                         ! [Z R ~> kg m-2].
-  real :: drdkDe_v(SZI_(G),SZK_(GV)+1)  ! Lateral difference of product of drdk and e at v-points
+  real :: drdkDe_v(SZI_(G),SZJB_(G),SZK_(GV)+1)  ! Lateral difference of product of drdk and e at v-points
                                         ! [Z R ~> kg m-2].
   real :: hg2A, hg2B, hg2L, hg2R ! Squares of geometric mean thicknesses [H2 ~> m2 or kg2 m-4].
   real :: haA, haB, haL, haR     ! Arithmetic mean thicknesses [H ~> m or kg m-2].
@@ -751,16 +759,16 @@ subroutine thickness_diffuse_full(h, e, Kh_u, Kh_v, tv, uhD, vhD, cg1, dt, G, GV
   real :: dz_harm       ! Harmonic mean layer vertical extent [Z ~> m].
   real :: c2_dz_u(SZIB_(G),SZK_(GV)+1) ! Wave speed squared divided by dz at u-points [L2 Z-1 T-2 ~> m s-2]
   real :: c2_dz_v(SZI_(G),SZK_(GV)+1)  ! Wave speed squared divided by dz at v-points [L2 Z-1 T-2 ~> m s-2]
-  real :: dzN2_u(SZIB_(G),SZK_(GV)+1) ! Vertical extent times N2 at interfaces above u-points times
+  real :: dzN2_u(SZIB_(G),SZJ_(G),SZK_(GV)+1) ! Vertical extent times N2 at interfaces above u-points times
                         ! rescaling factors from vertical to horizontal distances [L2 Z-1 T-2 ~> m s-2]
-  real :: dzN2_v(SZI_(G),SZK_(GV)+1)  ! Vertical extent times N2 at interfaces above v-points times
+  real :: dzN2_v(SZI_(G),SZJB_(G),SZK_(GV)+1)  ! Vertical extent times N2 at interfaces above v-points times
                         ! rescaling factors from vertical to horizontal distances [L2 Z-1 T-2 ~> m s-2]
   real :: Sfn_est       ! A preliminary estimate (before limiting) of the overturning
                         ! streamfunction [H L2 T-1 ~> m3 s-1 or kg s-1].
-  real :: Sfn_unlim_u(SZIB_(G),SZK_(GV)+1) ! Volume streamfunction for u-points [Z L2 T-1 ~> m3 s-1]
-  real :: Sfn_unlim_v(SZI_(G),SZK_(GV)+1)  ! Volume streamfunction for v-points [Z L2 T-1 ~> m3 s-1]
-  real :: slope2_Ratio_u(SZIB_(G),SZK_(GV)+1) ! The ratio of the slope squared to slope_max squared [nondim]
-  real :: slope2_Ratio_v(SZI_(G),SZK_(GV)+1)  ! The ratio of the slope squared to slope_max squared [nondim]
+  real :: Sfn_unlim_u(SZIB_(G),SZJ_(G),SZK_(GV)+1) ! Volume streamfunction for u-points [Z L2 T-1 ~> m3 s-1]
+  real :: Sfn_unlim_v(SZI_(G),SZJB_(G),SZK_(GV)+1)  ! Volume streamfunction for v-points [Z L2 T-1 ~> m3 s-1]
+  real :: slope2_Ratio_u(SZIB_(G),SZJ_(G),SZK_(GV)+1) ! The ratio of the slope squared to slope_max squared [nondim]
+  real :: slope2_Ratio_v(SZI_(G),SZJB_(G),SZK_(GV)+1)  ! The ratio of the slope squared to slope_max squared [nondim]
   real :: Sfn_in_h      ! The overturning streamfunction [H L2 T-1 ~> m3 s-1 or kg s-1] (note that
                         ! the units are different from other Sfn vars).
   real :: Sfn_safe      ! The streamfunction that goes linearly back to 0 at the surface
@@ -784,6 +792,11 @@ subroutine thickness_diffuse_full(h, e, Kh_u, Kh_v, tv, uhD, vhD, cg1, dt, G, GV
   integer :: nk_linear  ! The number of layers over which the streamfunction goes to 0.
   real :: G_rho0        ! g/Rho0 [L2 R-1 Z-1 T-2 ~> m4 kg-1 s-2].
   real :: Rho_avg       ! The in situ density averaged to an interface [R ~> kg m-3]
+  integer :: eos_form   ! The equation-of-state form code, for the device-callable EOS dispatcher.
+  real :: eos_kg_m3_to_R  ! Factor converting the EOS kernel's density to model units [R m3 kg-1 ~> 1]
+  real :: eos_C_to_degC   ! Factor converting model temperature to the EOS kernel's degC [degC C-1 ~> 1]
+  real :: eos_S_to_ppt    ! Factor converting model salinity to the EOS kernel's ppt [ppt S-1 ~> 1]
+  real :: eos_RL2_T2_to_Pa ! Factor converting model pressure to Pa [Pa T2 R-1 L-2 ~> 1]
   real :: N2_floor      ! A floor for N2 to avoid degeneracy in the elliptic solver
                         ! times unit conversion factors [L2 Z-2 T-2 ~> s-2]
   real :: N2_unlim      ! An unlimited estimate of the buoyancy frequency
@@ -801,6 +814,17 @@ subroutine thickness_diffuse_full(h, e, Kh_u, Kh_v, tv, uhD, vhD, cg1, dt, G, GV
                                                         ! applying limiters [H L2 T-1 ~> m3 s-1 or kg s-1]
   real, allocatable :: skeb_gm_work(:,:)                ! Temp array to hold GM work for SKEB
   real, allocatable :: skeb_ebt_norm2(:,:)              ! Used to normalize EBT for SKEB
+  real :: GM_src_loc(SZI_(G),SZJ_(G))   ! Hoisted plain-array copy of MEKE%GM_src [R Z L2 T-3 ~> W m-2].
+                                        ! MEKE%GM_src is an allocatable component of a pointer/derived
+                                        ! type, so it is copied to/from this plain array around the
+                                        ! device region rather than deep-mapped (the pointer trap).
+  real :: GMwork_loc(SZI_(G),SZJ_(G))   ! Hoisted plain-array copy of CS%GMwork [R Z L2 T-3 ~> W m-2].
+  real :: p_surf_loc(SZI_(G),SZJ_(G))   ! Hoisted plain-array copy of the surface pressure tv%p_surf
+                                        ! [R L2 T-2 ~> Pa] (0 where tv%p_surf is not associated), so the
+                                        ! device reads a plain array rather than a pointer component of tv.
+  logical :: have_GM_src   ! True if MEKE%GM_src is allocated (evaluated on the host).
+  logical :: have_GMwork   ! True if CS%GMwork is allocated (evaluated on the host).
+  logical :: have_p_surf   ! True if tv%p_surf is associated (evaluated on the host).
 
   logical :: present_slope_x, present_slope_y, calc_derivatives
   integer, dimension(2) :: EOSdom_u  ! The shifted I-computational domain to use for equation of
@@ -861,37 +885,98 @@ subroutine thickness_diffuse_full(h, e, Kh_u, Kh_v, tv, uhD, vhD, cg1, dt, G, GV
   if (CS%use_FGNV_streamfn .and. .not. associated(cg1)) call MOM_error(FATAL, &
        "cg1 must be associated when using FGNV streamfunction.")
 
-  !$OMP parallel default(shared)
+  ! ---------------------------------------------------------------------------------------------
+  ! GPU offload of thickness_diffuse_full.  One target data region spans the whole compute below.
+  ! Notes on residency: tv%T/tv%S are NOT mapped — the density inputs on device are the host-filled
+  ! local arrays T and S (from vert_fill_TS), copied in fresh with map(to:).  MEKE%GM_src and
+  ! CS%GMwork are allocatable components of a pointer/derived type, so they are hoisted to the plain
+  ! local arrays GM_src_loc/GMwork_loc (mapped, written on device, copied back) rather than
+  ! deep-mapped (the pointer-in-derived-type trap).  The persistent, diabatic-mutated h is refreshed
+  ! with update to(h) (map-to-present is a no-copy).
+  ! ---------------------------------------------------------------------------------------------
+#ifdef __NVCOMPILER_OPENMP_GPU
+  if (use_stanley) call MOM_error(FATAL, &
+      "thickness_diffuse_full GPU build: USE_STANLEY_GM is not supported on device.")
+  if (CS%use_FGNV_streamfn) call MOM_error(FATAL, &
+      "thickness_diffuse_full GPU build: the FGNV streamfunction is not supported on device.")
+  if (skeb_use_gm) call MOM_error(FATAL, &
+      "thickness_diffuse_full GPU build: SKEB GM work is not supported on device.")
+  if (allocated(tv%SpV_avg)) call MOM_error(FATAL, &
+      "thickness_diffuse_full GPU build: the non-Boussinesq SpV_avg path is not supported on device.")
+  if ((CS%id_slope_x>0) .or. (CS%id_slope_y>0) .or. (CS%id_sfn_x>0) .or. (CS%id_sfn_y>0) .or. &
+      (CS%id_sfn_unlim_x>0) .or. (CS%id_sfn_unlim_y>0)) call MOM_error(FATAL, &
+      "thickness_diffuse_full GPU build: the streamfunction/slope diagnostics are not supported on device.")
+#endif
+
+  have_p_surf = associated(tv%p_surf)
+  have_GM_src = allocated(MEKE%GM_src)
+  have_GMwork = allocated(CS%GMwork)
+
+  ! Hoist MEKE%GM_src / CS%GMwork to plain local arrays (copied back after the region).
+  GM_src_loc(:,:) = 0.0 ; GMwork_loc(:,:) = 0.0
+  if (have_GM_src) then ; do j=js,je ; do i=is,ie ; GM_src_loc(i,j) = MEKE%GM_src(i,j) ; enddo ; enddo ; endif
+  if (have_GMwork) then ; do j=js,je ; do i=is,ie ; GMwork_loc(i,j) = CS%GMwork(i,j) ; enddo ; enddo ; endif
+
+  ! Hoist the surface pressure onto a plain array so the device never dereferences the tv%p_surf pointer.
+  p_surf_loc(:,:) = 0.0
+  if (have_p_surf) then
+    do j=js-1,je+1 ; do i=is-1,ie+1 ; p_surf_loc(i,j) = tv%p_surf(i,j) ; enddo ; enddo
+  endif
+
+#ifdef __NVCOMPILER_OPENMP_GPU
+  !$omp target enter data map(to: h, e, dz, T, S, Kh_u, Kh_v, int_slope_u, int_slope_v, CS, &
+  !$omp                          Slope_x_PE, Slope_y_PE, hN2_x_PE, hN2_y_PE, GM_src_loc, GMwork_loc, p_surf_loc) &
+  !$omp                    map(alloc: pres, h_avail, h_frac, h_avail_rsum, uhtot, vhtot, Work_u, Work_v, &
+  !$omp                          uhD, vhD, drdi_u, drdj_v, drdkDe_u, drdkDe_v, dzN2_u, dzN2_v, &
+  !$omp                          Sfn_unlim_u, Sfn_unlim_v, slope2_Ratio_u, slope2_Ratio_v)
+  if (present_slope_x) then
+    !$omp target enter data map(to: slope_x)
+  endif
+  if (present_slope_y) then
+    !$omp target enter data map(to: slope_y)
+  endif
+  ! h is persistently mapped and mutated on the host by diabatic, so refresh it (map-to-present
+  ! does not copy).
+  !$omp target update to(h)
+#endif
+
   ! Find the maximum and minimum permitted streamfunction.
-  !$OMP do
+#ifdef __NVCOMPILER_OPENMP_GPU
+  !$omp target teams loop collapse(2)
+#endif
   do j=js-1,je+1 ; do i=is-1,ie+1
     h_avail_rsum(i,j,1) = 0.0
-    pres(i,j,1) = 0.0
-    if (associated(tv%p_surf)) then ; pres(i,j,1) = tv%p_surf(i,j) ; endif
-
+    pres(i,j,1) = p_surf_loc(i,j)
     h_avail(i,j,1) = max(I4dt*G%areaT(i,j)*(h(i,j,1)-GV%Angstrom_H),0.0)
     h_avail_rsum(i,j,2) = h_avail(i,j,1)
     h_frac(i,j,1) = 1.0
     pres(i,j,2) = pres(i,j,1) + (GV%g_Earth*GV%H_to_RZ) * h(i,j,1)
   enddo ; enddo
-  do j=js-1,je+1
-    do k=2,nz ; do i=is-1,ie+1
+  ! Running sum up the column: a downward vertical recurrence, so collapse(2) over (j,i) + serial K.
+#ifdef __NVCOMPILER_OPENMP_GPU
+  !$omp target teams loop collapse(2)
+#endif
+  do j=js-1,je+1 ; do i=is-1,ie+1
+    do k=2,nz
       h_avail(i,j,k) = max(I4dt*G%areaT(i,j)*(h(i,j,k)-GV%Angstrom_H),0.0)
       h_avail_rsum(i,j,k+1) = h_avail_rsum(i,j,k) + h_avail(i,j,k)
       h_frac(i,j,k) = 0.0 ; if (h_avail(i,j,k) > 0.0) &
         h_frac(i,j,k) = h_avail(i,j,k) / h_avail_rsum(i,j,k+1)
       pres(i,j,K+1) = pres(i,j,K) + (GV%g_Earth*GV%H_to_RZ) * h(i,j,k)
-    enddo ; enddo
-  enddo
-  !$OMP do
+    enddo
+  enddo ; enddo
+#ifdef __NVCOMPILER_OPENMP_GPU
+  !$omp target teams loop collapse(2)
+#endif
   do j=js,je ; do I=is-1,ie
     uhtot(I,j) = 0.0 ; Work_u(I,j) = 0.0
   enddo ; enddo
-  !$OMP do
+#ifdef __NVCOMPILER_OPENMP_GPU
+  !$omp target teams loop collapse(2)
+#endif
   do J=js-1,je ; do i=is,ie
     vhtot(i,J) = 0.0 ; Work_v(i,J) = 0.0
   enddo ; enddo
-  !$OMP end parallel
 
   if (CS%id_sfn_x > 0) then ; diag_sfn_x(:,:,1) = 0.0 ; diag_sfn_x(:,:,nz+1) = 0.0 ; endif
   if (CS%id_sfn_y > 0) then ; diag_sfn_y(:,:,1) = 0.0 ; diag_sfn_y(:,:,nz+1) = 0.0 ; endif
@@ -902,41 +987,59 @@ subroutine thickness_diffuse_full(h, e, Kh_u, Kh_v, tv, uhD, vhD, cg1, dt, G, GV
   EOSdom_v(:) = EOS_domain(G%HI)
   EOSdom_h1(:) = EOS_domain(G%HI, halo=1)
 
+  ! Resolve the EOS form and its unit-scaling once (host v-table lookup), so the density derivatives
+  ! can be evaluated through the device-callable elementwise dispatcher instead of the polymorphic
+  ! array interface.  The scaling is always applied; for the unscaled case the factors are exactly
+  ! 1.0, reproducing the former array calculate_density_derivs calls bit-for-bit.
+  eos_form = -1
+  eos_kg_m3_to_R = 1.0 ; eos_C_to_degC = 1.0 ; eos_S_to_ppt = 1.0 ; eos_RL2_T2_to_Pa = 1.0
+  if (use_EOS) then
+    call get_EOS_form_and_scaling(tv%eqn_of_state, eos_form, eos_kg_m3_to_R, eos_C_to_degC, &
+                                  eos_S_to_ppt, eos_RL2_T2_to_Pa)
+#ifdef __NVCOMPILER_OPENMP_GPU
+    if ((eos_form /= EOS_ROQUET_RHO) .and. (eos_form /= EOS_WRIGHT)) call MOM_error(FATAL, &
+      "thickness_diffuse_full GPU build: EQN_OF_STATE has no device-callable density-derivs kernel "// &
+      "(only ROQUET_RHO and WRIGHT are supported); use a CPU build or add a _loc kernel.")
+#endif
+  endif
+
+  ! Zero the FGNV vertical-extent-times-N2 boundary interface values.
+#ifdef __NVCOMPILER_OPENMP_GPU
+  !$omp target teams loop collapse(2)
+#endif
+  do j=js,je ; do I=is-1,ie
+    dzN2_u(I,j,1) = 0. ; dzN2_u(I,j,nz+1) = 0.
+  enddo ; enddo
+
+  ! Calculate the zonal density gradients, slopes and unlimited streamfunction.  The 3-D promoted
+  ! scratch (drdi_u, drdkDe_u, dzN2_u, slope2_Ratio_u, Sfn_unlim_u, Slope_x_PE, hN2_x_PE) is shared
+  ! so it survives into the separate flux j-loop below; each j slice is written disjointly.  This
+  ! loop has no vertical recurrence, so on the GPU it collapses over (j,K,I).
+#ifdef __NVCOMPILER_OPENMP_GPU
+  !$omp target teams loop collapse(3) &
+  !$omp                          private(drdiA,drdiB,drdkL,drdkR,pres_us,T_us,S_us,dT_us,dS_us, &
+  !$omp                                  hg2A,hg2B,hg2L,hg2R,haA, &
+  !$omp                                  N2_unlim,haB,haL,haR,dzaL,dzaR,wtA,wtB,wtL,wtR,drdz,  &
+  !$omp                                  dzg2A,dzg2B,dzaA,dzaB,Z_to_H, &
+  !$omp                                  drdx,mag_grad2,Slope,calc_derivatives)
+#else
   !$OMP parallel do default(none) shared(nz,is,ie,js,je,find_work,use_EOS,G,GV,US,pres,T,S, &
   !$OMP                                  nk_linear,IsdB,tv,h,h_neglect,e,dz,dz_neglect,dz_neglect2, &
-  !$OMP                                  h_neglect2,hn_2,I_slope_max2,int_slope_u,KH_u,uhtot, &
-  !$OMP                                  h_frac,h_avail_rsum,uhD,h_avail,Work_u,CS,slope_x,cg1, &
-  !$OMP                                  diag_sfn_x,diag_sfn_unlim_x,N2_floor,EOSdom_u,EOSdom_h1, &
-  !$OMP                                  use_stanley,present_slope_x,G_rho0,Slope_x_PE,hN2_x_PE) &
-  !$OMP                          private(drdiA,drdiB,drdkL,drdkR,pres_u,T_u,S_u,G_scale, &
-  !$OMP                                  drho_dT_u,drho_dS_u,hg2A,hg2B,hg2L,hg2R,haA, &
-  !$OMP                                  drho_dT_dT_h,scrap,pres_h,T_h,S_h,N2_unlim,  &
-  !$OMP                                  haB,haL,haR,dzaL,dzaR,wtA,wtB,wtL,wtR,drdz,  &
-  !$OMP                                  dzg2A,dzg2B,dzaA,dzaB,dz_harm,Z_to_H, &
-  !$OMP                                  drdx,mag_grad2,Slope,slope2_Ratio_u,dzN2_u,  &
-  !$OMP                                  Sfn_unlim_u,Rho_avg,drdi_u,drdkDe_u,c2_dz_u, &
-  !$OMP                                  Sfn_safe,Sfn_est,Sfn_in_h,calc_derivatives)
+  !$OMP                                  h_neglect2,hn_2,I_slope_max2,int_slope_u,KH_u, &
+  !$OMP                                  h_frac,h_avail_rsum,uhD,h_avail,CS,slope_x,cg1, &
+  !$OMP                                  diag_sfn_unlim_x,N2_floor,EOSdom_u,EOSdom_h1, &
+  !$OMP                                  use_stanley,present_slope_x,G_rho0,Slope_x_PE,hN2_x_PE, &
+  !$OMP                                  drdi_u,drdkDe_u,dzN2_u,slope2_Ratio_u,Sfn_unlim_u, &
+  !$OMP                                  eos_form,eos_kg_m3_to_R,eos_C_to_degC,eos_S_to_ppt,eos_RL2_T2_to_Pa) &
+  !$OMP                          private(drdiA,drdiB,drdkL,drdkR,pres_us,T_us,S_us,dT_us,dS_us, &
+  !$OMP                                  hg2A,hg2B,hg2L,hg2R,haA,drho_dT_dT_h,scrap,pres_h,T_h,S_h, &
+  !$OMP                                  N2_unlim,haB,haL,haR,dzaL,dzaR,wtA,wtB,wtL,wtR,drdz,  &
+  !$OMP                                  dzg2A,dzg2B,dzaA,dzaB,Z_to_H, &
+  !$OMP                                  drdx,mag_grad2,Slope,calc_derivatives)
+#endif
   do j=js,je
-    do I=is-1,ie ; dzN2_u(I,1) = 0. ; dzN2_u(I,nz+1) = 0. ; enddo
     do K=nz,2,-1
-      if (find_work .and. .not.(use_EOS)) then
-        drdiA = 0.0 ; drdiB = 0.0
-        drdkL = GV%Rlay(k) - GV%Rlay(k-1) ; drdkR = drdkL
-      endif
-
-      calc_derivatives = use_EOS .and. (k >= nk_linear) .and. &
-         (find_work .or. .not. present_slope_x .or. CS%use_FGNV_streamfn .or. use_stanley)
-
-      ! Calculate the zonal fluxes and gradients.
-      if (calc_derivatives) then
-        do I=is-1,ie
-          pres_u(I) = 0.5*(pres(i,j,K) + pres(i+1,j,K))
-          T_u(I) = 0.25*((T(i,j,k) + T(i+1,j,k)) + (T(i,j,k-1) + T(i+1,j,k-1)))
-          S_u(I) = 0.25*((S(i,j,k) + S(i+1,j,k)) + (S(i,j,k-1) + S(i+1,j,k-1)))
-        enddo
-        call calculate_density_derivs(T_u, S_u, pres_u, drho_dT_u, drho_dS_u, &
-                                      tv%eqn_of_state, EOSdom_u)
-      endif
+#ifndef __NVCOMPILER_OPENMP_GPU
       if (use_stanley) then
         do i=is-1,ie+1
           pres_h(i) = pres(i,j,K)
@@ -950,24 +1053,45 @@ subroutine thickness_diffuse_full(h, e, Kh_u, Kh_v, tv, uhD, vhD, cg1, dt, G, GV
                      scrap, scrap, drho_dT_dT_h, scrap, scrap, &
                      tv%eqn_of_state, EOSdom_h1)
       endif
+#endif
 
       do I=is-1,ie
+        calc_derivatives = use_EOS .and. (k >= nk_linear) .and. &
+           (find_work .or. .not. present_slope_x .or. CS%use_FGNV_streamfn .or. use_stanley)
+
+        if (find_work .and. .not.(use_EOS)) then
+          drdiA = 0.0 ; drdiB = 0.0
+          drdkL = GV%Rlay(k) - GV%Rlay(k-1) ; drdkR = drdkL
+        endif
+
+        ! Fill the interface T, S and pressure at the u-point and evaluate the density derivatives
+        ! through the device-callable elementwise EOS dispatcher (fused into this loop from the
+        ! former separate do-I EOS-fill loop, which read the same I in the same iteration).
         if (calc_derivatives) then
+          pres_us = 0.5*(pres(i,j,K) + pres(i+1,j,K))
+          T_us = 0.25*((T(i,j,k) + T(i+1,j,k)) + (T(i,j,k-1) + T(i+1,j,k-1)))
+          S_us = 0.25*((S(i,j,k) + S(i+1,j,k)) + (S(i,j,k-1) + S(i+1,j,k-1)))
+          call calculate_density_derivs_elem_loc(eos_form, eos_C_to_degC*T_us, eos_S_to_ppt*S_us, &
+                     eos_RL2_T2_to_Pa*pres_us, dT_us, dS_us)
+          dT_us = (eos_kg_m3_to_R*eos_C_to_degC) * dT_us
+          dS_us = (eos_kg_m3_to_R*eos_S_to_ppt) * dS_us
+
           ! Estimate the horizontal density gradients along layers.
-          drdiA = drho_dT_u(I) * (T(i+1,j,k-1)-T(i,j,k-1)) + &
-                  drho_dS_u(I) * (S(i+1,j,k-1)-S(i,j,k-1))
-          drdiB = drho_dT_u(I) * (T(i+1,j,k)-T(i,j,k)) + &
-                  drho_dS_u(I) * (S(i+1,j,k)-S(i,j,k))
+          drdiA = dT_us * (T(i+1,j,k-1)-T(i,j,k-1)) + &
+                  dS_us * (S(i+1,j,k-1)-S(i,j,k-1))
+          drdiB = dT_us * (T(i+1,j,k)-T(i,j,k)) + &
+                  dS_us * (S(i+1,j,k)-S(i,j,k))
 
           ! Estimate the vertical density gradients times the grid spacing.
-          drdkL = (drho_dT_u(I) * (T(i,j,k)-T(i,j,k-1)) + &
-                   drho_dS_u(I) * (S(i,j,k)-S(i,j,k-1)))
-          drdkR = (drho_dT_u(I) * (T(i+1,j,k)-T(i+1,j,k-1)) + &
-                   drho_dS_u(I) * (S(i+1,j,k)-S(i+1,j,k-1)))
-          drdkDe_u(I,K) = (drdkR * e(i+1,j,K)) - (drdkL * e(i,j,K))
+          drdkL = (dT_us * (T(i,j,k)-T(i,j,k-1)) + &
+                   dS_us * (S(i,j,k)-S(i,j,k-1)))
+          drdkR = (dT_us * (T(i+1,j,k)-T(i+1,j,k-1)) + &
+                   dS_us * (S(i+1,j,k)-S(i+1,j,k-1)))
+          drdkDe_u(I,j,K) = (drdkR * e(i+1,j,K)) - (drdkL * e(i,j,K))
         elseif (find_work) then ! This is used in pure stacked SW mode
-          drdkDe_u(I,K) = (drdkR * e(i+1,j,K)) - (drdkL * e(i,j,K))
+          drdkDe_u(I,j,K) = (drdkR * e(i+1,j,K)) - (drdkL * e(i,j,K))
         endif
+#ifndef __NVCOMPILER_OPENMP_GPU
         if (use_stanley) then
           ! Correction to the horizontal density gradient due to nonlinearity in
           ! the EOS rectifying SGS temperature anomalies
@@ -976,7 +1100,8 @@ subroutine thickness_diffuse_full(h, e, Kh_u, Kh_v, tv, uhD, vhD, cg1, dt, G, GV
           drdiB = drdiB + 0.5 * ((drho_dT_dT_h(i+1) * tv%varT(i+1,j,k)) - &
                                 (drho_dT_dT_h(i) * tv%varT(i,j,k)) )
         endif
-        if (find_work) drdi_u(I,k) = drdiB
+#endif
+        if (find_work) drdi_u(I,j,k) = drdiB
 
         if (k > nk_linear) then
           if (use_EOS) then
@@ -1019,14 +1144,14 @@ subroutine thickness_diffuse_full(h, e, Kh_u, Kh_v, tv, uhD, vhD, cg1, dt, G, GV
               dzaA = 0.5*(dz(i,j,k-1) + dz(i+1,j,k-1)) + dz_neglect
               dzaB = 0.5*(dz(i,j,k) + dz(i+1,j,k)) + dz_neglect
               ! dzN2_u is used with the FGNV streamfunction formulation
-              dzN2_u(I,K) = (0.5 * ( dzg2A / dzaA + dzg2B / dzaB )) * max(N2_unlim, N2_floor)
+              dzN2_u(I,j,K) = (0.5 * ( dzg2A / dzaA + dzg2B / dzaB )) * max(N2_unlim, N2_floor)
               if (find_work .and. CS%GM_src_alt) &
                 hN2_x_PE(I,j,k) = (0.5 * ( hg2A / haA + hg2B / haB )) * max(N2_unlim, N2_floor)
             endif
 
             if (present_slope_x) then
               Slope = slope_x(I,j,k)
-              slope2_Ratio_u(I,K) = Slope**2 * I_slope_max2
+              slope2_Ratio_u(I,j,K) = Slope**2 * I_slope_max2
             else
               ! Use the harmonic mean thicknesses to weight the horizontal gradients.
               ! These unnormalized weights have been rearranged to minimize divisions.
@@ -1040,10 +1165,10 @@ subroutine thickness_diffuse_full(h, e, Kh_u, Kh_v, tv, uhD, vhD, cg1, dt, G, GV
               mag_grad2 = (US%Z_to_L*drdx)**2 + drdz**2
               if (mag_grad2 > 0.0) then
                 Slope = drdx / sqrt(mag_grad2)
-                slope2_Ratio_u(I,K) = Slope**2 * I_slope_max2
+                slope2_Ratio_u(I,j,K) = Slope**2 * I_slope_max2
               else ! Just in case mag_grad2 = 0 ever.
                 Slope = 0.0
-                slope2_Ratio_u(I,K) = 1.0e20  ! Force the use of the safe streamfunction.
+                slope2_Ratio_u(I,j,K) = 1.0e20  ! Force the use of the safe streamfunction.
               endif
             endif
 
@@ -1051,7 +1176,7 @@ subroutine thickness_diffuse_full(h, e, Kh_u, Kh_v, tv, uhD, vhD, cg1, dt, G, GV
             ! that ignore density gradients along layers.
             Slope = (1.0 - int_slope_u(I,j,K)) * Slope + &
                     int_slope_u(I,j,K) * ((e(i+1,j,K)-e(i,j,K)) * G%IdxCu(I,j))
-            slope2_Ratio_u(I,K) = (1.0 - int_slope_u(I,j,K)) * slope2_Ratio_u(I,K)
+            slope2_Ratio_u(I,j,K) = (1.0 - int_slope_u(I,j,K)) * slope2_Ratio_u(I,j,K)
 
             if (CS%MEKE_src_slope_bug) then
               Slope_x_PE(I,j,k) = MIN(Slope, CS%slope_max)
@@ -1060,27 +1185,29 @@ subroutine thickness_diffuse_full(h, e, Kh_u, Kh_v, tv, uhD, vhD, cg1, dt, G, GV
               if (Slope > CS%slope_max) Slope_x_PE(I,j,k) = CS%slope_max
               if (Slope < -CS%slope_max) Slope_x_PE(I,j,k) = -CS%slope_max
             endif
+#ifndef __NVCOMPILER_OPENMP_GPU
             if (CS%id_slope_x > 0) CS%diagSlopeX(I,j,k) = Slope
+#endif
 
             ! Estimate the streamfunction at each interface [H L2 T-1 ~> m3 s-1 or kg s-1].
-            Sfn_unlim_u(I,K) = -(KH_u(I,j,K)*G%dy_Cu(I,j))*Slope
+            Sfn_unlim_u(I,j,K) = -(KH_u(I,j,K)*G%dy_Cu(I,j))*Slope
 
             ! Avoid moving dense water upslope from below the level of
             ! the bottom on the receiving side.
-            if (Sfn_unlim_u(I,K) > 0.0) then ! The flow below this interface is positive.
+            if (Sfn_unlim_u(I,j,K) > 0.0) then ! The flow below this interface is positive.
               if (e(i,j,K) < e(i+1,j,nz+1)) then
-                Sfn_unlim_u(I,K) = 0.0 ! This is not uhtot, because it may compensate for
+                Sfn_unlim_u(I,j,K) = 0.0 ! This is not uhtot, because it may compensate for
                                 ! deeper flow in very unusual cases.
               elseif (e(i+1,j,nz+1) > e(i,j,K+1)) then
                 ! Scale the transport with the fraction of the donor layer above
                 ! the bottom on the receiving side.
-                Sfn_unlim_u(I,K) = Sfn_unlim_u(I,K) * ((e(i,j,K) - e(i+1,j,nz+1)) / &
+                Sfn_unlim_u(I,j,K) = Sfn_unlim_u(I,j,K) * ((e(i,j,K) - e(i+1,j,nz+1)) / &
                                          ((e(i,j,K) - e(i,j,K+1)) + dz_neglect))
               endif
             else
-              if (e(i+1,j,K) < e(i,j,nz+1)) then ; Sfn_unlim_u(I,K) = 0.0
+              if (e(i+1,j,K) < e(i,j,nz+1)) then ; Sfn_unlim_u(I,j,K) = 0.0
               elseif (e(i,j,nz+1) > e(i+1,j,K+1)) then
-                Sfn_unlim_u(I,K) = Sfn_unlim_u(I,K) * ((e(i+1,j,K) - e(i,j,nz+1)) / &
+                Sfn_unlim_u(I,j,K) = Sfn_unlim_u(I,j,K) * ((e(i+1,j,K) - e(i,j,nz+1)) / &
                                        ((e(i+1,j,K) - e(i+1,j,K+1)) + dz_neglect))
               endif
             endif
@@ -1091,18 +1218,38 @@ subroutine thickness_diffuse_full(h, e, Kh_u, Kh_v, tv, uhD, vhD, cg1, dt, G, GV
             else
               Slope = (e(i+1,j,K)-e(i,j,K)) * G%IdxCu_OBCmask(I,j)
             endif
+#ifndef __NVCOMPILER_OPENMP_GPU
             if (CS%id_slope_x > 0) CS%diagSlopeX(I,j,k) = Slope
-            Sfn_unlim_u(I,K) = -(KH_u(I,j,K)*G%dy_Cu(I,j))*Slope
-            dzN2_u(I,K) = GV%g_prime(K)
+#endif
+            Sfn_unlim_u(I,j,K) = -(KH_u(I,j,K)*G%dy_Cu(I,j))*Slope
+            dzN2_u(I,j,K) = GV%g_prime(K)
           endif ! if (use_EOS)
         else ! if (k > nk_linear)
-          dzN2_u(I,K) = N2_floor * dz_neglect
-          Sfn_unlim_u(I,K) = 0.
+          dzN2_u(I,j,K) = N2_floor * dz_neglect
+          Sfn_unlim_u(I,j,K) = 0.
         endif ! if (k > nk_linear)
-        if (CS%id_sfn_unlim_x>0) diag_sfn_unlim_x(I,j,K) = Sfn_unlim_u(I,K)
+#ifndef __NVCOMPILER_OPENMP_GPU
+        if (CS%id_sfn_unlim_x>0) diag_sfn_unlim_x(I,j,K) = Sfn_unlim_u(I,j,K)
+#endif
       enddo ! i-loop
     enddo ! k-loop
+  enddo ! end of j-loop
 
+  ! Vertically accumulate the zonal transports (limited by the available mass) and, if requested, the
+  ! energy conversion.  uhtot has a downward vertical recurrence, so this loop is collapse(2) over
+  ! (j,I) with a serial K inside on the GPU.
+#ifdef __NVCOMPILER_OPENMP_GPU
+  !$omp target teams loop collapse(2) &
+  !$omp                          private(Rho_avg,Z_to_H,Sfn_safe,Sfn_est,Sfn_in_H,G_scale)
+#else
+  !$OMP parallel do default(none) shared(nz,is,ie,js,je,find_work,use_EOS,GV,G,US,tv,h,e,hn_2, &
+  !$OMP                                  nk_linear,h_frac,h_avail_rsum,h_avail,uhtot,uhD,Work_u, &
+  !$OMP                                  slope2_Ratio_u,Sfn_unlim_u,drdkDe_u,drdi_u,dzN2_u,cg1, &
+  !$OMP                                  dz,dz_neglect,CS,diag_sfn_x) &
+  !$OMP                          private(Rho_avg,Z_to_H,Sfn_safe,Sfn_est,Sfn_in_H,G_scale,dz_harm,c2_dz_u)
+#endif
+  do j=js,je
+#ifndef __NVCOMPILER_OPENMP_GPU
     if (CS%use_FGNV_streamfn) then
       do k=1,nz ; do I=is-1,ie ; if (G%OBCmaskCu(I,j)>0.) then
         dz_harm = max( dz_neglect, &
@@ -1114,20 +1261,24 @@ subroutine thickness_diffuse_full(h, e, Kh_u, Kh_v, tv, uhD, vhD, cg1, dt, G, GV
       do I=is-1,ie
         if (G%OBCmaskCu(I,j)>0.) then
           do K=2,nz
-            Sfn_unlim_u(I,K) = (1. + CS%FGNV_scale) * Sfn_unlim_u(I,K)
+            Sfn_unlim_u(I,j,K) = (1. + CS%FGNV_scale) * Sfn_unlim_u(I,j,K)
           enddo
-          call streamfn_solver(nz, c2_dz_u(I,:), dzN2_u(I,:), Sfn_unlim_u(I,:))
+          call streamfn_solver(nz, c2_dz_u(I,:), dzN2_u(I,j,:), Sfn_unlim_u(I,j,:))
         else
           do K=2,nz
-            Sfn_unlim_u(I,K) = 0.
+            Sfn_unlim_u(I,j,K) = 0.
           enddo
         endif
       enddo
     endif
+#endif
 
-    do K=nz,2,-1
-      do I=is-1,ie
+    do I=is-1,ie
+      do K=nz,2,-1
 
+#ifdef __NVCOMPILER_OPENMP_GPU
+        Z_to_H = GV%Z_to_H
+#else
         if (allocated(tv%SpV_avg) .and. (find_work .or. (k > nk_linear)) ) then
           Rho_avg = ( ((h(i,j,k) + h(i,j,k-1)) + (h(i+1,j,k) + h(i+1,j,k-1))) + 4.0*hn_2 ) / &
                 ( (((h(i,j,k)+hn_2) * tv%SpV_avg(i,j,k))   + ((h(i,j,k-1)+hn_2) * tv%SpV_avg(i,j,k-1))) + &
@@ -1137,6 +1288,7 @@ subroutine thickness_diffuse_full(h, e, Kh_u, Kh_v, tv, uhD, vhD, cg1, dt, G, GV
         else
           Z_to_H = GV%Z_to_H
         endif
+#endif
 
         if (k > nk_linear) then
           if (use_EOS) then
@@ -1149,9 +1301,9 @@ subroutine thickness_diffuse_full(h, e, Kh_u, Kh_v, tv, uhD, vhD, cg1, dt, G, GV
             endif
 
             ! Determine the actual streamfunction at each interface.
-            Sfn_est = (Z_to_H*Sfn_unlim_u(I,K) + slope2_Ratio_u(I,K)*Sfn_safe) / (1.0 + slope2_Ratio_u(I,K))
+            Sfn_est = (Z_to_H*Sfn_unlim_u(I,j,K) + slope2_Ratio_u(I,j,K)*Sfn_safe) / (1.0 + slope2_Ratio_u(I,j,K))
           else  ! When use_EOS is false, the layers are constant density.
-            Sfn_est = Z_to_H*Sfn_unlim_u(I,K)
+            Sfn_est = Z_to_H*Sfn_unlim_u(I,j,K)
           endif
 
           ! Make sure that there is enough mass above to allow the streamfunction
@@ -1163,7 +1315,9 @@ subroutine thickness_diffuse_full(h, e, Kh_u, Kh_v, tv, uhD, vhD, cg1, dt, G, GV
           uhD(I,j,k) = max(min((Sfn_in_H - uhtot(I,j)), h_avail(i,j,k)), &
                            -h_avail(i+1,j,k))
 
+#ifndef __NVCOMPILER_OPENMP_GPU
           if (CS%id_sfn_x>0) diag_sfn_x(I,j,K) = diag_sfn_x(I,j,K+1) + uhD(I,j,k)
+#endif
 !         sfn_x(I,j,K) = max(min(Sfn_in_h, uhtot(I,j)+h_avail(i,j,k)), &
 !                            uhtot(I,j)-h_avail(i+1,j,K))
 !         sfn_slope_x(I,j,K) = max(uhtot(I,j)-h_avail(i+1,j,k), &
@@ -1181,7 +1335,9 @@ subroutine thickness_diffuse_full(h, e, Kh_u, Kh_v, tv, uhD, vhD, cg1, dt, G, GV
             uhD(I,j,k) = -uhtot(I,j) * h_frac(i+1,j,k)
           endif
 
+#ifndef __NVCOMPILER_OPENMP_GPU
           if (CS%id_sfn_x>0) diag_sfn_x(I,j,K) = diag_sfn_x(I,j,K+1) + uhD(I,j,k)
+#endif
 !         if (sfn_slope_x(I,j,K+1) <= 0.0) then
 !           sfn_slope_x(I,j,K) = sfn_slope_x(I,j,K+1) * (1.0 - h_frac(i,j,k))
 !         else
@@ -1199,57 +1355,57 @@ subroutine thickness_diffuse_full(h, e, Kh_u, Kh_v, tv, uhD, vhD, cg1, dt, G, GV
           !   A second order centered estimate is used for the density transferred
           ! between water columns.
 
+#ifdef __NVCOMPILER_OPENMP_GPU
+          G_scale = GV%g_Earth * GV%H_to_Z
+#else
           if (allocated(tv%SpV_avg)) then
             G_scale = GV%H_to_RZ * GV%g_Earth / Rho_avg
           else
             G_scale = GV%g_Earth * GV%H_to_Z
           endif
+#endif
 
           Work_u(I,j) = Work_u(I,j) + G_scale * &
-            ( uhtot(I,j) * drdkDe_u(I,K) - &
-              (uhD(I,j,k) * drdi_u(I,k)) * 0.25 * &
+            ( uhtot(I,j) * drdkDe_u(I,j,K) - &
+              (uhD(I,j,k) * drdi_u(I,j,k)) * 0.25 * &
               ((e(i,j,K) + e(i,j,K+1)) + (e(i+1,j,K) + e(i+1,j,K+1))) )
         endif
 
-      enddo
-    enddo ! end of k-loop
+      enddo ! end of k-loop
+    enddo ! end of i-loop
   enddo ! end of j-loop
 
   ! Calculate the meridional fluxes and gradients.
 
+  ! As for the u-points: 3-D scratch (drdj_v, drdkDe_v, dzN2_v, slope2_Ratio_v, Sfn_unlim_v,
+  ! Slope_y_PE, hN2_y_PE) is shared so it survives into the flux j-loop; no vertical recurrence, so
+  ! this loop collapses over (J,K,i) on the GPU.
+#ifdef __NVCOMPILER_OPENMP_GPU
+  !$omp target teams loop collapse(3) &
+  !$omp                          private(drdjA,drdjB,drdkL,drdkR,pres_vs,T_vs,S_vs,dT_vs,dS_vs, &
+  !$omp                                  hg2A,hg2B,hg2L,hg2R,haA, &
+  !$omp                                  haB,haL,haR,dzaL,dzaR,wtA,wtB,wtL,wtR,drdz, &
+  !$omp                                  dzg2A,dzg2B,dzaA,dzaB,Z_to_H, &
+  !$omp                                  drdy,mag_grad2,Slope,N2_unlim,calc_derivatives)
+#else
   !$OMP parallel do default(none) shared(nz,is,ie,js,je,find_work,use_EOS,G,GV,US,pres,T,S,dz, &
   !$OMP                                  nk_linear,IsdB,tv,h,h_neglect,e,dz_neglect,dz_neglect2, &
-  !$OMP                                  h_neglect2,int_slope_v,KH_v,vhtot,h_frac,h_avail_rsum, &
-  !$OMP                                  I_slope_max2,vhD,h_avail,Work_v,CS,slope_y,cg1,hn_2,&
-  !$OMP                                  diag_sfn_y,diag_sfn_unlim_y,N2_floor,EOSdom_v,use_stanley,&
-  !$OMP                                  present_slope_y,G_rho0,Slope_y_PE,hN2_y_PE)  &
-  !$OMP                          private(drdjA,drdjB,drdkL,drdkR,pres_v,T_v,S_v,S_h,S_hr,    &
-  !$OMP                                  drho_dT_v,drho_dS_v,hg2A,hg2B,hg2L,hg2R,haA,G_scale, &
+  !$OMP                                  h_neglect2,int_slope_v,KH_v, &
+  !$OMP                                  I_slope_max2,CS,slope_y, &
+  !$OMP                                  diag_sfn_unlim_y,N2_floor,EOSdom_v,use_stanley,&
+  !$OMP                                  present_slope_y,G_rho0,Slope_y_PE,hN2_y_PE, &
+  !$OMP                                  drdj_v,drdkDe_v,dzN2_v,slope2_Ratio_v,Sfn_unlim_v, &
+  !$OMP                                  eos_form,eos_kg_m3_to_R,eos_C_to_degC,eos_S_to_ppt,eos_RL2_T2_to_Pa)  &
+  !$OMP                          private(drdjA,drdjB,drdkL,drdkR,pres_vs,T_vs,S_vs,dT_vs,dS_vs, &
+  !$OMP                                  S_h,S_hr,hg2A,hg2B,hg2L,hg2R,haA, &
   !$OMP                                  drho_dT_dT_h,drho_dT_dT_hr,scrap,pres_h,T_h,T_hr,   &
   !$OMP                                  haB,haL,haR,dzaL,dzaR,wtA,wtB,wtL,wtR,drdz,pres_hr, &
-  !$OMP                                  dzg2A,dzg2B,dzaA,dzaB,dz_harm,Z_to_H, &
-  !$OMP                                  drdy,mag_grad2,Slope,slope2_Ratio_v,dzN2_v,N2_unlim, &
-  !$OMP                                  Sfn_unlim_v,Rho_avg,drdj_v,drdkDe_v,c2_dz_v, &
-  !$OMP                                  Sfn_safe,Sfn_est,Sfn_in_h,calc_derivatives)
+  !$OMP                                  dzg2A,dzg2B,dzaA,dzaB,Z_to_H, &
+  !$OMP                                  drdy,mag_grad2,Slope,N2_unlim,calc_derivatives)
+#endif
   do J=js-1,je
     do K=nz,2,-1
-      if (find_work .and. .not.(use_EOS)) then
-        drdjA = 0.0 ; drdjB = 0.0
-        drdkL = GV%Rlay(k) - GV%Rlay(k-1) ; drdkR = drdkL
-      endif
-
-      calc_derivatives = use_EOS .and. (k >= nk_linear) .and. &
-         (find_work .or. .not. present_slope_y .or. CS%use_FGNV_streamfn .or. use_stanley)
-
-      if (calc_derivatives) then
-        do i=is,ie
-          pres_v(i) = 0.5*(pres(i,j,K) + pres(i,j+1,K))
-          T_v(i) = 0.25*((T(i,j,k) + T(i,j+1,k)) + (T(i,j,k-1) + T(i,j+1,k-1)))
-          S_v(i) = 0.25*((S(i,j,k) + S(i,j+1,k)) + (S(i,j,k-1) + S(i,j+1,k-1)))
-        enddo
-        call calculate_density_derivs(T_v, S_v, pres_v, drho_dT_v, drho_dS_v, &
-                                      tv%eqn_of_state, EOSdom_v)
-      endif
+#ifndef __NVCOMPILER_OPENMP_GPU
       if (use_stanley) then
         do i=is,ie
           pres_h(i) = pres(i,j,K)
@@ -1270,23 +1426,43 @@ subroutine thickness_diffuse_full(h, e, Kh_u, Kh_v, tv, uhD, vhD, cg1, dt, G, GV
                      scrap, scrap, drho_dT_dT_hr, scrap, scrap, &
                      tv%eqn_of_state, EOSdom_v)
       endif
+#endif
       do i=is,ie
+        calc_derivatives = use_EOS .and. (k >= nk_linear) .and. &
+           (find_work .or. .not. present_slope_y .or. CS%use_FGNV_streamfn .or. use_stanley)
+
+        if (find_work .and. .not.(use_EOS)) then
+          drdjA = 0.0 ; drdjB = 0.0
+          drdkL = GV%Rlay(k) - GV%Rlay(k-1) ; drdkR = drdkL
+        endif
+
+        ! Fill the interface T, S and pressure at the v-point and evaluate the density derivatives
+        ! through the device-callable elementwise EOS dispatcher (fused from the former EOS-fill loop).
         if (calc_derivatives) then
+          pres_vs = 0.5*(pres(i,j,K) + pres(i,j+1,K))
+          T_vs = 0.25*((T(i,j,k) + T(i,j+1,k)) + (T(i,j,k-1) + T(i,j+1,k-1)))
+          S_vs = 0.25*((S(i,j,k) + S(i,j+1,k)) + (S(i,j,k-1) + S(i,j+1,k-1)))
+          call calculate_density_derivs_elem_loc(eos_form, eos_C_to_degC*T_vs, eos_S_to_ppt*S_vs, &
+                     eos_RL2_T2_to_Pa*pres_vs, dT_vs, dS_vs)
+          dT_vs = (eos_kg_m3_to_R*eos_C_to_degC) * dT_vs
+          dS_vs = (eos_kg_m3_to_R*eos_S_to_ppt) * dS_vs
+
           ! Estimate the horizontal density gradients along layers.
-          drdjA = drho_dT_v(i) * (T(i,j+1,k-1)-T(i,j,k-1)) + &
-                  drho_dS_v(i) * (S(i,j+1,k-1)-S(i,j,k-1))
-          drdjB = drho_dT_v(i) * (T(i,j+1,k)-T(i,j,k)) + &
-                  drho_dS_v(i) * (S(i,j+1,k)-S(i,j,k))
+          drdjA = dT_vs * (T(i,j+1,k-1)-T(i,j,k-1)) + &
+                  dS_vs * (S(i,j+1,k-1)-S(i,j,k-1))
+          drdjB = dT_vs * (T(i,j+1,k)-T(i,j,k)) + &
+                  dS_vs * (S(i,j+1,k)-S(i,j,k))
 
           ! Estimate the vertical density gradients times the grid spacing.
-          drdkL = (drho_dT_v(i) * (T(i,j,k)-T(i,j,k-1)) + &
-                   drho_dS_v(i) * (S(i,j,k)-S(i,j,k-1)))
-          drdkR = (drho_dT_v(i) * (T(i,j+1,k)-T(i,j+1,k-1)) + &
-                   drho_dS_v(i) * (S(i,j+1,k)-S(i,j+1,k-1)))
-          drdkDe_v(i,K) =  (drdkR * e(i,j+1,K)) - (drdkL * e(i,j,K))
+          drdkL = (dT_vs * (T(i,j,k)-T(i,j,k-1)) + &
+                   dS_vs * (S(i,j,k)-S(i,j,k-1)))
+          drdkR = (dT_vs * (T(i,j+1,k)-T(i,j+1,k-1)) + &
+                   dS_vs * (S(i,j+1,k)-S(i,j+1,k-1)))
+          drdkDe_v(i,J,K) =  (drdkR * e(i,j+1,K)) - (drdkL * e(i,j,K))
         elseif (find_work) then ! This is used in pure stacked SW mode
-          drdkDe_v(i,K) =  (drdkR * e(i,j+1,K)) - (drdkL * e(i,j,K))
+          drdkDe_v(i,J,K) =  (drdkR * e(i,j+1,K)) - (drdkL * e(i,j,K))
         endif
+#ifndef __NVCOMPILER_OPENMP_GPU
         if (use_stanley) then
           ! Correction to the horizontal density gradient due to nonlinearity in
           ! the EOS rectifying SGS temperature anomalies
@@ -1295,8 +1471,9 @@ subroutine thickness_diffuse_full(h, e, Kh_u, Kh_v, tv, uhD, vhD, cg1, dt, G, GV
           drdjB = drdjB + 0.5 * ((drho_dT_dT_hr(i) * tv%varT(i,j+1,k)) - &
                                 (drho_dT_dT_h(i) * tv%varT(i,j,k)) )
         endif
+#endif
 
-        if (find_work) drdj_v(i,k) = drdjB
+        if (find_work) drdj_v(i,J,k) = drdjB
 
         if (k > nk_linear) then
           if (use_EOS) then
@@ -1341,13 +1518,13 @@ subroutine thickness_diffuse_full(h, e, Kh_u, Kh_v, tv, uhD, vhD, cg1, dt, G, GV
               dzaB = 0.5*(dz(i,j,k) + dz(i,j+1,k)) + dz_neglect
 
               ! dzN2_v is used with the FGNV streamfunction formulation
-              dzN2_v(i,K) = (0.5*( dzg2A / dzaA + dzg2B / dzaB )) * max(N2_unlim, N2_floor)
+              dzN2_v(i,J,K) = (0.5*( dzg2A / dzaA + dzg2B / dzaB )) * max(N2_unlim, N2_floor)
               if (find_work .and. CS%GM_src_alt) &
                 hN2_y_PE(i,J,k) = (0.5*( hg2A / haA + hg2B / haB )) * max(N2_unlim, N2_floor)
             endif
             if (present_slope_y) then
               Slope = slope_y(i,J,k)
-              slope2_Ratio_v(i,K) = Slope**2 * I_slope_max2
+              slope2_Ratio_v(i,J,K) = Slope**2 * I_slope_max2
             else
               ! Use the harmonic mean thicknesses to weight the horizontal gradients.
               ! These unnormalized weights have been rearranged to minimize divisions.
@@ -1361,10 +1538,10 @@ subroutine thickness_diffuse_full(h, e, Kh_u, Kh_v, tv, uhD, vhD, cg1, dt, G, GV
               mag_grad2 = (US%Z_to_L*drdy)**2 + drdz**2
               if (mag_grad2 > 0.0) then
                 Slope = drdy / sqrt(mag_grad2)
-                slope2_Ratio_v(i,K) = Slope**2 * I_slope_max2
+                slope2_Ratio_v(i,J,K) = Slope**2 * I_slope_max2
               else ! Just in case mag_grad2 = 0 ever.
                 Slope = 0.0
-                slope2_Ratio_v(i,K) = 1.0e20  ! Force the use of the safe streamfunction.
+                slope2_Ratio_v(i,J,K) = 1.0e20  ! Force the use of the safe streamfunction.
               endif
             endif
 
@@ -1372,7 +1549,7 @@ subroutine thickness_diffuse_full(h, e, Kh_u, Kh_v, tv, uhD, vhD, cg1, dt, G, GV
             ! that ignore density gradients along layers.
             Slope = (1.0 - int_slope_v(i,J,K)) * Slope + &
                     int_slope_v(i,J,K) * ((e(i,j+1,K)-e(i,j,K)) * G%IdyCv(i,J))
-            slope2_Ratio_v(i,K) = (1.0 - int_slope_v(i,J,K)) * slope2_Ratio_v(i,K)
+            slope2_Ratio_v(i,J,K) = (1.0 - int_slope_v(i,J,K)) * slope2_Ratio_v(i,J,K)
 
             if (CS%MEKE_src_slope_bug) then
               Slope_y_PE(i,J,k) = MIN(Slope, CS%slope_max)
@@ -1381,26 +1558,28 @@ subroutine thickness_diffuse_full(h, e, Kh_u, Kh_v, tv, uhD, vhD, cg1, dt, G, GV
               if (Slope > CS%slope_max) Slope_y_PE(i,J,k) = CS%slope_max
               if (Slope < -CS%slope_max) Slope_y_PE(i,J,k) = -CS%slope_max
             endif
+#ifndef __NVCOMPILER_OPENMP_GPU
             if (CS%id_slope_y > 0) CS%diagSlopeY(I,j,k) = Slope
+#endif
 
-            Sfn_unlim_v(i,K) = -((KH_v(i,J,K)*G%dx_Cv(i,J))*Slope)
+            Sfn_unlim_v(i,J,K) = -((KH_v(i,J,K)*G%dx_Cv(i,J))*Slope)
 
             ! Avoid moving dense water upslope from below the level of
             ! the bottom on the receiving side.
-            if (Sfn_unlim_v(i,K) > 0.0) then ! The flow below this interface is positive.
+            if (Sfn_unlim_v(i,J,K) > 0.0) then ! The flow below this interface is positive.
               if (e(i,j,K) < e(i,j+1,nz+1)) then
-                Sfn_unlim_v(i,K) = 0.0 ! This is not vhtot, because it may compensate for
+                Sfn_unlim_v(i,J,K) = 0.0 ! This is not vhtot, because it may compensate for
                                 ! deeper flow in very unusual cases.
               elseif (e(i,j+1,nz+1) > e(i,j,K+1)) then
                 ! Scale the transport with the fraction of the donor layer above
                 ! the bottom on the receiving side.
-                Sfn_unlim_v(i,K) = Sfn_unlim_v(i,K) * ((e(i,j,K) - e(i,j+1,nz+1)) / &
+                Sfn_unlim_v(i,J,K) = Sfn_unlim_v(i,J,K) * ((e(i,j,K) - e(i,j+1,nz+1)) / &
                                          ((e(i,j,K) - e(i,j,K+1)) + dz_neglect))
               endif
             else
-              if (e(i,j+1,K) < e(i,j,nz+1)) then ; Sfn_unlim_v(i,K) = 0.0
+              if (e(i,j+1,K) < e(i,j,nz+1)) then ; Sfn_unlim_v(i,J,K) = 0.0
               elseif (e(i,j,nz+1) > e(i,j+1,K+1)) then
-                Sfn_unlim_v(i,K) = Sfn_unlim_v(i,K) * ((e(i,j+1,K) - e(i,j,nz+1)) / &
+                Sfn_unlim_v(i,J,K) = Sfn_unlim_v(i,J,K) * ((e(i,j+1,K) - e(i,j,nz+1)) / &
                                        ((e(i,j+1,K) - e(i,j+1,K+1)) + dz_neglect))
               endif
             endif
@@ -1411,18 +1590,37 @@ subroutine thickness_diffuse_full(h, e, Kh_u, Kh_v, tv, uhD, vhD, cg1, dt, G, GV
             else
               Slope = (e(i,j+1,K)-e(i,j,K)) * G%IdyCv_OBCmask(i,J)
             endif
+#ifndef __NVCOMPILER_OPENMP_GPU
             if (CS%id_slope_y > 0) CS%diagSlopeY(I,j,k) = Slope
-            Sfn_unlim_v(i,K) = -((KH_v(i,J,K)*G%dx_Cv(i,J))*Slope)
-            dzN2_v(i,K) = GV%g_prime(K)
+#endif
+            Sfn_unlim_v(i,J,K) = -((KH_v(i,J,K)*G%dx_Cv(i,J))*Slope)
+            dzN2_v(i,J,K) = GV%g_prime(K)
           endif ! if (use_EOS)
         else ! if (k > nk_linear)
-          dzN2_v(i,K) = N2_floor * dz_neglect
-          Sfn_unlim_v(i,K) = 0.
+          dzN2_v(i,J,K) = N2_floor * dz_neglect
+          Sfn_unlim_v(i,J,K) = 0.
         endif ! if (k > nk_linear)
-        if (CS%id_sfn_unlim_y>0) diag_sfn_unlim_y(i,J,K) = Sfn_unlim_v(i,K)
+#ifndef __NVCOMPILER_OPENMP_GPU
+        if (CS%id_sfn_unlim_y>0) diag_sfn_unlim_y(i,J,K) = Sfn_unlim_v(i,J,K)
+#endif
       enddo ! i-loop
     enddo ! k-loop
+  enddo ! end of j-loop
 
+  ! Vertically accumulate the meridional transports (limited by available mass) and, if requested,
+  ! the energy conversion.  vhtot recurs downward, so collapse(2) over (J,i) + serial K on the GPU.
+#ifdef __NVCOMPILER_OPENMP_GPU
+  !$omp target teams loop collapse(2) &
+  !$omp                          private(Rho_avg,Z_to_H,Sfn_safe,Sfn_est,Sfn_in_H,G_scale)
+#else
+  !$OMP parallel do default(none) shared(nz,is,ie,js,je,find_work,use_EOS,GV,G,US,tv,h,e,hn_2, &
+  !$OMP                                  nk_linear,h_frac,h_avail_rsum,h_avail,vhtot,vhD,Work_v, &
+  !$OMP                                  slope2_Ratio_v,Sfn_unlim_v,drdkDe_v,drdj_v,dzN2_v,cg1, &
+  !$OMP                                  dz,dz_neglect,CS,diag_sfn_y) &
+  !$OMP                          private(Rho_avg,Z_to_H,Sfn_safe,Sfn_est,Sfn_in_H,G_scale,dz_harm,c2_dz_v)
+#endif
+  do J=js-1,je
+#ifndef __NVCOMPILER_OPENMP_GPU
     if (CS%use_FGNV_streamfn) then
       do k=1,nz ; do i=is,ie ; if (G%OBCmaskCv(i,J)>0.) then
         dz_harm = max( dz_neglect, &
@@ -1434,19 +1632,23 @@ subroutine thickness_diffuse_full(h, e, Kh_u, Kh_v, tv, uhD, vhD, cg1, dt, G, GV
       do i=is,ie
         if (G%OBCmaskCv(i,J)>0.) then
           do K=2,nz
-            Sfn_unlim_v(i,K) = (1. + CS%FGNV_scale) * Sfn_unlim_v(i,K)
+            Sfn_unlim_v(i,J,K) = (1. + CS%FGNV_scale) * Sfn_unlim_v(i,J,K)
           enddo
-          call streamfn_solver(nz, c2_dz_v(i,:), dzN2_v(i,:), Sfn_unlim_v(i,:))
+          call streamfn_solver(nz, c2_dz_v(i,:), dzN2_v(i,J,:), Sfn_unlim_v(i,J,:))
         else
           do K=2,nz
-            Sfn_unlim_v(i,K) = 0.
+            Sfn_unlim_v(i,J,K) = 0.
           enddo
         endif
       enddo
     endif
+#endif
 
-    do K=nz,2,-1
-      do i=is,ie
+    do i=is,ie
+      do K=nz,2,-1
+#ifdef __NVCOMPILER_OPENMP_GPU
+        Z_to_H = GV%Z_to_H
+#else
         if (allocated(tv%SpV_avg) .and. (find_work .or. (k > nk_linear)) ) then
           Rho_avg = ( ((h(i,j,k) + h(i,j,k-1)) + (h(i,j+1,k) + h(i,j+1,k-1))) + 4.0*hn_2 ) / &
               ( (((h(i,j,k)+hn_2) * tv%SpV_avg(i,j,k))   + ((h(i,j,k-1)+hn_2) * tv%SpV_avg(i,j,k-1))) + &
@@ -1456,6 +1658,7 @@ subroutine thickness_diffuse_full(h, e, Kh_u, Kh_v, tv, uhD, vhD, cg1, dt, G, GV
         else
           Z_to_H = GV%Z_to_H
         endif
+#endif
 
         if (k > nk_linear) then
           if (use_EOS) then
@@ -1468,9 +1671,9 @@ subroutine thickness_diffuse_full(h, e, Kh_u, Kh_v, tv, uhD, vhD, cg1, dt, G, GV
             endif
 
             ! Find the actual streamfunction at each interface.
-            Sfn_est = (Z_to_H*Sfn_unlim_v(i,K) + slope2_Ratio_v(i,K)*Sfn_safe) / (1.0 + slope2_Ratio_v(i,K))
+            Sfn_est = (Z_to_H*Sfn_unlim_v(i,J,K) + slope2_Ratio_v(i,J,K)*Sfn_safe) / (1.0 + slope2_Ratio_v(i,J,K))
           else  ! When use_EOS is false, the layers are constant density.
-            Sfn_est = Z_to_H*Sfn_unlim_v(i,K)
+            Sfn_est = Z_to_H*Sfn_unlim_v(i,J,K)
           endif
 
           ! Make sure that there is enough mass above to allow the streamfunction
@@ -1481,7 +1684,9 @@ subroutine thickness_diffuse_full(h, e, Kh_u, Kh_v, tv, uhD, vhD, cg1, dt, G, GV
           ! neighboring grid cells.
           vhD(i,J,k) = max(min((Sfn_in_H - vhtot(i,J)), h_avail(i,j,k)), -h_avail(i,j+1,k))
 
+#ifndef __NVCOMPILER_OPENMP_GPU
           if (CS%id_sfn_y>0) diag_sfn_y(i,J,K) = diag_sfn_y(i,J,K+1) + vhD(i,J,k)
+#endif
 !         sfn_y(i,J,K) = max(min(Sfn_in_h, vhtot(i,J)+h_avail(i,j,k)), &
 !                            vhtot(i,J)-h_avail(i,j+1,k))
 !         sfn_slope_y(i,J,K) = max(vhtot(i,J)-h_avail(i,j+1,k), &
@@ -1499,7 +1704,9 @@ subroutine thickness_diffuse_full(h, e, Kh_u, Kh_v, tv, uhD, vhD, cg1, dt, G, GV
             vhD(i,J,k) = -vhtot(i,J) * h_frac(i,j+1,k)
           endif
 
+#ifndef __NVCOMPILER_OPENMP_GPU
           if (CS%id_sfn_y>0) diag_sfn_y(i,J,K) = diag_sfn_y(i,J,K+1) + vhD(i,J,k)
+#endif
 !         if (sfn_slope_y(i,J,K+1) <= 0.0) then
 !           sfn_slope_y(i,J,K) = sfn_slope_y(i,J,K+1) * (1.0 - h_frac(i,j,k))
 !         else
@@ -1516,114 +1723,134 @@ subroutine thickness_diffuse_full(h, e, Kh_u, Kh_v, tv, uhD, vhD, cg1, dt, G, GV
           !   A second order centered estimate is used for the density transferred
           ! between water columns.
 
+#ifdef __NVCOMPILER_OPENMP_GPU
+          G_scale = GV%g_Earth * GV%H_to_Z
+#else
           if (allocated(tv%SpV_avg)) then
             G_scale = GV%H_to_RZ * GV%g_Earth / Rho_avg
           else
             G_scale = GV%g_Earth * GV%H_to_Z
           endif
+#endif
 
           Work_v(i,J) = Work_v(i,J) + G_scale * &
-            ( vhtot(i,J) * drdkDe_v(i,K) - &
-             (vhD(i,J,k) * drdj_v(i,k)) * 0.25 * &
+            ( vhtot(i,J) * drdkDe_v(i,J,K) - &
+             (vhD(i,J,k) * drdj_v(i,J,k)) * 0.25 * &
              ((e(i,j,K) + e(i,j,K+1)) + (e(i,j+1,K) + e(i,j+1,K+1))) )
         endif
 
-      enddo
-    enddo ! end of k-loop
+      enddo ! end of k-loop
+    enddo ! end of i-loop
   enddo ! end of j-loop
 
   ! In layer 1, enforce the boundary conditions that Sfn(z=0) = 0.0
   if (.not.find_work .or. .not.(use_EOS)) then
+#ifdef __NVCOMPILER_OPENMP_GPU
+    !$omp target teams loop collapse(2)
+#endif
     do j=js,je ; do I=is-1,ie ; uhD(I,j,1) = -uhtot(I,j) ; enddo ; enddo
+#ifdef __NVCOMPILER_OPENMP_GPU
+    !$omp target teams loop collapse(2)
+#endif
     do J=js-1,je ; do i=is,ie ; vhD(i,J,1) = -vhtot(i,J) ; enddo ; enddo
   else
-    EOSdom_u(1) = (is-1) - (G%IsdB-1) ; EOSdom_u(2) = ie - (G%IsdB-1)
-    !$OMP parallel do default(shared) private(pres_u,T_u,S_u,drho_dT_u,drho_dS_u,drdiB,G_scale)
-    do j=js,je
-      if (use_EOS) then
-        do I=is-1,ie
-          pres_u(I) = 0.5*(pres(i,j,1) + pres(i+1,j,1))
-          T_u(I) = 0.5*(T(i,j,1) + T(i+1,j,1))
-          S_u(I) = 0.5*(S(i,j,1) + S(i+1,j,1))
-        enddo
-        call calculate_density_derivs(T_u, S_u, pres_u, drho_dT_u, drho_dS_u, &
-                                      tv%eqn_of_state, EOSdom_u )
+    ! In this branch use_EOS is necessarily true.  The density derivatives use the device-callable
+    ! elementwise dispatcher (v-points too), fused into the work loop and scalarized.
+#ifdef __NVCOMPILER_OPENMP_GPU
+    !$omp target teams loop collapse(2) private(pres_us,T_us,S_us,dT_us,dS_us,drdiB,G_scale)
+#else
+    !$OMP parallel do default(shared) private(pres_us,T_us,S_us,dT_us,dS_us,drdiB,G_scale)
+#endif
+    do j=js,je ; do I=is-1,ie
+      pres_us = 0.5*(pres(i,j,1) + pres(i+1,j,1))
+      T_us = 0.5*(T(i,j,1) + T(i+1,j,1))
+      S_us = 0.5*(S(i,j,1) + S(i+1,j,1))
+      call calculate_density_derivs_elem_loc(eos_form, eos_C_to_degC*T_us, eos_S_to_ppt*S_us, &
+                 eos_RL2_T2_to_Pa*pres_us, dT_us, dS_us)
+      dT_us = (eos_kg_m3_to_R*eos_C_to_degC) * dT_us
+      dS_us = (eos_kg_m3_to_R*eos_S_to_ppt) * dS_us
+
+      uhD(I,j,1) = -uhtot(I,j)
+
+      G_scale = GV%g_Earth * GV%H_to_Z
+      drdiB = dT_us * (T(i+1,j,1)-T(i,j,1)) + dS_us * (S(i+1,j,1)-S(i,j,1))
+#ifndef __NVCOMPILER_OPENMP_GPU
+      if (allocated(tv%SpV_avg)) then
+        G_scale = GV%H_to_RZ * GV%g_Earth * &
+            ( ( ((h(i,j,1)+hn_2) * tv%SpV_avg(i,j,1)) + ((h(i+1,j,1)+hn_2) * tv%SpV_avg(i+1,j,1)) ) / &
+              ( (h(i,j,1) + h(i+1,j,1)) + 2.0*hn_2 ) )
       endif
-      do I=is-1,ie
-        uhD(I,j,1) = -uhtot(I,j)
-
-        G_scale = GV%g_Earth * GV%H_to_Z
-        if (use_EOS) then
-          drdiB = drho_dT_u(I) * (T(i+1,j,1)-T(i,j,1)) + &
-                  drho_dS_u(I) * (S(i+1,j,1)-S(i,j,1))
-          if (allocated(tv%SpV_avg)) then
-            G_scale = GV%H_to_RZ * GV%g_Earth * &
-                ( ( ((h(i,j,1)+hn_2) * tv%SpV_avg(i,j,1)) + ((h(i+1,j,1)+hn_2) * tv%SpV_avg(i+1,j,1)) ) / &
-                  ( (h(i,j,1) + h(i+1,j,1)) + 2.0*hn_2 ) )
-          endif
-        endif
-        if (CS%use_GM_work_bug) then
-          Work_u(I,j) = Work_u(I,j) + G_scale * &
-              ( (uhD(I,j,1) * drdiB) * 0.25 * &
-                ((e(i,j,1) + e(i,j,2)) + (e(i+1,j,1) + e(i+1,j,2))) )
-        else
-          Work_u(I,j) = Work_u(I,j) - G_scale * &
-              ( (uhD(I,j,1) * drdiB) * 0.25 * &
-                ((e(i,j,1) + e(i,j,2)) + (e(i+1,j,1) + e(i+1,j,2))) )
-        endif
-      enddo
-    enddo
-
-    EOSdom_v(:) = EOS_domain(G%HI)
-    !$OMP parallel do default(shared) private(pres_v,T_v,S_v,drho_dT_v,drho_dS_v,drdjB,G_scale)
-    do J=js-1,je
-      if (use_EOS) then
-        do i=is,ie
-          pres_v(i) = 0.5*(pres(i,j,1) + pres(i,j+1,1))
-          T_v(i) = 0.5*(T(i,j,1) + T(i,j+1,1))
-          S_v(i) = 0.5*(S(i,j,1) + S(i,j+1,1))
-        enddo
-        call calculate_density_derivs(T_v, S_v, pres_v, drho_dT_v, drho_dS_v, &
-                                      tv%eqn_of_state, EOSdom_v)
+#endif
+      if (CS%use_GM_work_bug) then
+        Work_u(I,j) = Work_u(I,j) + G_scale * &
+            ( (uhD(I,j,1) * drdiB) * 0.25 * &
+              ((e(i,j,1) + e(i,j,2)) + (e(i+1,j,1) + e(i+1,j,2))) )
+      else
+        Work_u(I,j) = Work_u(I,j) - G_scale * &
+            ( (uhD(I,j,1) * drdiB) * 0.25 * &
+              ((e(i,j,1) + e(i,j,2)) + (e(i+1,j,1) + e(i+1,j,2))) )
       endif
-      do i=is,ie
-        vhD(i,J,1) = -vhtot(i,J)
+    enddo ; enddo
 
-        G_scale = GV%g_Earth * GV%H_to_Z
-        if (use_EOS) then
-          drdjB = drho_dT_v(i) * (T(i,j+1,1)-T(i,j,1)) + &
-                  drho_dS_v(i) * (S(i,j+1,1)-S(i,j,1))
-          if (allocated(tv%SpV_avg)) then
-            G_scale = GV%H_to_RZ * GV%g_Earth * &
-                ( ( ((h(i,j,1)+hn_2) * tv%SpV_avg(i,j,1)) + ((h(i,j+1,1)+hn_2) * tv%SpV_avg(i,j+1,1)) ) / &
-                  ( (h(i,j,1) + h(i,j+1,1)) + 2.0*hn_2 ) )
-          endif
-        endif
-        Work_v(i,J) = Work_v(i,J) - G_scale * &
-            ( (vhD(i,J,1) * drdjB) * 0.25 * &
-              ((e(i,j,1) + e(i,j,2)) + (e(i,j+1,1) + e(i,j+1,2))) )
-      enddo
-    enddo
+#ifdef __NVCOMPILER_OPENMP_GPU
+    !$omp target teams loop collapse(2) private(pres_vs,T_vs,S_vs,dT_vs,dS_vs,drdjB,G_scale)
+#else
+    !$OMP parallel do default(shared) private(pres_vs,T_vs,S_vs,dT_vs,dS_vs,drdjB,G_scale)
+#endif
+    do J=js-1,je ; do i=is,ie
+      pres_vs = 0.5*(pres(i,j,1) + pres(i,j+1,1))
+      T_vs = 0.5*(T(i,j,1) + T(i,j+1,1))
+      S_vs = 0.5*(S(i,j,1) + S(i,j+1,1))
+      call calculate_density_derivs_elem_loc(eos_form, eos_C_to_degC*T_vs, eos_S_to_ppt*S_vs, &
+                 eos_RL2_T2_to_Pa*pres_vs, dT_vs, dS_vs)
+      dT_vs = (eos_kg_m3_to_R*eos_C_to_degC) * dT_vs
+      dS_vs = (eos_kg_m3_to_R*eos_S_to_ppt) * dS_vs
+
+      vhD(i,J,1) = -vhtot(i,J)
+
+      G_scale = GV%g_Earth * GV%H_to_Z
+      drdjB = dT_vs * (T(i,j+1,1)-T(i,j,1)) + dS_vs * (S(i,j+1,1)-S(i,j,1))
+#ifndef __NVCOMPILER_OPENMP_GPU
+      if (allocated(tv%SpV_avg)) then
+        G_scale = GV%H_to_RZ * GV%g_Earth * &
+            ( ( ((h(i,j,1)+hn_2) * tv%SpV_avg(i,j,1)) + ((h(i,j+1,1)+hn_2) * tv%SpV_avg(i,j+1,1)) ) / &
+              ( (h(i,j,1) + h(i,j+1,1)) + 2.0*hn_2 ) )
+      endif
+#endif
+      Work_v(i,J) = Work_v(i,J) - G_scale * &
+          ( (vhD(i,J,1) * drdjB) * 0.25 * &
+            ((e(i,j,1) + e(i,j,2)) + (e(i,j+1,1) + e(i,j+1,2))) )
+    enddo ; enddo
   endif
 
-  if (find_work) then ; do j=js,je ; do i=is,ie
-    ! Note that the units of Work_v and Work_u are [R Z L4 T-3 ~> W], while Work_h is in [R Z L2 T-3 ~> W m-2].
-    Work_h = 0.5 * G%IareaT(i,j) * &
-      ((Work_u(I-1,j) + Work_u(I,j)) + (Work_v(i,J-1) + Work_v(i,J)))
-    if (allocated(CS%GMwork)) CS%GMwork(i,j) = Work_h
-    if (.not. CS%GM_src_alt) then ; if (allocated(MEKE%GM_src)) then
-      MEKE%GM_src(i,j) = MEKE%GM_src(i,j) + Work_h
-    endif ; endif
-    if (skeb_use_gm) then
-      skeb_gm_work(i,j)   = STOCH%skeb_gm_coef * Work_h
-      skeb_ebt_norm2(i,j) = 0.0
-      do k=1,nz
-        skeb_ebt_norm2(i,j) = skeb_ebt_norm2(i,j) + h(i,j,k) * VarMix%ebt_struct(i,j,k)**2
-      enddo
-      skeb_ebt_norm2(i,j) = GV%H_to_RZ * (skeb_ebt_norm2(i,j) + h_neglect)
-    endif
-  enddo ; enddo ; endif
+  ! Assemble the GM work / energy source (writing the hoisted local arrays, not the pointer/
+  ! allocatable components).
+  if (find_work) then
+#ifdef __NVCOMPILER_OPENMP_GPU
+    !$omp target teams loop collapse(2) private(Work_h)
+#endif
+    do j=js,je ; do i=is,ie
+      ! Note that the units of Work_v and Work_u are [R Z L4 T-3 ~> W], while Work_h is in [R Z L2 T-3 ~> W m-2].
+      Work_h = 0.5 * G%IareaT(i,j) * &
+        ((Work_u(I-1,j) + Work_u(I,j)) + (Work_v(i,J-1) + Work_v(i,J)))
+      if (have_GMwork) GMwork_loc(i,j) = Work_h
+      if (.not. CS%GM_src_alt) then ; if (have_GM_src) then
+        GM_src_loc(i,j) = GM_src_loc(i,j) + Work_h
+      endif ; endif
+#ifndef __NVCOMPILER_OPENMP_GPU
+      if (skeb_use_gm) then
+        skeb_gm_work(i,j)   = STOCH%skeb_gm_coef * Work_h
+        skeb_ebt_norm2(i,j) = 0.0
+        do k=1,nz
+          skeb_ebt_norm2(i,j) = skeb_ebt_norm2(i,j) + h(i,j,k) * VarMix%ebt_struct(i,j,k)**2
+        enddo
+        skeb_ebt_norm2(i,j) = GV%H_to_RZ * (skeb_ebt_norm2(i,j) + h_neglect)
+      endif
+#endif
+    enddo ; enddo
+  endif
 
+#ifndef __NVCOMPILER_OPENMP_GPU
   if (skeb_use_gm) then
     ! This block spreads the GM work down through the column using the ebt vertical structure, squared.
     ! Note the sign convention.
@@ -1632,37 +1859,70 @@ subroutine thickness_diffuse_full(h, e, Kh_u, Kh_v, tv, uhD, vhD, cg1, dt, G, GV
                                VarMix%ebt_struct(i,j,k)**2 / skeb_ebt_norm2(i,j)
     enddo ; enddo ; enddo
   endif
+#endif
 
-  if (find_work .and. CS%GM_src_alt) then ; if (allocated(MEKE%GM_src)) then
+  if (find_work .and. CS%GM_src_alt) then ; if (have_GM_src) then
+    ! Accumulate the S^2 N^2 kappa energy release down each column (a serial-K sum into GM_src_loc).
     if (CS%MEKE_src_answer_date >= 20240601) then
+#ifdef __NVCOMPILER_OPENMP_GPU
+      !$omp target teams loop collapse(2) private(PE_release_h)
+#endif
       do j=js,je ; do i=is,ie ; do k=nz,1,-1
         PE_release_h = -0.25 * GV%H_to_RZ * &
                          ( ((KH_u(I,j,k)*(Slope_x_PE(I,j,k)**2) * hN2_x_PE(I,j,k)) + &
                             (Kh_u(I-1,j,k)*(Slope_x_PE(I-1,j,k)**2) * hN2_x_PE(I-1,j,k))) + &
                            ((Kh_v(i,J,k)*(Slope_y_PE(i,J,k)**2) * hN2_y_PE(i,J,k)) + &
                             (Kh_v(i,J-1,k)*(Slope_y_PE(i,J-1,k)**2) * hN2_y_PE(i,J-1,k))) )
-        MEKE%GM_src(i,j) = MEKE%GM_src(i,j) + PE_release_h
+        GM_src_loc(i,j) = GM_src_loc(i,j) + PE_release_h
       enddo ; enddo ; enddo
     else
+#ifdef __NVCOMPILER_OPENMP_GPU
+      !$omp target teams loop collapse(2) private(PE_release_h)
+#endif
       do j=js,je ; do i=is,ie ; do k=nz,1,-1
         PE_release_h = -0.25 * GV%H_to_RZ * &
                            ((KH_u(I,j,k)*(Slope_x_PE(I,j,k)**2) * hN2_x_PE(I,j,k)) + &
                             (Kh_u(I-1,j,k)*(Slope_x_PE(I-1,j,k)**2) * hN2_x_PE(I-1,j,k)) + &
                             (Kh_v(i,J,k)*(Slope_y_PE(i,J,k)**2) * hN2_y_PE(i,J,k)) + &
                             (Kh_v(i,J-1,k)*(Slope_y_PE(i,J-1,k)**2) * hN2_y_PE(i,J-1,k)))
-        MEKE%GM_src(i,j) = MEKE%GM_src(i,j) + PE_release_h
+        GM_src_loc(i,j) = GM_src_loc(i,j) + PE_release_h
       enddo ; enddo ; enddo
     endif
 
+#ifndef __NVCOMPILER_OPENMP_GPU
     if (CS%debug) then
-      call hchksum(MEKE%GM_src, 'MEKE%GM_src', G%HI, unscale=US%RZ3_T3_to_W_m2*US%L_to_Z**2)
+      call hchksum(GM_src_loc, 'MEKE%GM_src', G%HI, unscale=US%RZ3_T3_to_W_m2*US%L_to_Z**2)
       call uvchksum("KH_[uv]", Kh_u, Kh_v, G%HI, unscale=US%L_to_m**2*US%s_to_T, &
                     scalar_pair=.true.)
       call uvchksum("Slope_[xy]_PE", Slope_x_PE, Slope_y_PE, G%HI, unscale=US%Z_to_L)
       call uvchksum("hN2_[xy]_PE", hN2_x_PE, hN2_y_PE, G%HI, unscale=GV%H_to_mks*US%L_to_Z**2*US%s_to_T**2, &
                     scalar_pair=.true.)
     endif
+#endif
   endif ; endif
+
+  ! ------------------------------------------------------------------------------------------
+  ! Close the device data region: copy the outputs back and release every mapping (release, not
+  ! delete — a per-call delete forces the refcount to zero and would destroy any outer/persistent
+  ! mapping of the same storage; KNOWLEDGE §8), then copy the hoisted GM work back to the host.
+  ! ------------------------------------------------------------------------------------------
+#ifdef __NVCOMPILER_OPENMP_GPU
+  !$omp target exit data map(from: uhD, vhD, GM_src_loc, GMwork_loc) &
+  !$omp                   map(release: e, dz, T, S, Kh_u, Kh_v, int_slope_u, int_slope_v, CS, p_surf_loc, &
+  !$omp                          Slope_x_PE, Slope_y_PE, hN2_x_PE, hN2_y_PE, pres, h_avail, h_frac, &
+  !$omp                          h_avail_rsum, uhtot, vhtot, Work_u, Work_v, drdi_u, drdj_v, &
+  !$omp                          drdkDe_u, drdkDe_v, dzN2_u, dzN2_v, Sfn_unlim_u, Sfn_unlim_v, &
+  !$omp                          slope2_Ratio_u, slope2_Ratio_v) &
+  !$omp                   map(release: h)
+  if (present_slope_x) then
+    !$omp target exit data map(release: slope_x)
+  endif
+  if (present_slope_y) then
+    !$omp target exit data map(release: slope_y)
+  endif
+#endif
+  if (have_GM_src) then ; do j=js,je ; do i=is,ie ; MEKE%GM_src(i,j) = GM_src_loc(i,j) ; enddo ; enddo ; endif
+  if (have_GMwork) then ; do j=js,je ; do i=is,ie ; CS%GMwork(i,j) = GMwork_loc(i,j) ; enddo ; enddo ; endif
 
   if (CS%id_slope_x > 0) call post_data(CS%id_slope_x, CS%diagSlopeX, CS%diag)
   if (CS%id_slope_y > 0) call post_data(CS%id_slope_y, CS%diagSlopeY, CS%diag)

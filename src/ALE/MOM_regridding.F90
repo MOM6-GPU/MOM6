@@ -32,6 +32,7 @@ use regrid_interp, only : set_interp_scheme, set_interp_extrap, set_interp_answe
 
 use coord_zlike,  only : zlike_CS
 use coord_zlike,  only : init_coord_zlike, set_zlike_params, build_zstar_column, end_coord_zlike
+use coord_zlike,  only : build_zstar_column_loc, get_zlike_coord_res
 use coord_sigma,  only : sigma_CS
 use coord_sigma,  only : init_coord_sigma, set_sigma_params, build_sigma_column, end_coord_sigma
 use coord_rho,    only : init_coord_rho, rho_CS, set_rho_params, build_rho_column, end_coord_rho
@@ -47,6 +48,13 @@ use MOM_hybgen_regrid, only : write_Hybgen_coord_file
 implicit none ; private
 
 #include <MOM_memory.h>
+
+!> On GPU builds this fixes the per-column private scratch in the regrid column loops
+!! (build_zstar_grid's zNew/zOld) to a compile-time-constant size, so each device thread gets
+!! stack (local memory) arrays instead of runtime-sized device-heap allocations, which nvfortran
+!! cannot place in local memory (NVFORTRAN-W-0155).  Checked against CS%nk / GV%ke in
+!! build_zstar_grid.  Unused in CPU builds, where the declarations keep their exact sizes.
+integer, parameter :: GPU_nk_max = 128
 
 ! A note on unit descriptions in comments: MOM6 uses units that can be rescaled for dimensional
 ! consistency testing. These are noted in comments with units like Z, H, L, and T, along with
@@ -1465,6 +1473,28 @@ subroutine filtered_grid_motion( CS, nk, z_old, z_new, dz_g )
   real, dimension(CS%nk+1), intent(in)    :: z_new !< New grid position before filtering [H ~> m or kg m-2]
   real, dimension(CS%nk+1), intent(inout) :: dz_g  !< Change in interface positions including
                                                    !! the effects of filtering [H ~> m or kg m-2]
+
+  call filtered_grid_motion_loc( CS%nk, CS%depth_of_time_filter_shallow, CS%depth_of_time_filter_deep, &
+                                 CS%old_grid_weight, nk, z_old, z_new, dz_g )
+
+end subroutine filtered_grid_motion
+
+!> Element-wise, control-structure-free form of filtered_grid_motion: it takes the (host-resolved)
+!! target level count and filter parameters explicitly so it can be made device-callable, avoiding a
+!! dereference of regridding_CS inside a device region.  The arithmetic is verbatim.
+subroutine filtered_grid_motion_loc( nk_tgt, filt_shallow, filt_deep, old_grid_wt, nk, z_old, z_new, dz_g )
+  integer,                   intent(in)    :: nk_tgt !< Number of cells in the target grid (was CS%nk)
+  real,                      intent(in)    :: filt_shallow !< Depth at which the shallow filter
+                                                    !! timescale applies [H ~> m or kg m-2] (was CS%depth_of_time_filter_shallow)
+  real,                      intent(in)    :: filt_deep !< Depth at which the deep filter timescale
+                                                    !! applies [H ~> m or kg m-2] (was CS%depth_of_time_filter_deep)
+  real,                      intent(in)    :: old_grid_wt !< Weight given to the old grid when
+                                                    !! filtering [nondim] (was CS%old_grid_weight)
+  integer,                   intent(in)    :: nk !< Number of cells in source grid
+  real, dimension(nk+1),     intent(in)    :: z_old !< Old grid position [H ~> m or kg m-2]
+  real, dimension(nk_tgt+1), intent(in)    :: z_new !< New grid position before filtering [H ~> m or kg m-2]
+  real, dimension(nk_tgt+1), intent(inout) :: dz_g  !< Change in interface positions including
+                                                   !! the effects of filtering [H ~> m or kg m-2]
   ! Local variables
   real :: sgn     ! The sign convention for downward [nondim].
   real :: dz_tgt  ! The target grid movement of the unfiltered grid [H ~> m or kg m-2]
@@ -1486,24 +1516,37 @@ subroutine filtered_grid_motion( CS, nk, z_old, z_new, dz_g )
   real :: Int_zd  ! A depth integral of the weights in [H ~> m or kg m-2]
   real :: dInt_zs_zd ! The depth integral of the weights between the deep and shallow depths in [H ~> m or kg m-2]
 ! For debugging:
+#ifndef __NVCOMPILER_OPENMP_GPU
   real, dimension(nk+1) :: z_act ! The final grid positions after the filtered movement [H ~> m or kg m-2]
 !  real, dimension(nk+1) :: ddz_g_s, ddz_g_d
   logical :: debug = .false.
+#endif
+  logical :: massless ! True for a massless column, in which case no grid motion is applied.
   integer :: k
+  !$omp declare target
 
-  if ((z_old(nk+1) - z_old(1)) * (z_new(CS%nk+1) - z_new(1)) < 0.0) then
+  ! GPU port: the massless-column early return is expressed as an if-guard (device loops cannot
+  ! return early), and the "should never happen" sign/tangling MOM_error asserts are compiled out
+  ! of device builds (kept on the host).
+  massless = .false. ; sgn = 1.0
+  if ((z_old(nk+1) - z_old(1)) * (z_new(nk_tgt+1) - z_new(1)) < 0.0) then
+#ifndef __NVCOMPILER_OPENMP_GPU
     call MOM_error(FATAL, "filtered_grid_motion: z_old and z_new use different sign conventions.")
-  elseif ((z_old(nk+1) - z_old(1)) * (z_new(CS%nk+1) - z_new(1)) == 0.0) then
-    ! This is a massless column, so do nothing and return.
-    do k=1,CS%nk+1 ; dz_g(k) = 0.0 ; enddo ; return
-  elseif ((z_old(nk+1) - z_old(1)) + (z_new(CS%nk+1) - z_new(1)) > 0.0) then
+#endif
+  elseif ((z_old(nk+1) - z_old(1)) * (z_new(nk_tgt+1) - z_new(1)) == 0.0) then
+    ! This is a massless column, so do nothing (the filtering block below is skipped).
+    massless = .true. ; do k=1,nk_tgt+1 ; dz_g(k) = 0.0 ; enddo
+  elseif ((z_old(nk+1) - z_old(1)) + (z_new(nk_tgt+1) - z_new(1)) > 0.0) then
     sgn = 1.0
   else
     sgn = -1.0
   endif
 
+  if (.not. massless) then
+
+#ifndef __NVCOMPILER_OPENMP_GPU
   if (debug) then
-    do k=2,CS%nk+1
+    do k=2,nk_tgt+1
       if (sgn*(z_new(k)-z_new(k-1)) < -5e-16*(abs(z_new(k))+abs(z_new(k-1))) ) &
           call MOM_error(FATAL, "filtered_grid_motion: z_new is tangled.")
     enddo
@@ -1513,10 +1556,11 @@ subroutine filtered_grid_motion( CS, nk, z_old, z_new, dz_g )
     enddo
     ! ddz_g_s(:) = 0.0 ; ddz_g_d(:) = 0.0
   endif
+#endif
 
-  zs = CS%depth_of_time_filter_shallow
-  zd = CS%depth_of_time_filter_deep
-  wtd = 1.0 - CS%old_grid_weight
+  zs = filt_shallow
+  zd = filt_deep
+  wtd = 1.0 - old_grid_wt
   Iwtd = 1.0 / wtd
 
   dzwt = (zd - zs)
@@ -1526,7 +1570,7 @@ subroutine filtered_grid_motion( CS, nk, z_old, z_new, dz_g )
 
   dz_g(1) = 0.0
   z_old_k = z_old(1)
-  do k = 2,CS%nk+1
+  do k = 2,nk_tgt+1
     if (k<=nk+1) z_old_k = z_old(k) ! This allows for virtual z_old interface at bottom of the model
     ! zr1 is positive and increases with depth, and dz_tgt is positive downward.
     dz_tgt = sgn*(z_new(k) - z_old_k)
@@ -1593,19 +1637,23 @@ subroutine filtered_grid_motion( CS, nk, z_old, z_new, dz_g )
   enddo
  !dz_g(CS%nk+1) = 0.0
 
+#ifndef __NVCOMPILER_OPENMP_GPU
   if (debug) then
     z_old_k = z_old(1)
-    do k=1,CS%nk+1
+    do k=1,nk_tgt+1
       if (k<=nk+1) z_old_k = z_old(k) ! This allows for virtual z_old interface at bottom of the model
       z_act(k) = z_old_k + dz_g(k)
     enddo
-    do k=2,CS%nk+1
+    do k=2,nk_tgt+1
       if (sgn*((z_act(k))-z_act(k-1)) < -1e-15*(abs(z_act(k))+abs(z_act(k-1))) ) &
           call MOM_error(FATAL, "filtered_grid_motion: z_output is tangled.")
     enddo
   endif
+#endif
 
-end subroutine filtered_grid_motion
+  endif ! .not. massless
+
+end subroutine filtered_grid_motion_loc
 
 !> Builds a z*-coordinate grid with partial steps (Adcroft and Campin, 2004).
 !! z* is defined as
@@ -1634,8 +1682,21 @@ subroutine build_zstar_grid( CS, G, GV, h, nom_depth_H, dzInterface, frac_shelf_
 #ifdef __DO_SAFETY_CHECKS__
   real :: dh    ! The larger of the total column thickness or bathymetric depth [H ~> m or kg m-2]
 #endif
+  ! GPU port: per-column private scratch gets compile-time-constant sizes on GPU builds so each
+  ! device thread uses stack (local memory) arrays rather than runtime-sized device-heap allocations.
+#ifdef __NVCOMPILER_OPENMP_GPU
+  real, dimension(GPU_nk_max+1) :: zOld ! Previous coordinate interface heights [H ~> m or kg m-2]
+  real, dimension(GPU_nk_max+1) :: zNew ! New coordinate interface heights [H ~> m or kg m-2]
+#else
   real, dimension(SZK_(GV)+1) :: zOld    ! Previous coordinate interface heights [H ~> m or kg m-2]
   real, dimension(CS%nk+1)    :: zNew    ! New coordinate interface heights [H ~> m or kg m-2]
+#endif
+  ! GPU port: the regridding_CS scalars + coordinateResolution are hoisted into plain locals so the
+  ! device column loop never dereferences the nested (pointer + allocatable) control structure.
+  real, dimension(CS%nk) :: coordRes ! A local copy of CS%zlike_CS%coordinateResolution [Z ~> m]
+  real :: min_thick, filt_shallow, filt_deep, old_grid_wt, z_scale_l ! Hoisted CS scalars
+  integer :: nk_tgt ! A local copy of CS%nk (target level count)
+  logical :: do_filter, use_adjust ! Hoisted CS control flags
   integer :: i, j, k, nz
   logical :: ice_shelf
 
@@ -1643,20 +1704,35 @@ subroutine build_zstar_grid( CS, G, GV, h, nom_depth_H, dzInterface, frac_shelf_
   minThickness = CS%min_thickness
   ice_shelf = present(frac_shelf_h)
 
-  !$OMP parallel do default(none) shared(G,GV,dzInterface,CS,nz,h,frac_shelf_h, &
-  !$OMP                                  ice_shelf,minThickness,zScale,nom_depth_H) &
-  !$OMP                          private(nominalDepth,totalThickness, &
-#ifdef __DO_SAFETY_CHECKS__
-  !$OMP                                  dh, &
+  ! Hoist the control-structure reads onto the host; the device column loop reads only plain locals.
+  nk_tgt = CS%nk
+  min_thick = CS%min_thickness
+  filt_shallow = CS%depth_of_time_filter_shallow
+  filt_deep = CS%depth_of_time_filter_deep
+  old_grid_wt = CS%old_grid_weight
+  do_filter = CS%use_depth_based_time_filter .or. CS%old_grid_weight > 0.
+  use_adjust = CS%use_adjust_interface_motion
+  z_scale_l = 1.0 ; if (present(zScale)) z_scale_l = zScale
+  call get_zlike_coord_res(CS%zlike_CS, coordRes)
+#ifdef __NVCOMPILER_OPENMP_GPU
+  if (nk_tgt > GPU_nk_max .or. nz > GPU_nk_max) call MOM_error(FATAL, &
+    "build_zstar_grid: GPU builds require CS%nk and GV%ke <= GPU_nk_max; increase GPU_nk_max "//&
+    "in MOM_regridding.F90.")
 #endif
-  !$OMP                                  zNew,zOld)
+
+  ! GPU port: run the per-column regrid on the device.  h is host-authoritative in the (host) ALE
+  ! stack -> refresh; nom_depth_H/coordRes are fresh host locals; dzInterface is device-written and
+  ! copied back for the (host) remap that follows.
+  !$omp target update to(h)
+  !$omp target enter data map(to: nom_depth_H, coordRes) map(alloc: dzInterface)
+  !$omp target teams loop collapse(2) &
+  !$omp   private(nominalDepth, totalThickness, zNew, zOld, k) &
+  !$omp   firstprivate(nz, nk_tgt, min_thick, filt_shallow, filt_deep, old_grid_wt, &
+  !$omp                do_filter, use_adjust, ice_shelf, z_scale_l)
   do j = G%jsc-1,G%jec+1
     do i = G%isc-1,G%iec+1
 
-      if (G%mask2dT(i,j)==0.) then
-        dzInterface(i,j,:) = 0.
-        cycle
-      endif
+      if (G%mask2dT(i,j)/=0.) then
 
       ! Local depth (positive downward)
       nominalDepth = nom_depth_H(i,j)
@@ -1677,21 +1753,21 @@ subroutine build_zstar_grid( CS, G, GV, h, nom_depth_H, dzInterface, frac_shelf_
 
       if (ice_shelf) then
         if (frac_shelf_h(i,j) > 0.) then ! under ice shelf
-          call build_zstar_column(CS%zlike_CS, nominalDepth, totalThickness, zNew, &
-                                z_rigid_top=totalThickness-nominalDepth, &
-                                eta_orig=zOld(1), zScale=zScale)
+          call build_zstar_column_loc(nk_tgt, min_thick, coordRes, nominalDepth, totalThickness, zNew, &
+                                z_scale_l, totalThickness-nominalDepth, zOld(1))
         else
-          call build_zstar_column(CS%zlike_CS, nominalDepth, totalThickness, &
-                                zNew, zScale=zScale)
+          call build_zstar_column_loc(nk_tgt, min_thick, coordRes, nominalDepth, totalThickness, &
+                                zNew, z_scale_l)
         endif
       else
-        call build_zstar_column(CS%zlike_CS, nominalDepth, totalThickness, &
-                                zNew, zScale=zScale)
+        call build_zstar_column_loc(nk_tgt, min_thick, coordRes, nominalDepth, totalThickness, &
+                                zNew, z_scale_l)
       endif
 
       ! Calculate the final change in grid position after blending new and old grids
-      if (CS%use_depth_based_time_filter .or. CS%old_grid_weight>0.) &
-        call filtered_grid_motion(CS, nz, zOld, zNew, dzInterface(i,j,:))
+      if (do_filter) &
+        call filtered_grid_motion_loc(nk_tgt, filt_shallow, filt_deep, old_grid_wt, nz, zOld, zNew, &
+                                      dzInterface(i,j,:))
 
 #ifdef __DO_SAFETY_CHECKS__
       dh = max(nominalDepth,totalThickness)
@@ -1716,10 +1792,17 @@ subroutine build_zstar_grid( CS, G, GV, h, nom_depth_H, dzInterface, frac_shelf_
       endif
 #endif
 
-      if (CS%use_adjust_interface_motion) call adjust_interface_motion( CS, nz, h(i,j,:), dzInterface(i,j,:) )
+      if (use_adjust) call adjust_interface_motion_loc( nk_tgt, min_thick, nz, h(i,j,:), dzInterface(i,j,:) )
+
+      else
+        dzInterface(i,j,:) = 0.
+      endif ! G%mask2dT(i,j) /= 0.
 
     enddo
   enddo
+
+  !$omp target update from(dzInterface)
+  !$omp target exit data map(release: nom_depth_H, coordRes, dzInterface)
 
 end subroutine build_zstar_grid
 
@@ -2164,6 +2247,21 @@ subroutine adjust_interface_motion( CS, nk, h_old, dz_int )
   real, dimension(nk),      intent(in)    :: h_old  !< Layer thicknesses on the old grid [H ~> m or kg m-2]
   real, dimension(CS%nk+1), intent(inout) :: dz_int !< Interface movements, adjusted to keep the thicknesses
                                                     !! thicker than their minimum value [H ~> m or kg m-2]
+
+  call adjust_interface_motion_loc( CS%nk, CS%min_thickness, nk, h_old, dz_int )
+
+end subroutine adjust_interface_motion
+
+!> Element-wise, control-structure-free form of adjust_interface_motion: it takes the (host-resolved)
+!! target level count and minimum thickness explicitly so it can be made device-callable.  Verbatim.
+subroutine adjust_interface_motion_loc( nk_tgt, min_thick, nk, h_old, dz_int )
+  integer,                   intent(in)    :: nk_tgt !< Number of cells in the target grid (was CS%nk)
+  real,                      intent(in)    :: min_thick !< Minimum allowed thickness [H ~> m or kg m-2]
+                                                    !! (was CS%min_thickness)
+  integer,                   intent(in)    :: nk !< Number of layers in h_old
+  real, dimension(nk),       intent(in)    :: h_old  !< Layer thicknesses on the old grid [H ~> m or kg m-2]
+  real, dimension(nk_tgt+1), intent(inout) :: dz_int !< Interface movements, adjusted to keep the thicknesses
+                                                    !! thicker than their minimum value [H ~> m or kg m-2]
   ! Local variables
   real :: h_new   ! A layer thickness on the new grid [H ~> m or kg m-2]
   real :: eps     ! A tiny relative thickness [nondim]
@@ -2171,14 +2269,16 @@ subroutine adjust_interface_motion( CS, nk, h_old, dz_int )
   real :: h_err   ! An error tolerance that use used to flag unacceptably large negative layer thicknesses
                   ! that can not be explained by roundoff errors [H ~> m or kg m-2]
   integer :: k
+  !$omp declare target
 
   eps = 1. ; eps = epsilon(eps)
 
   h_total = 0. ; h_err = 0.
-  do k = 1, min(CS%nk,nk)
+  do k = 1, min(nk_tgt,nk)
     h_total = h_total + h_old(k)
     h_err = h_err + max( h_old(k), abs(dz_int(k)), abs(dz_int(k+1)) )*eps
     h_new = h_old(k) + ( dz_int(k) - dz_int(k+1) )
+#ifndef __NVCOMPILER_OPENMP_GPU
     if (h_new < -3.0*h_err) then
       write(0,*) 'h<0 at k=',k,'h_old=',h_old(k), &
           'wup=',dz_int(k),'wdn=',dz_int(k+1),'dw_dz=',dz_int(k) - dz_int(k+1), &
@@ -2186,11 +2286,13 @@ subroutine adjust_interface_motion( CS, nk, h_old, dz_int )
       call MOM_error( FATAL, 'MOM_regridding: adjust_interface_motion() - '//&
                      'implied h<0 is larger than roundoff!')
     endif
+#endif
   enddo
-  if (CS%nk>nk) then
-    do k = nk+1, CS%nk
+  if (nk_tgt>nk) then
+    do k = nk+1, nk_tgt
       h_err = h_err + max( abs(dz_int(k)), abs(dz_int(k+1)) )*eps
       h_new = ( dz_int(k) - dz_int(k+1) )
+#ifndef __NVCOMPILER_OPENMP_GPU
       if (h_new < -3.0*h_err) then
         write(0,*) 'h<0 at k=',k,'h_old was empty',&
             'wup=',dz_int(k),'wdn=',dz_int(k+1),'dw_dz=',dz_int(k) - dz_int(k+1), &
@@ -2198,16 +2300,18 @@ subroutine adjust_interface_motion( CS, nk, h_old, dz_int )
         call MOM_error( FATAL, 'MOM_regridding: adjust_interface_motion() - '//&
                        'implied h<0 is larger than roundoff!')
       endif
+#endif
     enddo
   endif
-  do k = min(CS%nk,nk),2,-1
+  do k = min(nk_tgt,nk),2,-1
     h_new = h_old(k) + ( dz_int(k) - dz_int(k+1) )
-    if (h_new<CS%min_thickness) &
-        dz_int(k) = ( dz_int(k+1) - h_old(k) ) + CS%min_thickness ! Implies next h_new = min_thickness
+    if (h_new<min_thick) &
+        dz_int(k) = ( dz_int(k+1) - h_old(k) ) + min_thick ! Implies next h_new = min_thickness
     h_new = h_old(k) + ( dz_int(k) - dz_int(k+1) )
     if (h_new<0.) &
         dz_int(k) = ( 1. - eps ) * ( dz_int(k+1) - h_old(k) ) ! Backup in case min_thickness==0
     h_new = h_old(k) + ( dz_int(k) - dz_int(k+1) )
+#ifndef __NVCOMPILER_OPENMP_GPU
     if (h_new<0.) then
       write(0,*) 'h<0 at k=',k,'h_old=',h_old(k), &
           'wup=',dz_int(k),'wdn=',dz_int(k+1),'dw_dz=',dz_int(k) - dz_int(k+1), &
@@ -2216,10 +2320,11 @@ subroutine adjust_interface_motion( CS, nk, h_old, dz_int )
       call MOM_error( FATAL, 'MOM_regridding: adjust_interface_motion() - '//&
                      'Repeated adjustment for roundoff h<0 failed!')
     endif
+#endif
   enddo
  !if (dz_int(1)/=0.) stop 'MOM_regridding: adjust_interface_motion() surface moved'
 
-end subroutine adjust_interface_motion
+end subroutine adjust_interface_motion_loc
 
 
 !------------------------------------------------------------------------------

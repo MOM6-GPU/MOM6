@@ -17,12 +17,13 @@ use MOM_file_parser,    only : get_param, log_param, log_version, param_file_typ
 use MOM_forcing_type,   only : forcing
 use MOM_grid,           only : ocean_grid_type
 use MOM_interface_heights, only : thickness_to_dz
-use MOM_intrinsic_functions, only : cuberoot
+use MOM_intrinsic_functions, only : cuberoot, exp_reprod, log_reprod
 use MOM_string_functions, only : uppercase
 use MOM_unit_scaling,   only : unit_scale_type
 use MOM_variables,      only : thermo_var_ptrs, vertvisc_type
 use MOM_verticalGrid,   only : verticalGrid_type
-use MOM_wave_interface, only : wave_parameters_CS, Get_Langmuir_Number
+use MOM_wave_interface, only : wave_parameters_CS, Get_Langmuir_Number, Get_Langmuir_Number_LF17
+use MOM_wave_interface, only : wave_LF17_params, set_wave_LF17_params
 use MOM_stochastics,    only : stochastic_CS
 
 implicit none ; private
@@ -277,6 +278,10 @@ type, public :: energetic_PBL_CS ; private
   ! The next options are used when passively diagnosing sensitivities from parameter choices
   integer :: id_opt_diff_Kd_ePBL = -1, id_opt_maxdiff_Kd_ePBL = -1, id_opt_diff_hML_depth = -1
   !>@}
+  type(wave_LF17_params) :: wave_lf17 !< A device-mappable bundle of the loop-invariant LF17 wave
+                              !! scalars, populated from the Waves CS each call so the on-device
+                              !! Langmuir path reads these (allocatable-free, maps cleanly) instead
+                              !! of dereferencing the Waves pointer.
 end type energetic_PBL_CS
 
 !>@{ Enumeration values for mstar_scheme
@@ -320,6 +325,39 @@ type, public :: ePBL_column_diags ; private
   integer :: OBL_its !< The number of iterations used to find a self-consistent surface boundary layer depth
   integer :: BBL_its !< The number of iterations used to find a self-consistent bottom boundary layer depth
 end type ePBL_column_diags
+
+!> GPU port: make the per-column ePBL helper kernels device-callable so ePBL_column (which runs on the
+!! device once the driver loop is offloaded) can call them.  They are pure scalar computations, so the
+!! same source serves the host and device paths.
+!$omp declare target(exp_decay_TKE_adjust, find_PE_chg, find_PE_chg_orig, find_Kd_from_PE_chg)
+!$omp declare target(find_mstar, mstar_Langmuir)
+!$omp declare target(ePBL_column)
+
+! RESOLVED(gpu-bitwise-repro) 2026-07-20: ePBL is now GPU/CPU bit-for-bit -- the on-device
+! transcendentals below were routed through the reproducible kernels exp_reprod/log_reprod/
+! erfc_reprod (MOM_intrinsic_functions), and a same-source nvfortran-CPU build (ocean_only/cpu_build)
+! reproduces the GPU benchmark_ALE ocean.stats bit-for-bit (empty diff). These prototype reprod
+! kernels change answers slightly vs the intrinsics (like cuberoot vs x**(1/3)); coordinate with
+! Marshall's transcendental-repro pass, which may supersede them. The sites that were wired (kept as
+! a record; live in benchmark_ALE) were the device-vs-host divergence before the fix:
+!   - find_PE_chg / find_PE_chg_orig : exp() in the PE-change integrals (core, per interface x
+!       iteration -- the likely dominant contributor).
+!   - exp_decay_TKE_adjust (~:1533)  : exp(-h*Idecay_len_TKE) TKE decay.
+!   - find_mstar mstar_N (~:3753)    : log(...) Ekman-limit term (EPBL_MSTAR_SCHEME=OM4).
+!   - mstar_Langmuir (~:3875,:3878)  : Convect_Langmuir_Number**LT_enhance_exp (LT_ENHANCE_EXP=-1.33,
+!       an ARBITRARY real power -- no cuberoot/nth_root form; = exp(y*log x) under the hood).
+!   - MixLen_shape (~:1492)          : (...)**MixLenExponent with MixLenExponent=1.0 == pow(x,1.0);
+!       a trivial local stopgap would be an `==1.0` identity fast-path next to the existing `==2.0`
+!       one, but it alone does NOT restore bitwise (the exp/log above dominate), so left for Marshall.
+!   (MKE_src exp() sites ~:1755+ are multiplied by MKE_TO_TKE_EFFIC=0.0 in benchmark_ALE -> harmless.)
+! See the [[gpu-transcendental-bitwise-plan]] auto-memory. Until this lands, ePBL offload increments
+! are gated on "no NEW diff vs the ePBL-device baseline", not bit-for-bit vs the golden.
+
+!> GPU port: fixes the per-column private scratch in ePBL_column to a compile-time-constant size on
+!! GPU builds, so each device thread gets stack (local memory) arrays rather than runtime-sized
+!! device-heap automatics (NVFORTRAN-W-0155 / KNOWLEDGE row 21).  Checked against GV%ke in
+!! energetic_PBL_init.  Unused in CPU builds, where the local declarations keep their exact sizes.
+integer, parameter :: GPU_nk_max = 128
 
 contains
 
@@ -406,7 +444,16 @@ subroutine energetic_PBL(h_3d, u_3d, v_3d, tv, fluxes, visc, dt, Kd_int, G, GV, 
     v_2d            ! A 2-d slice of the meridional velocity [L T-1 ~> m s-1].
   real, dimension(SZI_(G),SZK_(GV)+1) :: &
     Kd_2d           ! A 2-d version of the diapycnal diffusivity [H Z T-1 ~> m2 s-1 or kg m-1 s-1]
+  real, dimension(SZI_(G),SZJ_(G),SZK_(GV)) :: &
+    dz_3d           ! The vertical distance across layers over the whole domain [Z ~> m], computed
+                    ! once per call to replace the former per-j thickness_to_dz slice.
+#ifdef __NVCOMPILER_OPENMP_GPU
+  ! On GPU these per-column column scratch arrays are teams-loop private() and so must have a
+  ! compile-time-constant size (NVFORTRAN-W-0155); GPU_nk_max is guarded by a FATAL on GV%ke.
+  real, dimension(GPU_nk_max) :: &
+#else
   real, dimension(SZK_(GV)) :: &
+#endif
     h, &            ! The layer thickness [H ~> m or kg m-2].
     dz, &           ! The vertical distance across layers [Z ~> m].
     T0, &           ! The initial layer temperatures [C ~> degC].
@@ -416,13 +463,14 @@ subroutine energetic_PBL(h_3d, u_3d, v_3d, tv, fluxes, visc, dt, Kd_int, G, GV, 
     TKE_forcing, &  ! Forcing of the TKE in the layer coming from TKE_forced [R Z3 T-2 ~> J m-2].
     u, &            ! The zonal velocity [L T-1 ~> m s-1].
     v               ! The meridional velocity [L T-1 ~> m s-1].
+#ifdef __NVCOMPILER_OPENMP_GPU
+  real, dimension(GPU_nk_max+1) :: &
+#else
   real, dimension(SZK_(GV)+1) :: &
+#endif
     Kd, &           ! The diapycnal diffusivity due to ePBL [H Z T-1 ~> m2 s-1 or kg m-1 s-1].
     mixvel, &       ! A turbulent mixing velocity [Z T-1 ~> m s-1].
     mixlen, &       ! A turbulent mixing length [Z ~> m].
-    mixvel_BBL, &   ! A bottom boundary layer turbulent mixing velocity [Z T-1 ~> m s-1].
-    mixlen_BBL, &   ! A bottom boundary layer turbulent mixing length [Z ~> m].
-    Kd_BBL, &       ! The bottom boundary layer diapycnal diffusivity [H Z T-1 ~> m2 s-1 or kg m-1 s-1].
     SpV_dt, &       ! Specific volume interpolated to interfaces divided by dt or 1.0 / (dt * Rho0),
                     ! in [R-1 T-1 ~> m3 kg-1 s-1], used to convert local TKE into a turbulence velocity cubed.
     SpV_dt_cf       ! Specific volume interpolated to interfaces divided by dt or 1.0 / (dt * Rho0)
@@ -430,6 +478,12 @@ subroutine energetic_PBL(h_3d, u_3d, v_3d, tv, fluxes, visc, dt, Kd_int, G, GV, 
                     ! [m3 Z-3 R-1 T2 s-3 ~> m3 kg-1 s-1] or without the conversion factors for
                     ! answer dates of 20240101 and later in [R-1 T-1 ~> m3 kg-1 s-1], used to
                     ! convert local TKE into a turbulence velocity cubed.
+  ! These bottom-boundary-layer column arrays are only used on the host (BBL_mixing / options_diff
+  ! paths, both FATAL-guarded off the GPU port), so they keep the runtime size.
+  real, dimension(SZK_(GV)+1) :: &
+    mixvel_BBL, &   ! A bottom boundary layer turbulent mixing velocity [Z T-1 ~> m s-1].
+    mixlen_BBL, &   ! A bottom boundary layer turbulent mixing length [Z ~> m].
+    Kd_BBL          ! The bottom boundary layer diapycnal diffusivity [H Z T-1 ~> m2 s-1 or kg m-1 s-1].
   real :: h_neglect ! A thickness that is so small it is usually lost
                     ! in roundoff and can be neglected [H ~> m or kg m-2].
 
@@ -507,6 +561,16 @@ subroutine energetic_PBL(h_3d, u_3d, v_3d, tv, fluxes, visc, dt, Kd_int, G, GV, 
                                        ! can be modified to test for sensitivities
   logical :: BBL_mixing ! If true, there is bottom boundary layer mixing.
   integer :: i, j, k, is, ie, js, je, nz
+#ifdef __NVCOMPILER_OPENMP_GPU
+  ! Plain-array hoists for the GPU port: pointer-member forcing and the CS%ML_depth first guess are
+  ! copied to these on the host (where associated() is evaluated) so the device loop touches neither
+  ! fluxes% pointer members nor the CS allocatable components.
+  real, dimension(SZI_(G),SZJ_(G)) :: &
+    ustar_2d, &          ! Surface friction velocity [Z T-1 ~> m s-1]
+    ustar_gustless_2d, & ! Gustless surface friction velocity [Z T-1 ~> m s-1]
+    ML_depth_2d, &       ! Mixed layer depth guess (in) / result (out) [H ~> m or kg m-2]
+    BBL_depth_2d         ! Bottom boundary layer depth result [H ~> m or kg m-2]
+#endif
 
   is = G%isc ; ie = G%iec ; js = G%jsc ; je = G%jec ; nz = GV%ke
 
@@ -587,50 +651,114 @@ subroutine energetic_PBL(h_3d, u_3d, v_3d, tv, fluxes, visc, dt, Kd_int, G, GV, 
     if (CS%id_opt_diff_hML_depth > 0)  diff_hML_depth(:,:) = 0.0
   endif
 
-  !!OMP parallel do default(private) shared(js,je,nz,is,ie,h_3d,u_3d,v_3d,tv,dt,I_dt,BBL_mixing, &
-  !!OMP                                  CS,G,GV,US,fluxes,TKE_forced,dSV_dT,dSV_dS,Kd_int)
+  ! Compute the vertical layer extent over the whole domain once, replacing the per-j
+  ! thickness_to_dz slice that used to sit inside the j-loop (identical elementwise result).
+  call thickness_to_dz(h_3d, tv, dz_3d, G, GV, US)
+
+#ifdef __NVCOMPILER_OPENMP_GPU
+  ! ---- GPU port: FATAL-guard the features this port does not implement on device ----
+  if (.not.GV%Boussinesq) call MOM_error(FATAL, &
+      "energetic_PBL: the GPU port only supports Boussinesq mode.")
+  if (BBL_mixing) call MOM_error(FATAL, &
+      "energetic_PBL: bottom boundary layer mixing is not supported in the GPU port.")
+  if (CS%options_diff > 0) call MOM_error(FATAL, &
+      "energetic_PBL: options_diff>0 (sensitivity diagnostics) is not supported in the GPU port.")
+  if (stoch_CS%pert_epbl) call MOM_error(FATAL, &
+      "energetic_PBL: stochastic ePBL perturbations are not supported in the GPU port.")
+  if (CS%TKE_diagnostics) call MOM_error(FATAL, &
+      "energetic_PBL: the ePBL TKE-budget diagnostics are not supported in the GPU port.")
+  if (report_avg_its) call MOM_error(FATAL, &
+      "energetic_PBL: report_avg_its is not supported in the GPU port.")
+  if (CS%debug) call MOM_error(FATAL, &
+      "energetic_PBL: CS%debug is not supported in the GPU port.")
+  if ((CS%id_Mixing_Length>0) .or. (CS%id_Velocity_Scale>0) .or. (CS%id_ustar_ePBL>0) .or. &
+      (CS%id_Kd_ePBL_col_by_col>0) .or. (CS%id_mstar_sfc>0) .or. (CS%id_mstar_bbl>0) .or. &
+      (CS%id_mstar_LT>0) .or. (CS%id_LA>0) .or. (CS%id_LA_mod>0)) call MOM_error(FATAL, &
+      "energetic_PBL: the per-column ePBL diagnostics are not supported in the GPU port.")
+
+  ! Hoist pointer-member forcing and the CS%ML_depth first guess onto plain arrays (associated()
+  ! tests happen here on the host); the device loop then reads only these plain arrays and never
+  ! dereferences a fluxes% pointer member or a CS allocatable component.
+  if (.not.(associated(fluxes%ustar) .and. (GV%Boussinesq .or. .not.associated(fluxes%tau_mag)))) &
+    call MOM_error(FATAL, "energetic_PBL: the GPU port requires the fluxes%ustar forcing path.")
+  if (associated(fluxes%ustar_shelf) .and. associated(fluxes%frac_shelf_h)) call MOM_error(FATAL, &
+      "energetic_PBL: ice-shelf ustar blending is not supported in the GPU port.")
+  do j=js,je ; do i=is,ie
+    ustar_2d(i,j) = fluxes%ustar(i,j) ; ustar_gustless_2d(i,j) = fluxes%ustar_gustless(i,j)
+    ML_depth_2d(i,j) = CS%ML_depth(i,j)
+  enddo ; enddo
+  ! Bundle the loop-invariant LF17 wave scalars into CS%wave_lf17 (allocatable-free, so it rides the
+  ! CS map onto the device) — the on-device Langmuir path reads these instead of the Waves pointer.
+  if (associated(Waves)) call set_wave_LF17_params(Waves, CS%wave_lf17)
+
+  ! One driver-level data region (find_N2 lesson: map full-domain arrays ONCE, never per-column).
+  !$omp target enter data map(to: h_3d, u_3d, v_3d, dz_3d, TKE_forced, dSV_dT, dSV_dS, buoy_flux, &
+  !$omp                          ustar_2d, ustar_gustless_2d, ML_depth_2d, CS, tv, tv%T, tv%S) &
+  !$omp                    map(alloc: BBL_depth_2d, Kd_int)
+  if (associated(Waves)) then
+    !$omp target enter data map(to: Waves)
+  endif
+  ! tv%T/tv%S are persistently resident via CS%tv and were mutated on the host earlier in diabatic,
+  ! so refresh them here (the map-to-present-no-copy trap); h_3d may likewise be persistently mapped.
+  !$omp target update to(tv%T, tv%S, h_3d)
+
+  !$omp target teams loop collapse(2) &
+  !$omp   private(eCD, u_star, u_star_mean, mech_TKE, absf, B_flux, MLD_io, BBLD_io, MLD_in, &
+  !$omp           h, dz, u, v, T0, S0, dSV_dT_1d, dSV_dS_1d, TKE_forcing, Kd, mixvel, mixlen, &
+  !$omp           SpV_dt, SpV_dt_cf) &
+  !$omp   firstprivate(is, ie, nz, dt, I_dt, I_rho, I_rho0dt)
+#endif
   do j=js,je
-    ! Copy the thicknesses and other fields to 2-d arrays.
-    do k=1,nz ; do i=is,ie
-      h_2d(i,k) = h_3d(i,j,k) ; u_2d(i,k) = u_3d(i,j,k) ; v_2d(i,k) = v_3d(i,j,k)
-      T_2d(i,k) = tv%T(i,j,k) ; S_2d(i,k) = tv%S(i,j,k)
-      TKE_forced_2d(i,k) = TKE_forced(i,j,k)
-      dSV_dT_2d(i,k) = dSV_dT(i,j,k) ; dSV_dS_2d(i,k) = dSV_dS(i,j,k)
-    enddo ; enddo
-    call thickness_to_dz(h_3d, tv, dz_2d, j, G, GV)
-
-    ! Set the inverse density used to translating local TKE into a turbulence velocity
-    SpV_dt(:) = 0.0
-    if ((dt > 0.0) .and. GV%Boussinesq .or. .not.allocated(tv%SpV_avg)) then
-      if (CS%answer_date < 20240101) then
-        do K=1,nz+1
-          SpV_dt(K) = 1.0 / (dt*GV%Rho0)
-        enddo
-      else
-        do K=1,nz+1
-          SpV_dt(K) = I_rho0dt
-        enddo
-      endif
-    endif
-
-    !   Determine the initial mech_TKE and conv_PErel, including the energy required
-    ! to mix surface heating through the topmost cell, the energy released by mixing
-    ! surface cooling & brine rejection down through the topmost cell, and
-    ! homogenizing the shortwave heating within that cell.  This sets the energy
-    ! and ustar and wstar available to drive mixing at the first interior
-    ! interface.
+    !   For each ocean column determine the initial mech_TKE and conv_PErel, including the energy
+    ! required to mix surface heating through the topmost cell, the energy released by mixing surface
+    ! cooling & brine rejection down through the topmost cell, and homogenizing the shortwave heating
+    ! within that cell.  This sets the energy and ustar and wstar available to drive mixing at the
+    ! first interior interface.
     do i=is,ie ; if (G%mask2dT(i,j) > 0.0) then
 
-      ! Copy the thicknesses and other fields to 1-d arrays.
+      ! Copy the thicknesses and other fields to 1-d column arrays, read directly from the 3-d
+      ! inputs (the former per-j 2-d staging slabs are no longer needed).
       do k=1,nz
-        h(k) = h_2d(i,k) + GV%H_subroundoff ; dz(k) = dz_2d(i,k) + GV%dZ_subroundoff
-        u(k) = u_2d(i,k) ; v(k) = v_2d(i,k)
-        T0(k) = T_2d(i,k) ; S0(k) = S_2d(i,k) ; TKE_forcing(k) =  TKE_forced_2d(i,k)
-        dSV_dT_1d(k) = dSV_dT_2d(i,k) ; dSV_dS_1d(k) = dSV_dS_2d(i,k)
+        h(k) = h_3d(i,j,k) + GV%H_subroundoff ; dz(k) = dz_3d(i,j,k) + GV%dZ_subroundoff
+        u(k) = u_3d(i,j,k) ; v(k) = v_3d(i,j,k)
+        T0(k) = tv%T(i,j,k) ; S0(k) = tv%S(i,j,k) ; TKE_forcing(k) = TKE_forced(i,j,k)
+        dSV_dT_1d(k) = dSV_dT(i,j,k) ; dSV_dS_1d(k) = dSV_dS(i,j,k)
       enddo
       do K=1,nz+1 ; Kd(K) = 0.0 ; enddo
 
+      ! Set the inverse density used to translate local TKE into a turbulence velocity.
+#ifdef __NVCOMPILER_OPENMP_GPU
+      do K=1,nz+1 ; SpV_dt(K) = 0.0 ; enddo
+      if (dt > 0.0) then
+        if (CS%answer_date < 20240101) then
+          do K=1,nz+1 ; SpV_dt(K) = 1.0 / (dt*GV%Rho0) ; enddo
+        else
+          do K=1,nz+1 ; SpV_dt(K) = I_rho0dt ; enddo
+        endif
+      endif
+#else
+      SpV_dt(:) = 0.0
+      if ((dt > 0.0) .and. GV%Boussinesq .or. .not.allocated(tv%SpV_avg)) then
+        if (CS%answer_date < 20240101) then
+          do K=1,nz+1
+            SpV_dt(K) = 1.0 / (dt*GV%Rho0)
+          enddo
+        else
+          do K=1,nz+1
+            SpV_dt(K) = I_rho0dt
+          enddo
+        endif
+      endif
+#endif
+
       ! Make local copies of surface forcing and process them.
+#ifdef __NVCOMPILER_OPENMP_GPU
+      ! GPU port: Boussinesq fluxes%ustar path only (guarded above); read the hoisted plain arrays.
+      u_star = ustar_2d(i,j)
+      u_star_Mean = ustar_gustless_2d(i,j)
+      mech_TKE = dt * GV%Rho0 * u_star**3
+      B_flux = buoy_flux(i,j)
+#else
       if (associated(fluxes%ustar) .and. (GV%Boussinesq .or. .not.associated(fluxes%tau_mag))) then
         u_star = fluxes%ustar(i,j)
         u_star_Mean = fluxes%ustar_gustless(i,j)
@@ -661,6 +789,7 @@ subroutine energetic_PBL(h_3d, u_3d, v_3d, tv, fluxes, visc, dt, Kd_int, G, GV, 
           u_star = (1.0 - fluxes%frac_shelf_h(i,j)) * u_star + &
                    fluxes%frac_shelf_h(i,j) * fluxes%ustar_shelf(i,j)
       endif
+#endif
       if (u_star < CS%ustar_min) u_star = CS%ustar_min
       if (CS%omega_frac >= 1.0) then
         absf = 2.0*CS%omega
@@ -673,7 +802,11 @@ subroutine energetic_PBL(h_3d, u_3d, v_3d, tv, fluxes, visc, dt, Kd_int, G, GV, 
 
       ! Perhaps provide a first guess for MLD based on a stored previous value.
       MLD_io = -1.0
+#ifdef __NVCOMPILER_OPENMP_GPU
+      if (CS%MLD_iteration_guess .and. (ML_depth_2d(i,j) > 0.0)) MLD_io = ML_depth_2d(i,j)
+#else
       if (CS%MLD_iteration_guess .and. (CS%ML_depth(i,j) > 0.0))  MLD_io = CS%ML_depth(i,j)
+#endif
       BBLD_io = 0.0
 
       ! Store the initial guesses at the boundary layer depths for testing sensitivities.
@@ -684,19 +817,24 @@ subroutine energetic_PBL(h_3d, u_3d, v_3d, tv, fluxes, visc, dt, Kd_int, G, GV, 
       else
         do K=1,nz+1 ; SpV_dt_cf(K) = SpV_dt(K) ; enddo
       endif
+#ifndef __NVCOMPILER_OPENMP_GPU
       if (stoch_CS%pert_epbl) then ! stochastics are active
         call ePBL_column(h, dz, u, v, T0, S0, dSV_dT_1d, dSV_dS_1d, SpV_dt_cf, TKE_forcing, B_flux, absf, &
                          u_star, u_star_mean, mech_TKE, dt, MLD_io, Kd, mixvel, mixlen, GV, &
                          US, CS, eCD, Waves, G, i, j, &
                          TKE_gen_stoch=stoch_CS%epbl1_wts(i,j), TKE_diss_stoch=stoch_CS%epbl2_wts(i,j))
       else
+#endif
         call ePBL_column(h, dz, u, v, T0, S0, dSV_dT_1d, dSV_dS_1d, SpV_dt_cf, TKE_forcing, B_flux, absf, &
                          u_star, u_star_mean, mech_TKE, dt, MLD_io, Kd, mixvel, mixlen, GV, &
                          US, CS, eCD, Waves, G, i, j)
+#ifndef __NVCOMPILER_OPENMP_GPU
       endif
       if (CS%id_Kd_ePBL_col_by_col > 0) &
         call post_data_3d_by_column(CS%id_Kd_ePBL_col_by_col, Kd, CS%diag, i, j)
+#endif
 
+#ifndef __NVCOMPILER_OPENMP_GPU
       ! Add the diffusivity due to bottom boundary layer mixing, if there is energy to drive this mixing.
       if (BBL_mixing) then
         if (CS%MLD_iteration_guess .and. (CS%BBL_depth(i,j) > 0.0)) BBLD_io = CS%BBL_depth(i,j)
@@ -734,14 +872,21 @@ subroutine energetic_PBL(h_3d, u_3d, v_3d, tv, fluxes, visc, dt, Kd_int, G, GV, 
         if ((CS%id_BBL_decay_scale > 0) .and. (CS%TKE_decay * absf > 0)) &
           diag_BBL_decay_scale(i,j) = u_star_BBL / (CS%TKE_decay * absf)
       endif
+#endif
 
-      ! Copy the diffusivities to a 2-d array.
+      ! Copy the diffusivities to the output interface diffusivity array.
       do K=1,nz+1
-        Kd_2d(i,K) = Kd(K)
+        Kd_int(i,j,K) = Kd(K)
       enddo
+#ifdef __NVCOMPILER_OPENMP_GPU
+      ML_depth_2d(i,j) = MLD_io
+      BBL_depth_2d(i,j) = BBLD_io
+#else
       CS%ML_depth(i,j) = MLD_io
       CS%BBL_depth(i,j) = BBLD_io
+#endif
 
+#ifndef __NVCOMPILER_OPENMP_GPU
       if (CS%TKE_diagnostics) then
         diag_TKE_MKE(i,j) = diag_TKE_MKE(i,j) + eCD%dTKE_MKE
         diag_TKE_conv(i,j) = diag_TKE_conv(i,j) + eCD%dTKE_conv
@@ -820,17 +965,34 @@ subroutine energetic_PBL(h_3d, u_3d, v_3d, tv, fluxes, visc, dt, Kd_int, G, GV, 
         endif
         if (CS%id_opt_diff_hML_depth > 0) diff_hML_depth(i,j) = BLD_1 - BLD_2
       endif
+#endif
 
     else ! End of the ocean-point part of the i-loop
       ! For masked points, Kd_int must still be set (to 0) because it has intent out.
-      do K=1,nz+1 ; Kd_2d(i,K) = 0. ; enddo
+      do K=1,nz+1 ; Kd_int(i,j,K) = 0. ; enddo
+#ifdef __NVCOMPILER_OPENMP_GPU
+      ML_depth_2d(i,j) = 0.0
+      BBL_depth_2d(i,j) = 0.0
+#else
       CS%ML_depth(i,j) = 0.0
       CS%BBL_depth(i,j) = 0.0
+#endif
     endif ; enddo ! Close of i-loop - Note the unusual loop order, with k-loops inside i-loops.
 
-    do K=1,nz+1 ; do i=is,ie ; Kd_int(i,j,K) = Kd_2d(i,K) ; enddo ; enddo
-
   enddo ! j-loop
+
+#ifdef __NVCOMPILER_OPENMP_GPU
+  ! Copy the results back to the host and tear down the driver-level data region.
+  !$omp target exit data map(from: Kd_int, ML_depth_2d, BBL_depth_2d) &
+  !$omp   map(release: h_3d, u_3d, v_3d, dz_3d, TKE_forced, dSV_dT, dSV_dS, buoy_flux, &
+  !$omp                ustar_2d, ustar_gustless_2d, CS, tv%T, tv%S, tv)
+  if (associated(Waves)) then
+    !$omp target exit data map(release: Waves)
+  endif
+  do j=js,je ; do i=is,ie
+    CS%ML_depth(i,j) = ML_depth_2d(i,j) ; CS%BBL_depth(i,j) = BBL_depth_2d(i,j)
+  enddo ; enddo
+#endif
   if (CS%id_Kd_ePBL_col_by_col > 0) call post_data_3d_final(CS%id_Kd_ePBL_col_by_col, CS%diag)
 
   if (CS%debug .and. BBL_mixing) then
@@ -966,7 +1128,11 @@ subroutine ePBL_column(h, dz, u, v, T0, S0, dSV_dT, dSV_dS, SpV_dt, TKE_forcing,
 ! mixing.
 
   ! Local variables
+#ifdef __NVCOMPILER_OPENMP_GPU
+  real, dimension(GPU_nk_max+1) :: &
+#else
   real, dimension(SZK_(GV)+1) :: &
+#endif
     pres_Z, &       ! Interface pressures with a rescaling factor to convert interface height
                     ! movements into changes in column potential energy [R Z2 T-2 ~> kg m-1 s-2].
     hb_hs           ! The distance from the bottom over the thickness of the
@@ -983,7 +1149,11 @@ subroutine ePBL_column(h, dz, u, v, T0, S0, dSV_dT, dSV_dS, SpV_dt, TKE_forcing,
   real :: Idecay_len_TKE  ! The inverse of a turbulence decay length scale [H-1 ~> m-1 or m2 kg-1].
   real :: dz_sum    ! The total thickness of the water column [Z ~> m].
 
+#ifdef __NVCOMPILER_OPENMP_GPU
+  real, dimension(GPU_nk_max) :: &
+#else
   real, dimension(SZK_(GV)) :: &
+#endif
     dT_to_dColHt, & ! Partial derivative of the total column height with the temperature changes
                     ! within a layer [Z C-1 ~> m degC-1].
     dS_to_dColHt, & ! Partial derivative of the total column height with the salinity changes
@@ -1020,7 +1190,11 @@ subroutine ePBL_column(h, dz, u, v, T0, S0, dSV_dT, dSV_dS, SpV_dt, TKE_forcing,
                     ! mixing effects with other yet lower layers [C H ~> degC m or degC kg m-2].
     Sh_b            ! An effective salinity times a thickness in the layer below, including implicit
                     ! mixing effects with other yet lower layers [S H ~> ppt m or ppt kg m-2].
+#ifdef __NVCOMPILER_OPENMP_GPU
+  real, dimension(GPU_nk_max+1) :: &
+#else
   real, dimension(SZK_(GV)+1) :: &
+#endif
     MixLen_shape, & ! A nondimensional shape factor for the mixing length that
                     ! gives it an appropriate asymptotic value at the bottom of
                     ! the boundary layer [nondim].
@@ -1153,6 +1327,10 @@ subroutine ePBL_column(h, dz, u, v, T0, S0, dSV_dT, dSV_dS, SpV_dt, TKE_forcing,
   real, dimension(20) :: Kddt_h_itt     ! The value of Kddt_h_guess after each iteration [H ~> m or kg m-2]
   real, dimension(20) :: dPEa_dKd_itt   ! The value of dPEc_dKd after each iteration [R Z3 T-2 H-1 ~> J m-3 or J kg-1]
   real, dimension(20) :: MKE_src_itt    ! The value of MKE_src after each iteration [R Z3 T-2 ~> J m-2]
+#ifdef __NVCOMPILER_OPENMP_GPU
+  real, dimension(GPU_nk_max) :: mech_TKE_k, conv_PErel_k, nstar_k, dT_expect, dS_expect
+  integer, dimension(GPU_nk_max) :: num_itts
+#else
   real, dimension(SZK_(GV)) :: mech_TKE_k  ! The mechanically generated turbulent kinetic energy
                     ! available for mixing over a time step for each layer [R Z3 T-2 ~> J m-2].
   real, dimension(SZK_(GV)) :: conv_PErel_k ! The potential energy that has been convectively released
@@ -1162,6 +1340,7 @@ subroutine ePBL_column(h, dz, u, v, T0, S0, dSV_dT, dSV_dS, SpV_dt, TKE_forcing,
   real, dimension(SZK_(GV)) :: dT_expect ! Expected temperature changes [C ~> degC]
   real, dimension(SZK_(GV)) :: dS_expect ! Expected salinity changes [S ~> ppt]
   integer, dimension(SZK_(GV)) :: num_itts
+#endif
 
   integer :: k, nz, itt, max_itt
 
@@ -1251,8 +1430,12 @@ subroutine ePBL_column(h, dz, u, v, T0, S0, dSV_dT, dSV_dS, SpV_dt, TKE_forcing,
 
     !/ Here we get mstar, which is the ratio of convective TKE driven mixing to UStar**3
     if (CS%Use_LT) then
+#ifdef __NVCOMPILER_OPENMP_GPU
+      call get_Langmuir_Number_LF17(LA, GV, US, abs(MLD_guess), u_star_mean, CS%wave_lf17)
+#else
       call get_Langmuir_Number(LA, G, GV, US, abs(MLD_guess), u_star_mean, i, j, dz, Waves, &
                                U_H=u, V_H=v)
+#endif
       call find_mstar(CS, US, B_flux, u_star, MLD_guess, absf, .false., &
                       mstar_total, Langmuir_Number=La, Convect_Langmuir_Number=LAmod,&
                       mstar_LT=mstar_LT)
@@ -1315,13 +1498,18 @@ subroutine ePBL_column(h, dz, u, v, T0, S0, dSV_dT, dSV_dS, SpV_dt, TKE_forcing,
       dz_rsum = 0.0
       MixLen_shape(1) = 1.0
       if (CS%eqdisc) then ! update Kd as per Machine Learning equation discovery
+#ifndef __NVCOMPILER_OPENMP_GPU
         call kappa_eqdisc(MixLen_shape, CS, GV, h, absf, B_flux, u_star, MLD_guess)
+#endif
       else
         do K=2,nz+1
           dz_rsum = dz_rsum + dz(k-1)
           if (CS%MixLenExponent==2.0) then
             MixLen_shape(K) = CS%transLay_scale + (1.0 - CS%transLay_scale) * &
                (max(0.0, (MLD_guess - dz_rsum)*I_MLD) )**2 ! CS%MixLenExponent
+          elseif (CS%MixLenExponent==1.0) then
+            MixLen_shape(K) = CS%transLay_scale + (1.0 - CS%transLay_scale) * &
+               max(0.0, (MLD_guess - dz_rsum)*I_MLD) ! CS%MixLenExponent==1.0 identity
           else
             MixLen_shape(K) = CS%transLay_scale + (1.0 - CS%transLay_scale) * &
                (max(0.0, (MLD_guess - dz_rsum)*I_MLD) )**CS%MixLenExponent
@@ -1331,11 +1519,13 @@ subroutine ePBL_column(h, dz, u, v, T0, S0, dSV_dT, dSV_dS, SpV_dt, TKE_forcing,
     endif
 
     v0_ML_turb_vel_scale = 0.0 ! a variable that gets passed on to get_eqdisc_v0 & get_eqdisc_v0h
+#ifndef __NVCOMPILER_OPENMP_GPU
     if (CS%eqdisc_v0) then
       call get_eqdisc_v0(CS,absf,B_flux,u_star,v0_ML_turb_vel_scale)
     elseif (CS%eqdisc_v0h) then
       call get_eqdisc_v0h(CS,B_flux,u_star,MLD_guess,v0_ML_turb_vel_scale)
     endif
+#endif
 
     Kd(1) = 0.0 ; Kddt_h(1) = 0.0
     hp_a(1) = h(1)
@@ -1363,7 +1553,7 @@ subroutine ePBL_column(h, dz, u, v, T0, S0, dSV_dT, dSV_dS, SpV_dt, TKE_forcing,
         Idecay_len_TKE = (CS%TKE_decay * absf) / (h_dz_int(K) * u_star)
       endif
       exp_kh = 1.0
-      if (Idecay_len_TKE > 0.0) exp_kh = exp(-h(k-1)*Idecay_len_TKE)
+      if (Idecay_len_TKE > 0.0) exp_kh = exp_reprod(-h(k-1)*Idecay_len_TKE)
       if (CS%TKE_diagnostics) &
         eCD%dTKE_mech_decay = eCD%dTKE_mech_decay + (exp_kh-1.0) * mech_TKE * I_dtdiag
       if (present(TKE_diss_stoch)) then ! perturb the TKE destruction
@@ -2021,7 +2211,11 @@ subroutine ePBL_BBL_column(h, dz, u, v, T0, S0, dSV_dT, dSV_dS, SpV_dt, absf, &
 !  energy that is supplied as an argument to this routine.
 
   ! Local variables
+#ifdef __NVCOMPILER_OPENMP_GPU
+  real, dimension(GPU_nk_max+1) :: &
+#else
   real, dimension(SZK_(GV)+1) :: &
+#endif
     pres_Z, &       ! Interface pressures with a rescaling factor to convert interface height
                     ! movements into changes in column potential energy [R Z2 T-2 ~> kg m-1 s-2].
     dztop_dztot     ! The distance from the surface divided by the thickness of the
@@ -2039,7 +2233,11 @@ subroutine ePBL_BBL_column(h, dz, u, v, T0, S0, dSV_dT, dSV_dS, SpV_dt, absf, &
   real :: Idecay_len_TKE  ! The inverse of a turbulence decay length scale [H-1 ~> m-1 or m2 kg-1].
   real :: dz_sum    ! The total thickness of the water column [Z ~> m].
 
+#ifdef __NVCOMPILER_OPENMP_GPU
+  real, dimension(GPU_nk_max) :: &
+#else
   real, dimension(SZK_(GV)) :: &
+#endif
     dT_to_dColHt, & ! Partial derivative of the total column height with the temperature changes
                     ! within a layer [Z C-1 ~> m degC-1].
     dS_to_dColHt, & ! Partial derivative of the total column height with the salinity changes
@@ -2089,7 +2287,11 @@ subroutine ePBL_BBL_column(h, dz, u, v, T0, S0, dSV_dT, dSV_dS, SpV_dt, absf, &
                     ! mixing effects with other yet lower layers [C H ~> degC m or degC kg m-2].
     Sh_b            ! An effective salinity times a thickness in the layer below, including implicit
                     ! mixing effects with other yet lower layers [S H ~> ppt m or ppt kg m-2].
+#ifdef __NVCOMPILER_OPENMP_GPU
+  real, dimension(GPU_nk_max+1) :: &
+#else
   real, dimension(SZK_(GV)+1) :: &
+#endif
     MixLen_shape, & ! A nondimensional shape factor for the mixing length that
                     ! gives it an appropriate asymptotic value at the bottom of
                     ! the boundary layer [nondim].
@@ -3042,17 +3244,17 @@ function exp_decay_TKE_adjust(hb, ha, Idecay) result(TKE_to_PE_scale)
     ! TKE_to_PE_scale = (0.5 * (khb + kha)) / &
     !                   ((exp(-khb) - (1.0 - khb)) / khb + (exp(kha) - (1.0 + kha)) / kha)
     TKE_to_PE_scale = (0.5 * (khb + kha) * (kha * khb)) / &
-                      (kha * (exp(-khb) - (1.0 - khb)) + khb * (exp(kha) - (1.0 + kha)))
+                      (kha * (exp_reprod(-khb) - (1.0 - khb)) + khb * (exp_reprod(kha) - (1.0 + kha)))
   elseif (khb > 2.2e-4) then
     ! For small values of kha, approximate (exp(kha) - (1.0 + hha)) by the first two
     ! terms of its Taylor series: 0.5*kha**2 + C1_6*kha**3 + ... + kha**n/n! + ...
     ! which is more accurate when kha**4/24. < 1e-16 or kha < ~ 2.21e-4.
     TKE_to_PE_scale = (0.5 * (khb + kha) * khb) / &
-                      ((exp(-khb) - (1.0 - khb)) + 0.5*(khb * kha) * (1.0 + C1_3*kha))
+                      ((exp_reprod(-khb) - (1.0 - khb)) + 0.5*(khb * kha) * (1.0 + C1_3*kha))
   elseif (kha > 2.2e-4) then
     ! Use a Taylor series expansion for small values of khb
     TKE_to_PE_scale = (0.5 * (khb + kha) * kha) / &
-                      (0.5 * (kha * khb) * (1.0 - C1_3*Khb) + (exp(kha) - (1.0 + kha)))
+                      (0.5 * (kha * khb) * (1.0 - C1_3*Khb) + (exp_reprod(kha) - (1.0 + kha)))
   else ! (kha < 2.2e-4) .and. (khb < 2.2e-4) - use Taylor series approximations for both
     TKE_to_PE_scale = 1.0 / (1.0 + C1_3*(kha - khb))
   endif
@@ -3565,13 +3767,13 @@ subroutine find_mstar(CS, US, Buoyancy_Flux, UStar, &
       mstar_S = CS%mstar_coef*sqrt(max(0.0,Buoyancy_Flux) / UStar**2 / &
                     (Abs_Coriolis + 1.e-10*US%T_to_s) )
       ! The limit for rotation (Ekman length) limited mixing
-      mstar_N =  CS%C_Ek * log( max( 1., UStar / (Abs_Coriolis + 1.e-10*US%T_to_s) / BLD ) )
+      mstar_N =  CS%C_Ek * log_reprod( max( 1., UStar / (Abs_Coriolis + 1.e-10*US%T_to_s) / BLD ) )
     else
       ! The limit for the balance of rotation and stabilizing is f(L_Ekman,L_Obukhov)
       mstar_S = CS%mstar_coef*sqrt(max(0.0, Buoyancy_Flux) / (UStar**2 * max(Abs_Coriolis, 1.e-20*US%T_to_s)))
       ! The limit for rotation (Ekman length) limited mixing
       mstar_N = 0.0
-      if (UStar > Abs_Coriolis * BLD) mstar_N = CS%C_Ek * log(UStar / (Abs_Coriolis * BLD))
+      if (UStar > Abs_Coriolis * BLD) mstar_N = CS%C_Ek * log_reprod(UStar / (Abs_Coriolis * BLD))
     endif
 
     ! Here 1.25 is about .5/von Karman, which gives the Obukhov limit.
@@ -3693,10 +3895,10 @@ subroutine mstar_Langmuir(CS, US, Abs_Coriolis, Buoyancy_Flux, UStar, BLD, Langm
     if (CS%LT_enhance_form == Langmuir_rescale) then
       ! Enhancement is multiplied (added mst_lt set to 0)
       Enhance_mstar = min(CS%Max_Enhance_M, &
-                          (1. + CS%LT_enhance_coef * Convect_Langmuir_Number**CS%LT_enhance_exp) )
+                          (1. + CS%LT_enhance_coef * exp_reprod(CS%LT_enhance_exp*log_reprod(Convect_Langmuir_Number))) )
     elseif (CS%LT_enhance_form == Langmuir_add) then
       ! or Enhancement is additive (multiplied enhance_m set to 1)
-      mstar_LT_add = CS%LT_enhance_coef * Convect_Langmuir_Number**CS%LT_enhance_exp
+      mstar_LT_add = CS%LT_enhance_coef * exp_reprod(CS%LT_enhance_exp*log_reprod(Convect_Langmuir_Number))
     endif
   endif
 
@@ -4430,6 +4632,15 @@ subroutine energetic_PBL_init(Time, G, GV, US, param_file, diag, CS)
 
   call safe_alloc_alloc(CS%ML_depth, isd, ied, jsd, jed)
   call safe_alloc_alloc(CS%BBL_depth, isd, ied, jsd, jed)
+
+#ifdef __NVCOMPILER_OPENMP_GPU
+  ! GPU port guards: ePBL_column runs on the device with fixed-size (GPU_nk_max) per-column scratch,
+  ! and the equation-discovery (eqdisc) mixing-length/velocity paths are not device-callable.
+  if (GV%ke > GPU_nk_max) call MOM_error(FATAL, &
+    "energetic_PBL GPU build: GV%ke exceeds GPU_nk_max; increase GPU_nk_max in MOM_energetic_PBL.F90.")
+  if (CS%eqdisc .or. CS%eqdisc_v0 .or. CS%eqdisc_v0h) call MOM_error(FATAL, &
+    "energetic_PBL GPU build: the EPBL_EQD_DIFFUSIVITY (equation-discovery) paths are not device-callable.")
+#endif
 
 end subroutine energetic_PBL_init
 
