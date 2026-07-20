@@ -321,6 +321,12 @@ type, public :: ePBL_column_diags ; private
   integer :: BBL_its !< The number of iterations used to find a self-consistent bottom boundary layer depth
 end type ePBL_column_diags
 
+!> GPU port: make the per-column ePBL helper kernels device-callable so ePBL_column (which runs on the
+!! device once the driver loop is offloaded) can call them.  They are pure scalar computations, so the
+!! same source serves the host and device paths.
+!$omp declare target(exp_decay_TKE_adjust, find_PE_chg, find_PE_chg_orig, find_Kd_from_PE_chg)
+!$omp declare target(find_mstar, mstar_Langmuir)
+
 contains
 
 !>    This subroutine determines the diffusivities from the integrated energetics

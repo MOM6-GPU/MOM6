@@ -276,6 +276,11 @@ character*(5), parameter  :: DHH85_STRING     = "DHH85"         !< DHH85 wave me
 character*(4), parameter  :: LF17_STRING      = "LF17"          !< LF17 wave method string
 character*(7), parameter  :: EFACTOR_STRING   = "EFACTOR"       !< EFACTOR (based on vr12-ma) wave method string
 
+!> GPU port: the Li & Fox-Kemper statistical-wave Langmuir-number kernels are device-callable so the
+!! ePBL column solver can evaluate the Langmuir number on the device; on GPU builds only the LF17
+!! (USE_LA_LI2016) statistical-wave path is compiled (the wave-model branches are host-only).
+!$omp declare target(get_Langmuir_Number, get_StokesSL_LiFoxKemper, ust_2_u10_coare3p5)
+
 contains
 
 !> Initializes parameters related to MOM_wave_interface
@@ -1216,16 +1221,26 @@ subroutine get_Langmuir_Number( LA, G, GV, US, HBL, ustar, i, j, dz, Waves, &
 
 
 !Local Variables
+  real :: LA_STK ! Surface-layer averaged Stokes drift magnitude [L T-1 ~> m s-1]
+#ifndef __NVCOMPILER_OPENMP_GPU
   real :: Top, Bottom, MidPoint  ! Positions within each layer [Z ~> m]
   real :: Dpt_LASL         ! Averaging depth for Stokes drift [Z ~> m]
   real :: ShearDirection   ! Shear angular direction from atan2 [radians]
   real :: WaveDirection    ! Wave angular direction from atan2 [radians]
-  real :: LA_STKx, LA_STKy, LA_STK ! Stokes velocities in [L T-1 ~> m s-1]
+  real :: LA_STKx, LA_STKy ! Stokes velocities in [L T-1 ~> m s-1]
   logical :: ContinueLoop, USE_MA
   real, dimension(SZK_(GV)) :: US_H, VS_H ! Profiles of Stokes velocities [L T-1 ~> m s-1]
   real, allocatable :: StkBand_X(:), StkBand_Y(:) ! Stokes drifts by band [L T-1 ~> m s-1]
   integer :: k, BB
+#endif
 
+#ifdef __NVCOMPILER_OPENMP_GPU
+  ! Device path: only the LF17 statistical-wave method (USE_LA_LI2016) is supported, and misalignment
+  ! is not applied; other WaveMethods / LA_Misalignment on a GPU build are rejected by a host-side
+  ! guard.  This reproduces the host LF17 branch (get_StokesSL_LiFoxKemper sets LA directly; Dpt_LASL
+  ! is not used on that path).
+  call get_StokesSL_LiFoxKemper(ustar, HBL*Waves%LA_FracHBL, GV, US, Waves, LA_STK, LA)
+#else
   ! Compute averaging depth for Stokes drift (negative)
   Dpt_LASL = -1.0*max(Waves%LA_FracHBL*HBL, Waves%LA_HBL_min)
 
@@ -1304,6 +1319,7 @@ subroutine get_Langmuir_Number( LA, G, GV, US, HBL, ustar, i, j, dz, Waves, &
     WaveDirection = atan2(LA_STKy, LA_STKx)
     LA = LA / sqrt(max(1.e-8, cos( WaveDirection - ShearDirection)))
   endif
+#endif
 
 end subroutine get_Langmuir_Number
 
@@ -2084,8 +2100,10 @@ subroutine ust_2_u10_coare3p5(USTair, U10, GV, US, CS)
   ! Note in Edson et al. 2013, eq. 13 m is given as 0.017.  However,
   ! m=0.0017 reproduces the curve in their figure 6.
 
+#ifndef __NVCOMPILER_OPENMP_GPU
   if (CS%vonKar < 0.0) call MOM_error(FATAL, &
     "ust_2_u10_coare3p5 called with a negative value of Waves%vonKar")
+#endif
 
   z0sm = 0.11 * CS%nu_air / USTair ! Compute z0smooth from ustar guess
   u10a = 1000.0*US%m_s_to_L_T ! An insanely large upper bound for u10.
