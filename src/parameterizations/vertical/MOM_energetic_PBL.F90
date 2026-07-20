@@ -333,6 +333,27 @@ end type ePBL_column_diags
 !$omp declare target(find_mstar, mstar_Langmuir)
 !$omp declare target(ePBL_column)
 
+! TODO(gpu-bitwise-repro): ePBL is the ONE routine on feat/port-ePBL that is not yet GPU/CPU
+! bit-for-bit. The device run differs from host at ~1e-13 in the energy diagnostic (T/S/mass are
+! bit-identical) SOLELY because of device-vs-host libm/libdevice divergence in transcendental ops
+! in this routine's on-device kernels -- there is no deterministic drop-in for these (unlike the
+! x**(1/3) cube roots, which the answer_date>=20240101 path already handles via cuberoot()). The
+! real fix is a matched-transcendental / bitwise-repro implementation being done by Marshall; do NOT
+! duplicate it here. The live (benchmark_ALE) device-vs-host transcendental sites, for Marshall's
+! pass / for the eventual GPU==CPU verify against ocean_only/cpu_build:
+!   - find_PE_chg / find_PE_chg_orig : exp() in the PE-change integrals (core, per interface x
+!       iteration -- the likely dominant contributor).
+!   - exp_decay_TKE_adjust (~:1533)  : exp(-h*Idecay_len_TKE) TKE decay.
+!   - find_mstar mstar_N (~:3753)    : log(...) Ekman-limit term (EPBL_MSTAR_SCHEME=OM4).
+!   - mstar_Langmuir (~:3875,:3878)  : Convect_Langmuir_Number**LT_enhance_exp (LT_ENHANCE_EXP=-1.33,
+!       an ARBITRARY real power -- no cuberoot/nth_root form; = exp(y*log x) under the hood).
+!   - MixLen_shape (~:1492)          : (...)**MixLenExponent with MixLenExponent=1.0 == pow(x,1.0);
+!       a trivial local stopgap would be an `==1.0` identity fast-path next to the existing `==2.0`
+!       one, but it alone does NOT restore bitwise (the exp/log above dominate), so left for Marshall.
+!   (MKE_src exp() sites ~:1755+ are multiplied by MKE_TO_TKE_EFFIC=0.0 in benchmark_ALE -> harmless.)
+! See the [[gpu-transcendental-bitwise-plan]] auto-memory. Until this lands, ePBL offload increments
+! are gated on "no NEW diff vs the ePBL-device baseline", not bit-for-bit vs the golden.
+
 !> GPU port: fixes the per-column private scratch in ePBL_column to a compile-time-constant size on
 !! GPU builds, so each device thread gets stack (local memory) arrays rather than runtime-sized
 !! device-heap automatics (NVFORTRAN-W-0155 / KNOWLEDGE row 21).  Checked against GV%ke in
