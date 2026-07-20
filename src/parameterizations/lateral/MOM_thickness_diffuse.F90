@@ -13,6 +13,8 @@ use MOM_domains,               only : pass_var, CORNER, pass_vector
 use MOM_error_handler,         only : MOM_error, FATAL, WARNING, is_root_pe
 use MOM_EOS,                   only : calculate_density, calculate_density_derivs, EOS_domain
 use MOM_EOS,                   only : calculate_density_second_derivs
+use MOM_EOS,                   only : calculate_density_derivs_elem_loc, get_EOS_form_and_scaling
+use MOM_EOS,                   only : EOS_ROQUET_RHO, EOS_WRIGHT
 use MOM_file_parser,           only : get_param, log_version, param_file_type
 use MOM_grid,                  only : ocean_grid_type
 use MOM_io,                    only : MOM_read_data, slasher
@@ -784,6 +786,11 @@ subroutine thickness_diffuse_full(h, e, Kh_u, Kh_v, tv, uhD, vhD, cg1, dt, G, GV
   integer :: nk_linear  ! The number of layers over which the streamfunction goes to 0.
   real :: G_rho0        ! g/Rho0 [L2 R-1 Z-1 T-2 ~> m4 kg-1 s-2].
   real :: Rho_avg       ! The in situ density averaged to an interface [R ~> kg m-3]
+  integer :: eos_form   ! The equation-of-state form code, for the device-callable EOS dispatcher.
+  real :: eos_kg_m3_to_R  ! Factor converting the EOS kernel's density to model units [R m3 kg-1 ~> 1]
+  real :: eos_C_to_degC   ! Factor converting model temperature to the EOS kernel's degC [degC C-1 ~> 1]
+  real :: eos_S_to_ppt    ! Factor converting model salinity to the EOS kernel's ppt [ppt S-1 ~> 1]
+  real :: eos_RL2_T2_to_Pa ! Factor converting model pressure to Pa [Pa T2 R-1 L-2 ~> 1]
   real :: N2_floor      ! A floor for N2 to avoid degeneracy in the elliptic solver
                         ! times unit conversion factors [L2 Z-2 T-2 ~> s-2]
   real :: N2_unlim      ! An unlimited estimate of the buoyancy frequency
@@ -898,12 +905,29 @@ subroutine thickness_diffuse_full(h, e, Kh_u, Kh_v, tv, uhD, vhD, cg1, dt, G, GV
   EOSdom_v(:) = EOS_domain(G%HI)
   EOSdom_h1(:) = EOS_domain(G%HI, halo=1)
 
+  ! Resolve the EOS form and its unit-scaling once (host v-table lookup), so the density derivatives
+  ! can be evaluated through the device-callable elementwise dispatcher instead of the polymorphic
+  ! array interface.  The scaling is always applied; for the unscaled case the factors are exactly
+  ! 1.0, reproducing the former array calculate_density_derivs calls bit-for-bit.
+  eos_form = -1
+  eos_kg_m3_to_R = 1.0 ; eos_C_to_degC = 1.0 ; eos_S_to_ppt = 1.0 ; eos_RL2_T2_to_Pa = 1.0
+  if (use_EOS) then
+    call get_EOS_form_and_scaling(tv%eqn_of_state, eos_form, eos_kg_m3_to_R, eos_C_to_degC, &
+                                  eos_S_to_ppt, eos_RL2_T2_to_Pa)
+#ifdef __NVCOMPILER_OPENMP_GPU
+    if ((eos_form /= EOS_ROQUET_RHO) .and. (eos_form /= EOS_WRIGHT)) call MOM_error(FATAL, &
+      "thickness_diffuse_full GPU build: EQN_OF_STATE has no device-callable density-derivs kernel "// &
+      "(only ROQUET_RHO and WRIGHT are supported); use a CPU build or add a _loc kernel.")
+#endif
+  endif
+
   !$OMP parallel do default(none) shared(nz,is,ie,js,je,find_work,use_EOS,G,GV,US,pres,T,S, &
   !$OMP                                  nk_linear,IsdB,tv,h,h_neglect,e,dz,dz_neglect,dz_neglect2, &
   !$OMP                                  h_neglect2,hn_2,I_slope_max2,int_slope_u,KH_u,uhtot, &
   !$OMP                                  h_frac,h_avail_rsum,uhD,h_avail,Work_u,CS,slope_x,cg1, &
   !$OMP                                  diag_sfn_x,diag_sfn_unlim_x,N2_floor,EOSdom_u,EOSdom_h1, &
-  !$OMP                                  use_stanley,present_slope_x,G_rho0,Slope_x_PE,hN2_x_PE) &
+  !$OMP                                  use_stanley,present_slope_x,G_rho0,Slope_x_PE,hN2_x_PE, &
+  !$OMP                                  eos_form,eos_kg_m3_to_R,eos_C_to_degC,eos_S_to_ppt,eos_RL2_T2_to_Pa) &
   !$OMP                          private(drdiA,drdiB,drdkL,drdkR,pres_u,T_u,S_u,G_scale, &
   !$OMP                                  drho_dT_u,drho_dS_u,hg2A,hg2B,hg2L,hg2R,haA, &
   !$OMP                                  drho_dT_dT_h,scrap,pres_h,T_h,S_h,N2_unlim,  &
@@ -929,9 +953,11 @@ subroutine thickness_diffuse_full(h, e, Kh_u, Kh_v, tv, uhD, vhD, cg1, dt, G, GV
           pres_u(I) = 0.5*(pres(i,j,K) + pres(i+1,j,K))
           T_u(I) = 0.25*((T(i,j,k) + T(i+1,j,k)) + (T(i,j,k-1) + T(i+1,j,k-1)))
           S_u(I) = 0.25*((S(i,j,k) + S(i+1,j,k)) + (S(i,j,k-1) + S(i+1,j,k-1)))
+          call calculate_density_derivs_elem_loc(eos_form, eos_C_to_degC*T_u(I), eos_S_to_ppt*S_u(I), &
+                     eos_RL2_T2_to_Pa*pres_u(I), drho_dT_u(I), drho_dS_u(I))
+          drho_dT_u(I) = (eos_kg_m3_to_R*eos_C_to_degC) * drho_dT_u(I)
+          drho_dS_u(I) = (eos_kg_m3_to_R*eos_S_to_ppt) * drho_dS_u(I)
         enddo
-        call calculate_density_derivs(T_u, S_u, pres_u, drho_dT_u, drho_dS_u, &
-                                      tv%eqn_of_state, EOSdom_u)
       endif
       if (use_stanley) then
         do i=is-1,ie+1
@@ -1218,7 +1244,8 @@ subroutine thickness_diffuse_full(h, e, Kh_u, Kh_v, tv, uhD, vhD, cg1, dt, G, GV
   !$OMP                                  h_neglect2,int_slope_v,KH_v,vhtot,h_frac,h_avail_rsum, &
   !$OMP                                  I_slope_max2,vhD,h_avail,Work_v,CS,slope_y,cg1,hn_2,&
   !$OMP                                  diag_sfn_y,diag_sfn_unlim_y,N2_floor,EOSdom_v,use_stanley,&
-  !$OMP                                  present_slope_y,G_rho0,Slope_y_PE,hN2_y_PE)  &
+  !$OMP                                  present_slope_y,G_rho0,Slope_y_PE,hN2_y_PE, &
+  !$OMP                                  eos_form,eos_kg_m3_to_R,eos_C_to_degC,eos_S_to_ppt,eos_RL2_T2_to_Pa)  &
   !$OMP                          private(drdjA,drdjB,drdkL,drdkR,pres_v,T_v,S_v,S_h,S_hr,    &
   !$OMP                                  drho_dT_v,drho_dS_v,hg2A,hg2B,hg2L,hg2R,haA,G_scale, &
   !$OMP                                  drho_dT_dT_h,drho_dT_dT_hr,scrap,pres_h,T_h,T_hr,   &
@@ -1242,9 +1269,11 @@ subroutine thickness_diffuse_full(h, e, Kh_u, Kh_v, tv, uhD, vhD, cg1, dt, G, GV
           pres_v(i) = 0.5*(pres(i,j,K) + pres(i,j+1,K))
           T_v(i) = 0.25*((T(i,j,k) + T(i,j+1,k)) + (T(i,j,k-1) + T(i,j+1,k-1)))
           S_v(i) = 0.25*((S(i,j,k) + S(i,j+1,k)) + (S(i,j,k-1) + S(i,j+1,k-1)))
+          call calculate_density_derivs_elem_loc(eos_form, eos_C_to_degC*T_v(i), eos_S_to_ppt*S_v(i), &
+                     eos_RL2_T2_to_Pa*pres_v(i), drho_dT_v(i), drho_dS_v(i))
+          drho_dT_v(i) = (eos_kg_m3_to_R*eos_C_to_degC) * drho_dT_v(i)
+          drho_dS_v(i) = (eos_kg_m3_to_R*eos_S_to_ppt) * drho_dS_v(i)
         enddo
-        call calculate_density_derivs(T_v, S_v, pres_v, drho_dT_v, drho_dS_v, &
-                                      tv%eqn_of_state, EOSdom_v)
       endif
       if (use_stanley) then
         do i=is,ie
@@ -1541,9 +1570,11 @@ subroutine thickness_diffuse_full(h, e, Kh_u, Kh_v, tv, uhD, vhD, cg1, dt, G, GV
           pres_u(I) = 0.5*(pres(i,j,1) + pres(i+1,j,1))
           T_u(I) = 0.5*(T(i,j,1) + T(i+1,j,1))
           S_u(I) = 0.5*(S(i,j,1) + S(i+1,j,1))
+          call calculate_density_derivs_elem_loc(eos_form, eos_C_to_degC*T_u(I), eos_S_to_ppt*S_u(I), &
+                     eos_RL2_T2_to_Pa*pres_u(I), drho_dT_u(I), drho_dS_u(I))
+          drho_dT_u(I) = (eos_kg_m3_to_R*eos_C_to_degC) * drho_dT_u(I)
+          drho_dS_u(I) = (eos_kg_m3_to_R*eos_S_to_ppt) * drho_dS_u(I)
         enddo
-        call calculate_density_derivs(T_u, S_u, pres_u, drho_dT_u, drho_dS_u, &
-                                      tv%eqn_of_state, EOSdom_u )
       endif
       do I=is-1,ie
         uhD(I,j,1) = -uhtot(I,j)
