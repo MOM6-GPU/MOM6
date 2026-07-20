@@ -303,6 +303,14 @@ character*(7), parameter  :: EFACTOR_STRING   = "EFACTOR"       !< EFACTOR (base
 !! (USE_LA_LI2016) statistical-wave path is compiled (the wave-model branches are host-only).
 !$omp declare target(get_StokesSL_LiFoxKemper, ust_2_u10_coare3p5)
 
+! TODO(gpu-bitwise-repro): this LF17 Langmuir chain runs on-device (called from ePBL_column) and
+! adds device-vs-host libm/libdevice transcendental divergence that feeds the ~1e-13 ePBL energy
+! floor (LA -> mstar_LT). Live sites (benchmark_ALE, WAVE_INTERFACE_ANSWER_DATE=99991231): exp() in
+! one_minus_exp_x; erfc() in get_StokesSL_LiFoxKemper r5 (the large root_2kz branch); PI=4*atan(1.0)
+! (a compile-time constant, usually folded). sqrt() is IEEE-exact (fine). No deterministic drop-in;
+! part of Marshall's matched-transcendental / bitwise-repro pass -- see the audit in
+! MOM_energetic_PBL.F90 and the [[gpu-transcendental-bitwise-plan]] auto-memory. Do NOT duplicate.
+
 contains
 
 !> Initializes parameters related to MOM_wave_interface
