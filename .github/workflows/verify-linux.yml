@@ -684,37 +684,71 @@ jobs:
       # with. benchmark is a much larger grid than the other two, so it gets
       # a shorter DAYMAX to keep the smoke run quick; double_gyre is already
       # small and fast at its checked-in DAYMAX, so only LAYOUT is forced.
+      #
+      # Some checked-in MOM_override files already carry their own #override
+      # DAYMAX/LAYOUT lines (e.g. benchmark's ships with an active
+      # `#override DAYMAX = 24.`). MOM_file_parser fatals if a second,
+      # differing #override for the same parameter is appended to the same
+      # file ("found with multiple inconsistent overrides"), so strip any
+      # pre-existing DAYMAX/LAYOUT overrides before adding ours.
       - name: Shorten cases to single-rank, single short runs
         run: |
+          for case in benchmark_ALE double_gyre benchmark; do
+            sed -i -E '/^!*#override[[:space:]]+(DAYMAX|LAYOUT)[[:space:]]*=/d' \
+              "MOM6-examples/ocean_only/$case/MOM_override"
+          done
           {
             echo '#override DAYMAX = 0.5'
             echo '#override LAYOUT = 1,1'
           } >> MOM6-examples/ocean_only/benchmark_ALE/MOM_override
           echo '#override LAYOUT = 1,1' >> MOM6-examples/ocean_only/double_gyre/MOM_override
           {
-            echo '#override DAYMAX = 0.25'
+            echo '#override DAYMAX = 3'
             echo '#override LAYOUT = 1,1'
           } >> MOM6-examples/ocean_only/benchmark/MOM_override
 
-      # Runs are chained through the same coverage-instrumented binary, so
-      # gcov's counters accumulate across all three cases (each run adds to
-      # the .gcda files rather than replacing them) and the report below
-      # reflects code paths exercised by any of them.
-      - name: Run benchmark_ALE with the coverage-instrumented binary
+      # Each case's coverage is captured in isolation: .gcda counters are reset
+      # before every run, so this case's gcov snapshot (and the per-case HTML
+      # report generated from it below) reflects only its own code paths, not
+      # an accumulation across all three. Snapshots are archived to
+      # gcov-reports/<case>/ before the next case resets the counters again.
+      - name: Run benchmark_ALE and archive its own gcov snapshot
         working-directory: MOM6-examples/ocean_only/benchmark_ALE
-        run: mpirun -np 1 "$GITHUB_WORKSPACE/.testing/build/cov/MOM6"
+        run: |
+          rm -f "$GITHUB_WORKSPACE/.testing/build/cov"/*.gcda
+          mpirun -np 1 "$GITHUB_WORKSPACE/.testing/build/cov/MOM6"
+          cd "$GITHUB_WORKSPACE/.testing/build/cov" && gcov -b *.gcda
+          mkdir -p "$GITHUB_WORKSPACE/gcov-reports/benchmark_ALE"
+          mv "$GITHUB_WORKSPACE/.testing/build/cov"/*.gcov "$GITHUB_WORKSPACE/gcov-reports/benchmark_ALE/"
 
-      - name: Run double_gyre with the coverage-instrumented binary
+      - name: Run double_gyre and archive its own gcov snapshot
         working-directory: MOM6-examples/ocean_only/double_gyre
-        run: mpirun -np 1 "$GITHUB_WORKSPACE/.testing/build/cov/MOM6"
+        run: |
+          rm -f "$GITHUB_WORKSPACE/.testing/build/cov"/*.gcda
+          mpirun -np 1 "$GITHUB_WORKSPACE/.testing/build/cov/MOM6"
+          cd "$GITHUB_WORKSPACE/.testing/build/cov" && gcov -b *.gcda
+          mkdir -p "$GITHUB_WORKSPACE/gcov-reports/double_gyre"
+          mv "$GITHUB_WORKSPACE/.testing/build/cov"/*.gcov "$GITHUB_WORKSPACE/gcov-reports/double_gyre/"
 
-      - name: Run benchmark with the coverage-instrumented binary
+      - name: Run benchmark and archive its own gcov snapshot
         working-directory: MOM6-examples/ocean_only/benchmark
-        run: mpirun -np 1 "$GITHUB_WORKSPACE/.testing/build/cov/MOM6"
+        run: |
+          rm -f "$GITHUB_WORKSPACE/.testing/build/cov"/*.gcda
+          mpirun -np 1 "$GITHUB_WORKSPACE/.testing/build/cov/MOM6"
+          cd "$GITHUB_WORKSPACE/.testing/build/cov" && gcov -b *.gcda
+          mkdir -p "$GITHUB_WORKSPACE/gcov-reports/benchmark"
+          mv "$GITHUB_WORKSPACE/.testing/build/cov"/*.gcov "$GITHUB_WORKSPACE/gcov-reports/benchmark/"
 
-      - name: Generate gcov reports
-        working-directory: .testing/build/cov
-        run: gcov -b *.gcda
+      # One page per case, generated from that case's own isolated snapshot
+      # above (gcov-reports/<case>/) — not the combined report below.
+      - name: Generate per-case GPU port coverage pages
+        run: |
+          for case in benchmark_ALE double_gyre benchmark; do
+            python3 .testing/tools/track_gpu_port.py \
+              --src-root . \
+              --gcov-dir "gcov-reports/$case" \
+              --out-html "gpu_port_html/$case"
+          done
 
       # List the .F90/.f90 files this PR actually touches, so the comment can report a
       # "this PR's files" subset in addition to the repo-wide total. Paths are left
@@ -757,7 +791,12 @@ jobs:
           github-token: ${{ github.token }}
           path: baseline
 
-      - name: Generate GPU port coverage report
+      # Combines all three cases' archived snapshots (gcov-reports/<case>/) into the
+      # one overall report used for the PR comment, baseline delta, job summary, and
+      # annotations — mathematically the same union-of-executed-lines a single
+      # accumulated run would give, since track_gpu_port.py already merges same-source
+      # counts across every .gcov file found under --gcov-dir (recursively).
+      - name: Generate combined GPU port coverage report
         run: |
           EXTRA_ARGS=()
           if [ -f baseline/gpu_port_report.json ]; then
@@ -768,7 +807,7 @@ jobs:
           fi
           python3 .testing/tools/track_gpu_port.py \
             --src-root . \
-            --gcov-dir .testing/build/cov \
+            --gcov-dir gcov-reports \
             --out-md gpu_port_report.md \
             --out-json gpu_port_report.json \
             --out-html gpu_port_html \
