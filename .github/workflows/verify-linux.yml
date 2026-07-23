@@ -644,12 +644,12 @@ jobs:
           tar -xpvf mom6-coverage.tar
           find .testing/build/cov -name "*.gcno" -exec touch {} \;
 
-      # Only the benchmark_ALE inputs are needed here — no MOM6/FMS build,
-      # since the coverage-instrumented binary from build-coverage is reused
-      # as-is. A plain `git clone` would also pull down every other case's
-      # input/restart files (several NetCDF files each), so this fetches
-      # just the one directory instead.
-      - name: Clone MOM6-gpu/MOM6-examples for the benchmark_ALE case
+      # Only the inputs for these three cases are needed here — no MOM6/FMS
+      # build, since the coverage-instrumented binary from build-coverage is
+      # reused as-is for all of them. A plain `git clone` would also pull
+      # down every other case's input/restart files (several NetCDF files
+      # each), so this fetches just these directories instead.
+      - name: Clone MOM6-gpu/MOM6-examples for the benchmark_ALE, double_gyre, and benchmark cases
         run: |
           # --depth 1: only fetch the latest commit, not the repo's full
           #   history.
@@ -664,27 +664,52 @@ jobs:
           git clone --depth 1 --filter=blob:none --no-checkout \
             https://github.com/MOM6-gpu/MOM6-examples.git MOM6-examples
           cd MOM6-examples
-          # `git archive` packs a directory (here, just
-          # ocean_only/benchmark_ALE) from a given commit (HEAD) into a
-          # tar stream. This is what triggers the on-demand blob fetch
-          # from above — only for files under this path — and `tar -x`
-          # unpacks that stream straight into the working directory, so
-          # the net effect is "check out just this one directory" without
-          # ever downloading the other cases' data files.
-          git archive HEAD -- ocean_only/benchmark_ALE | tar -x
+          # `git archive` packs directories (here, ocean_only/benchmark_ALE,
+          # ocean_only/double_gyre, and ocean_only/benchmark) from a given
+          # commit (HEAD) into a tar stream. This is what triggers the
+          # on-demand blob fetch from above — only for files under these
+          # paths — and `tar -x` unpacks that stream straight into the
+          # working directory, so the net effect is "check out just these
+          # directories" without ever downloading the other cases' data
+          # files.
+          git archive HEAD -- \
+            ocean_only/benchmark_ALE \
+            ocean_only/double_gyre \
+            ocean_only/benchmark \
+            | tar -x
 
-      # Force a single-rank layout and a short run: this is a coverage smoke
-      # run, not a scaling test, and the runner may have far fewer cores
-      # than whatever layout benchmark_ALE happens to be checked in with.
-      - name: Shorten benchmark_ALE to a single-rank, single short run
+      # Force a single-rank layout and a short run for each case: these are
+      # coverage smoke runs, not scaling tests, and the runner may have far
+      # fewer cores than whatever layout each case happens to be checked in
+      # with. benchmark is a much larger grid than the other two, so it gets
+      # a shorter DAYMAX to keep the smoke run quick; double_gyre is already
+      # small and fast at its checked-in DAYMAX, so only LAYOUT is forced.
+      - name: Shorten cases to single-rank, single short runs
         run: |
           {
             echo '#override DAYMAX = 0.5'
             echo '#override LAYOUT = 1,1'
           } >> MOM6-examples/ocean_only/benchmark_ALE/MOM_override
+          echo '#override LAYOUT = 1,1' >> MOM6-examples/ocean_only/double_gyre/MOM_override
+          {
+            echo '#override DAYMAX = 0.25'
+            echo '#override LAYOUT = 1,1'
+          } >> MOM6-examples/ocean_only/benchmark/MOM_override
 
+      # Runs are chained through the same coverage-instrumented binary, so
+      # gcov's counters accumulate across all three cases (each run adds to
+      # the .gcda files rather than replacing them) and the report below
+      # reflects code paths exercised by any of them.
       - name: Run benchmark_ALE with the coverage-instrumented binary
         working-directory: MOM6-examples/ocean_only/benchmark_ALE
+        run: mpirun -np 1 "$GITHUB_WORKSPACE/.testing/build/cov/MOM6"
+
+      - name: Run double_gyre with the coverage-instrumented binary
+        working-directory: MOM6-examples/ocean_only/double_gyre
+        run: mpirun -np 1 "$GITHUB_WORKSPACE/.testing/build/cov/MOM6"
+
+      - name: Run benchmark with the coverage-instrumented binary
+        working-directory: MOM6-examples/ocean_only/benchmark
         run: mpirun -np 1 "$GITHUB_WORKSPACE/.testing/build/cov/MOM6"
 
       - name: Generate gcov reports
