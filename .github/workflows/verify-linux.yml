@@ -810,10 +810,31 @@ jobs:
             --gcov-dir gcov-reports \
             --out-md gpu_port_report.md \
             --out-json gpu_port_report.json \
-            --out-html gpu_port_html \
+            --out-html gpu_port_html/total \
             --github-annotations \
             --verbose \
             "${EXTRA_ARGS[@]}"
+
+      # gpu_port_html/ itself has no report of its own — total/ (above) and each
+      # case/ (from "Generate per-case GPU port coverage pages") are siblings inside
+      # it, so this page just lets a reader pick one. Copied as-is to gh-pages by
+      # gpu-port-comment.yml, so this becomes the landing page at pr-<number>/ or
+      # porting_progress/.
+      - name: Generate GPU port coverage case picker page
+        run: |
+          {
+            echo '<!doctype html><html><head><meta charset="utf-8">'
+            echo '<title>GPU port coverage</title>'
+            echo '<style>body{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;margin:0;padding:1rem 1.5rem}ul{padding-left:1.2rem}li{margin:4px 0}</style>'
+            echo '</head><body>'
+            echo '<h1>GPU port coverage</h1>'
+            echo '<ul>'
+            echo '<li><a href="total/index.html">total (all three cases combined)</a></li>'
+            for case in benchmark_ALE double_gyre benchmark; do
+              echo "<li><a href=\"$case/index.html\">$case</a></li>"
+            done
+            echo '</ul></body></html>'
+          } > gpu_port_html/index.html
 
       - name: Publish report to job summary
         if: always()
