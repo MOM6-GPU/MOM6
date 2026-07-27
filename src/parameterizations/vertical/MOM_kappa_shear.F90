@@ -132,7 +132,7 @@ end type Kappa_shear_CS
 ! integer :: id_clock_project, id_clock_KQ, id_clock_avg, id_clock_setup
 
 ! The per-column solver and its helpers are device-callable so the driver column loop
-! can run inside a target region (GPU port increment 3).
+! can run inside a target region .
 !$omp declare target(kappa_shear_column, find_kappa_tke, calculate_projected_state)
 
 !> A compile-time ceiling on the number of layers in GPU builds, used to give the
@@ -232,8 +232,6 @@ subroutine Calculate_kappa_shear(u_in, v_in, h, tv, p_surf, kappa_io, tke_io, &
 
   use_temperature = associated(tv%T)
 
-  ! GPU port increment 3a: resolve the EOS form + unit scaling once on the host (the accessor
-  ! and MOM_error are not device-callable) so they can be passed into the column solver.
   eos_form = -1
   eos_kg_m3_to_R = 1.0 ; eos_C_to_degC = 1.0 ; eos_S_to_ppt = 1.0 ; eos_RL2_T2_to_Pa = 1.0
   if (use_temperature) then
@@ -585,9 +583,6 @@ subroutine Calc_kappa_shear_vertex(u_in, v_in, h, T_in, S_in, tv, p_surf, kappa_
 
   use_temperature = associated(tv%T)
 
-  ! GPU port increment 3a: resolve the EOS form + unit scaling once on the host (the accessor
-  ! and MOM_error are not device-callable) so they can be passed into the column solver, which
-  ! will run inside a device region.
   eos_form = -1
   eos_kg_m3_to_R = 1.0 ; eos_C_to_degC = 1.0 ; eos_S_to_ppt = 1.0 ; eos_RL2_T2_to_Pa = 1.0
   if (use_temperature) then
@@ -607,10 +602,6 @@ subroutine Calc_kappa_shear_vertex(u_in, v_in, h, T_in, S_in, tv, p_surf, kappa_
   I_Prandtl = 0.0 ; if (CS%Prandtl_turb > 0.0) I_Prandtl = 1.0 / CS%Prandtl_turb
   H_tiny = 0.5 * GV%H_subroundoff
 
-  ! GPU port increment 3: interpolate the surface pressure to the vertices on the host, ahead
-  ! of the device column region (p_surf is a possibly-unassociated pointer, which is simpler to
-  ! keep off the device).  The expressions are verbatim from the former in-column code, but are
-  ! evaluated for every vertex instead of only ocean vertices; the extra values are never read.
   surface_pres_2d(:,:) = 0.0
   if (associated(p_surf)) then
     if (CS%psurf_bug) then
@@ -632,10 +623,6 @@ subroutine Calc_kappa_shear_vertex(u_in, v_in, h, T_in, S_in, tv, p_surf, kappa_
   ! Convert layer thicknesses into geometric thickness in height units.
   call thickness_to_dz(h, tv, dz_3d, G, GV, US, halo_size=1)
 
-  ! --- GPU port increment 1: h_at_u/h_at_v interpolation offloaded to device.
-  ! h is host-authoritative in the (host-only) diabatic stack; refresh the device copy.
-  ! G%mask2dCu/Cv/T are already device-resident (mapped in initialize_MOM). h_at_u/h_at_v
-  ! are device workspace, consumed on the device by the slab interpolation below.
   !$omp target enter data map(to: h)
   !$omp target update to(h)
   !$omp target enter data map(alloc: h_at_u, h_at_v)
@@ -661,16 +648,6 @@ subroutine Calc_kappa_shear_vertex(u_in, v_in, h, T_in, S_in, tv, p_surf, kappa_
     enddo
   endif
 
-  ! --- GPU port increment 2: the per-J 2-D vertex slabs are promoted to 3-D arrays computed on
-  ! the device in one pass over J before the column loop.  The loop bodies are verbatim from the
-  ! former per-J loops, except that I_hwt is inlined as a reciprocal multiply (bitwise-identical)
-  ! and the temperature/salinity branch is hoisted out of the loop so each body is purely
-  ! elementwise.  u_in/v_in (the dycore u,v) are already device-resident but host-
-  ! authoritative at this point in the (host-only) diabatic stack, so they need an explicit
-  ! refresh — a map(to:) on an already-present object does NOT copy.  T_in/S_in (the caller's
-  ! convection-filtered T_f/S_f) and dz_3d are fresh host locals each call, so their map(to:)
-  ! does copy.  h_at_u/h_at_v are consumed on the device here, so increment 1's copy-back is
-  ! no longer needed.
   !$omp target enter data map(to: u_in, v_in, T_in, S_in, dz_3d)
   !$omp target update to(u_in, v_in)
   !$omp target enter data map(alloc: u_slab, v_slab, T_slab, S_slab, h_slab, dz_slab, rho_slab)
@@ -717,24 +694,9 @@ subroutine Calc_kappa_shear_vertex(u_in, v_in, h, T_in, S_in, tv, p_surf, kappa_
     enddo
   endif
 
-  ! --- GPU port increment 3: run the per-column solver on the device.  The columns iterate as
-  ! a target teams loop collapsed over (J,I); every piece of per-column scratch is private (the
-  ! declare-target solver's own locals are automatically private per device thread).  CS is all
-  ! scalars plus a diag pointer that is never dereferenced in the device code, so a per-call
-  ! shallow map(to:) suffices.  kappa_vertex/tke_io/kv_io are mapped to: (not alloc) so that the
-  ! host-set values - kv_io is intent(inout), kappa_vertex is zeroed on the host - survive the
-  ! full-array update from below.  The diag_* arrays are mapped after their (conditional) host
-  ! zeroing for the same reason.  kappa_3d/tke_3d are device-only staging for what was the per-J
-  ! kappa_2d/tke_2d, written per column and consumed by the write-back passes below.
   !$omp target enter data map(to: CS)
   !$omp target enter data map(to: surface_pres_2d)
   !$omp target enter data map(to: kappa_vertex, tke_io, kv_io)
-  ! kv_io's actual argument (visc%Kv_shear_Bu) is already persistently device-resident
-  ! (mapped in set_visc_init BEFORE the restart-reproducibility pass_var halo update), so the
-  ! map(to:) above does not copy it; without this refresh, the full-array update from below
-  ! would overwrite the corrected host halos with stale device values after a restart in
-  ! non-symmetric mode.  tke_io is not currently mapped elsewhere, but is refreshed too so
-  ! this routine does not silently depend on that staying true.
   !$omp target update to(tke_io, kv_io)
   !$omp target enter data map(to: diag_N2_init, diag_S2_init, diag_N2_mean, diag_S2_mean)
   !$omp target enter data map(alloc: kappa_3d, tke_3d)
@@ -1002,7 +964,6 @@ subroutine Calc_kappa_shear_vertex(u_in, v_in, h, T_in, S_in, tv, p_surf, kappa_
   if (CS%id_N2_mean > 0) call post_data(CS%id_N2_mean, diag_N2_mean, CS%diag)
   if (CS%id_S2_mean > 0) call post_data(CS%id_S2_mean, diag_S2_mean, CS%diag)
 
-  ! --- GPU port increments 1-3: mirror the enter-data above (balance discipline).
   !$omp target exit data map(release: kappa_3d, tke_3d)
   !$omp target exit data map(release: diag_N2_init, diag_S2_init, diag_N2_mean, diag_S2_mean)
   !$omp target exit data map(release: kappa_vertex, tke_io, kv_io)
@@ -2557,7 +2518,6 @@ function kappa_shear_init(Time, G, GV, US, param_file, diag, CS)
   endif
 
 #ifdef __NVCOMPILER_OPENMP_GPU
-  ! The device-executed column routines use fixed-size local arrays in GPU builds.
   if (kappa_shear_init .and. (GV%ke > GPU_nk_max)) call MOM_error(FATAL, &
     "kappa_shear_init: GPU builds of kappa_shear require GV%ke <= GPU_nk_max because the "//&
     "column routines use fixed-size local arrays on the device (this applies to the "//&
