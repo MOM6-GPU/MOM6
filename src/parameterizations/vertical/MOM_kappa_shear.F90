@@ -1030,7 +1030,8 @@ subroutine kappa_shear_column(kappa, tke, dt, nzc, f2, surface_pres, hlay, dz_la
   real,                    intent(in)    :: eos_kg_m3_to_R !< EOS factor converting kg m-3 to R [R m3 kg-1 ~> 1]
   real,                    intent(in)    :: eos_C_to_degC !< EOS factor converting temperature to degC [degC C-1 ~> 1]
   real,                    intent(in)    :: eos_S_to_ppt !< EOS factor converting salinity to ppt [ppt S-1 ~> 1]
-  real,                    intent(in)    :: eos_RL2_T2_to_Pa !< EOS factor converting pressure to Pa [Pa T2 R-1 L-2 ~> 1]
+  real,                    intent(in)    :: eos_RL2_T2_to_Pa !< EOS factor converting pressure 
+                                                             !! to Pa [Pa T2 R-1 L-2 ~> 1]
   logical,                 intent(in)    :: use_temperature !< If true, temperature and salinity are
                                            !! state variables (resolved host-side to avoid a device
                                            !! read of the tv%T pointer).
