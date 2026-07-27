@@ -25,6 +25,7 @@ use MOM_EOS,               only : EOS_ROQUET_RHO, EOS_WRIGHT
 implicit none ; private
 
 #include <MOM_memory.h>
+#include "do_concurrent_compat.h"
 
 public Calculate_kappa_shear, Calc_kappa_shear_vertex, kappa_shear_init
 public kappa_shear_is_used, kappa_shear_at_vertex
@@ -84,6 +85,8 @@ type, public :: Kappa_shear_CS ; private
                              !! iteration.  The bug causes under-corrections when dz > 1m.
   logical :: KS_at_vertex    !< If true, do the calculations of the shear-driven mixing
                              !! at the cell vertices (i.e., the vorticity points).
+  integer :: njblock         !< The J-direction block size used for the vertex scratch slabs
+                             !! in Calc_kappa_shear_vertex [nondim].
   logical :: eliminate_massless !< If true, massless layers are merged with neighboring
                              !! massive layers in this calculation.
                              !  I can think of no good reason why this should be false. - RWH
@@ -499,12 +502,18 @@ subroutine Calc_kappa_shear_vertex(u_in, v_in, h, T_in, S_in, tv, p_surf, kappa_
     h_at_u          ! A mask-weighted thickness interpolated to u-points [H ~> m or kg m-2]
   real, dimension(SZI_(G),SZJB_(G),SZK_(GV)) :: &
     h_at_v          ! A mask-weighted thickness interpolated to v-points [H ~> m or kg m-2]
-  real, dimension(SZIB_(G),SZJB_(G),SZK_(GV)) :: &
+  ! The vertex scratch slabs below are blocked in J: their second extent is the block size, not
+  ! the full J range, and they are indexed by the block-local jj = J - Jstart + 1.  The full J
+  ! extent at vertices is JeB-JsB+1 = G%JecB-(G%jsc-1)+1; CS%njblock==0 selects it, which collapses
+  ! the block loop to a single pass over the whole domain (the GPU default).  A block size of 1
+  ! (the CPU default) reduces these to one vertex row at a time, so the scratch stays cache
+  ! resident as it did before these were promoted to full 3-D arrays for offload.
+  real, dimension(SZIB_(G),merge(G%JecB-G%jsc+2,CS%njblock,CS%njblock==0),SZK_(GV)) :: &
     h_slab, &           ! A version of h interpolated to vertices [H ~> m or kg m-2].
     dz_slab, &          ! Vertical distance between interface heights at vertices [Z ~> m].
     u_slab, v_slab, &   ! Versions of u_in and v_in interpolated to vertices [L T-1 ~> m s-1].
     T_slab, S_slab, rho_slab ! Vertex versions of T [C ~> degC], S [S ~> ppt], and rho [R ~> kg m-3].
-  real, dimension(SZIB_(G),SZJB_(G),SZK_(GV)+1) :: &
+  real, dimension(SZIB_(G),merge(G%JecB-G%jsc+2,CS%njblock,CS%njblock==0),SZK_(GV)+1) :: &
     kappa_3d, & ! Device staging array for the columns' averaged kappa [H Z T-1 ~> m2 s-1 or Pa s]
     tke_3d      ! Device staging array for the columns' TKE [Z2 T-2 ~> m2 s-2].
   real, dimension(SZIB_(G),SZJB_(G)) :: &
@@ -569,11 +578,13 @@ subroutine Calc_kappa_shear_vertex(u_in, v_in, h, T_in, S_in, tv, p_surf, kappa_
   real :: H_tiny        ! A sub-roundoff thickness to use in the denominator when calculating
                         ! thickness-weighted averages [H ~> m or kg m-2]
   integer :: IsB, IeB, JsB, JeB, i, j, k, nz, nzc
+  integer :: Jstart, Jend, njblock, jj ! J-blocking bounds, block size and block-local J index.
   integer :: eos_form   ! The equation-of-state form id, resolved host-side for the GPU EOS path.
   real :: eos_kg_m3_to_R, eos_C_to_degC, eos_S_to_ppt, eos_RL2_T2_to_Pa ! EOS unit-rescaling factors.
 
   ! Diagnostics that should be deleted?
   isB = G%isc-1 ; ieB = G%iecB ; jsB = G%jsc-1 ; jeB = G%jecB ; nz = GV%ke
+  njblock = merge(JeB-JsB+1, CS%njblock, CS%njblock==0)
 
   if ((CS%id_N2_init>0) .or. CS%debug) diag_N2_init(:,:,:) = 0.0
   if ((CS%id_S2_init>0) .or. CS%debug) diag_S2_init(:,:,:) = 0.0
@@ -651,36 +662,49 @@ subroutine Calc_kappa_shear_vertex(u_in, v_in, h, T_in, S_in, tv, p_surf, kappa_
   !$omp target enter data map(to: u_in, v_in, T_in, S_in, dz_3d)
   !$omp target update to(u_in, v_in)
   !$omp target enter data map(alloc: u_slab, v_slab, T_slab, S_slab, h_slab, dz_slab, rho_slab)
+  !$omp target enter data map(to: CS)
+  !$omp target enter data map(to: surface_pres_2d)
+  !$omp target enter data map(to: kappa_vertex, tke_io, kv_io)
+  !$omp target update to(tke_io, kv_io)
+  !$omp target enter data map(to: diag_N2_init, diag_S2_init, diag_N2_mean, diag_S2_mean)
+  !$omp target enter data map(alloc: kappa_3d, tke_3d)
+
+  ! The scratch slabs are allocated on the device once, at the block size, and reused by every
+  ! block; only the loop bounds below change from one block to the next.
+  do Jstart=JsB,JeB,njblock
+    Jend = min(Jstart+njblock-1, JeB)
 
   ! Interpolate the various quantities to the corners, using masks.
-  do concurrent (k=1:nz, J=JsB:JeB, I=IsB:IeB)
-    u_slab(I,J,k) = ( (u_in(I,j,k) * h_at_u(I,j,k)) + (u_in(I,j+1,k) * h_at_u(I,j+1,k)) ) / &
+  do concurrent (k=1:nz, J=Jstart:Jend, I=IsB:IeB) DO_LOCALITY(local(jj))
+    jj = J - Jstart + 1
+    u_slab(I,jj,k) = ( (u_in(I,j,k) * h_at_u(I,j,k)) + (u_in(I,j+1,k) * h_at_u(I,j+1,k)) ) / &
                     ( (h_at_u(I,j,k) + h_at_u(I,j+1,k)) + H_tiny )
-    v_slab(I,J,k) = ( (v_in(i,J,k) * h_at_v(i,J,k)) + (v_in(i+1,J,k) * h_at_v(i+1,J,k)) ) / &
+    v_slab(I,jj,k) = ( (v_in(i,J,k) * h_at_v(i,J,k)) + (v_in(i+1,J,k) * h_at_v(i+1,J,k)) ) / &
                     ( (h_at_v(i,J,k) + h_at_v(i+1,J,k)) + H_tiny )
 
-    h_slab(I,J,k) = ((G%mask2dT(i,j) * h(i,j,k) + G%mask2dT(i+1,j+1) * h(i+1,j+1,k)) + &
+    h_slab(I,jj,k) = ((G%mask2dT(i,j) * h(i,j,k) + G%mask2dT(i+1,j+1) * h(i+1,j+1,k)) + &
                      (G%mask2dT(i+1,j) * h(i+1,j,k) + G%mask2dT(i,j+1) * h(i,j+1,k)) ) / &
                     ((G%mask2dT(i,j) + G%mask2dT(i+1,j+1)) + &
                      (G%mask2dT(i+1,j) + G%mask2dT(i,j+1)) + 1.0e-36 )
-    dz_slab(I,J,k) = ((G%mask2dT(i,j) * dz_3d(i,j,k) + G%mask2dT(i+1,j+1) * dz_3d(i+1,j+1,k)) + &
+    dz_slab(I,jj,k) = ((G%mask2dT(i,j) * dz_3d(i,j,k) + G%mask2dT(i+1,j+1) * dz_3d(i+1,j+1,k)) + &
                       (G%mask2dT(i+1,j) * dz_3d(i+1,j,k) + G%mask2dT(i,j+1) * dz_3d(i,j+1,k)) ) / &
                      ((G%mask2dT(i,j) + G%mask2dT(i+1,j+1)) + &
                       (G%mask2dT(i+1,j) + G%mask2dT(i,j+1)) + 1.0e-36 )
-!    h_slab(I,J,k) = 0.25*((h(i,j,k) + h(i+1,j+1,k)) + (h(i+1,j,k) + h(i,j+1,k)))
-!    h_slab(I,J,k) = (((h(i,j,k)**2) + (h(i+1,j+1,k)**2)) + &
+!    h_slab(I,jj,k) = 0.25*((h(i,j,k) + h(i+1,j+1,k)) + (h(i+1,j,k) + h(i,j+1,k)))
+!    h_slab(I,jj,k) = (((h(i,j,k)**2) + (h(i+1,j+1,k)**2)) + &
 !                     ((h(i+1,j,k)**2) + (h(i,j+1,k)**2))) * I_hwt
   enddo
   if (use_temperature) then
-    do concurrent (k=1:nz, J=JsB:JeB, I=IsB:IeB)
-      T_slab(I,J,k) = ( (G%mask2dT(i,j) * (h(i,j,k) * T_in(i,j,k)) + &
+    do concurrent (k=1:nz, J=Jstart:Jend, I=IsB:IeB) DO_LOCALITY(local(jj))
+      jj = J - Jstart + 1
+      T_slab(I,jj,k) = ( (G%mask2dT(i,j) * (h(i,j,k) * T_in(i,j,k)) + &
                          G%mask2dT(i+1,j+1) * (h(i+1,j+1,k) * T_in(i+1,j+1,k))) + &
                         (G%mask2dT(i+1,j) * (h(i+1,j,k) * T_in(i+1,j,k)) + &
                          G%mask2dT(i,j+1) * (h(i,j+1,k) * T_in(i,j+1,k))) ) * &
                       (1.0 / (((G%mask2dT(i,j) * h(i,j,k) + G%mask2dT(i+1,j+1) * h(i+1,j+1,k)) + &
                                (G%mask2dT(i+1,j) * h(i+1,j,k) + G%mask2dT(i,j+1) * h(i,j+1,k))) + &
                               GV%H_subroundoff))
-      S_slab(I,J,k) = ( (G%mask2dT(i,j) * (h(i,j,k) * S_in(i,j,k)) + &
+      S_slab(I,jj,k) = ( (G%mask2dT(i,j) * (h(i,j,k) * S_in(i,j,k)) + &
                          G%mask2dT(i+1,j+1) * (h(i+1,j+1,k) * S_in(i+1,j+1,k))) + &
                         (G%mask2dT(i+1,j) * (h(i+1,j,k) * S_in(i+1,j,k)) + &
                          G%mask2dT(i,j+1) * (h(i,j+1,k) * S_in(i,j+1,k))) ) * &
@@ -689,17 +713,11 @@ subroutine Calc_kappa_shear_vertex(u_in, v_in, h, T_in, S_in, tv, p_surf, kappa_
                               GV%H_subroundoff))
     enddo
   else
-    do concurrent (k=1:nz, J=JsB:JeB, I=IsB:IeB)
-      rho_slab(I,J,k) = GV%Rlay(k)
+    do concurrent (k=1:nz, J=Jstart:Jend, I=IsB:IeB) DO_LOCALITY(local(jj))
+      jj = J - Jstart + 1
+      rho_slab(I,jj,k) = GV%Rlay(k)
     enddo
   endif
-
-  !$omp target enter data map(to: CS)
-  !$omp target enter data map(to: surface_pres_2d)
-  !$omp target enter data map(to: kappa_vertex, tke_io, kv_io)
-  !$omp target update to(tke_io, kv_io)
-  !$omp target enter data map(to: diag_N2_init, diag_S2_init, diag_N2_mean, diag_S2_mean)
-  !$omp target enter data map(alloc: kappa_3d, tke_3d)
 
 !---------------------------------------
 ! Work on each column.
@@ -707,11 +725,11 @@ subroutine Calc_kappa_shear_vertex(u_in, v_in, h, T_in, S_in, tv, p_surf, kappa_
   !$omp target teams loop collapse(2) &
   !$omp   private(nzc, kc, kf, Idz, h_lay, dz_lay, u0xdz, v0xdz, T0xdz, S0xdz, dz_in_lay, &
   !$omp           f2, surface_pres, kappa, tke, kappa_avg, tke_avg, N2_init, S2_init, &
-  !$omp           N2_mean, S2_mean, k) &
+  !$omp           N2_mean, S2_mean, k, jj) &
   !$omp   firstprivate(nz, dt, k0dt, dz_massless, use_temperature, eos_form, &
-  !$omp                eos_kg_m3_to_R, eos_C_to_degC, eos_S_to_ppt, eos_RL2_T2_to_Pa)
-  do J=JsB,JeB
-    do I=IsB,IeB ; if ((G%mask2dCu(I,j) + G%mask2dCu(I,j+1)) + &
+  !$omp                eos_kg_m3_to_R, eos_C_to_degC, eos_S_to_ppt, eos_RL2_T2_to_Pa, Jstart)
+  do J=Jstart,Jend
+    do I=IsB,IeB ; jj = J - Jstart + 1 ; if ((G%mask2dCu(I,j) + G%mask2dCu(I,j+1)) + &
                        (G%mask2dCv(i,J) + G%mask2dCv(i+1,J)) > 0.0) then
     ! call cpu_clock_begin(Id_clock_setup)
       ! Store a transposed version of the initial arrays.
@@ -724,25 +742,25 @@ subroutine Calc_kappa_shear_vertex(u_in, v_in, h, T_in, S_in, tv, p_surf, kappa_
           T0xdz(k) = 0.0 ; S0xdz(k) = 0.0
 
           ! Add a new layer if this one has mass.
-!          if ((h_lay(nzc) > 0.0) .and. (h_slab(I,J,k) > dz_massless)) nzc = nzc+1
+!          if ((h_lay(nzc) > 0.0) .and. (h_slab(I,jj,k) > dz_massless)) nzc = nzc+1
           if ((k>CS%nkml) .and. (h_lay(nzc) > 0.0) .and. &
-              (h_slab(I,J,k) > dz_massless)) nzc = nzc+1
+              (h_slab(I,jj,k) > dz_massless)) nzc = nzc+1
 
           ! Only merge clusters of massless layers.
 !         if ((h_lay(nzc) > dz_massless) .or. &
-!             ((h_lay(nzc) > 0.0) .and. (h_slab(I,J,k) > dz_massless))) nzc = nzc+1
+!             ((h_lay(nzc) > 0.0) .and. (h_slab(I,jj,k) > dz_massless))) nzc = nzc+1
 
           kc(k) = nzc
-          h_lay(nzc) = h_lay(nzc) + h_slab(I,J,k)
-          dz_lay(nzc) = dz_lay(nzc) + dz_slab(I,J,k)
-          u0xdz(nzc) = u0xdz(nzc) + u_slab(I,J,k)*h_slab(I,J,k)
-          v0xdz(nzc) = v0xdz(nzc) + v_slab(I,J,k)*h_slab(I,J,k)
+          h_lay(nzc) = h_lay(nzc) + h_slab(I,jj,k)
+          dz_lay(nzc) = dz_lay(nzc) + dz_slab(I,jj,k)
+          u0xdz(nzc) = u0xdz(nzc) + u_slab(I,jj,k)*h_slab(I,jj,k)
+          v0xdz(nzc) = v0xdz(nzc) + v_slab(I,jj,k)*h_slab(I,jj,k)
           if (use_temperature) then
-            T0xdz(nzc) = T0xdz(nzc) + T_slab(I,J,k)*h_slab(I,J,k)
-            S0xdz(nzc) = S0xdz(nzc) + S_slab(I,J,k)*h_slab(I,J,k)
+            T0xdz(nzc) = T0xdz(nzc) + T_slab(I,jj,k)*h_slab(I,jj,k)
+            S0xdz(nzc) = S0xdz(nzc) + S_slab(I,jj,k)*h_slab(I,jj,k)
           else
-            T0xdz(nzc) = T0xdz(nzc) + rho_slab(I,J,k)*h_slab(I,J,k)
-            S0xdz(nzc) = S0xdz(nzc) + rho_slab(I,J,k)*h_slab(I,J,k)
+            T0xdz(nzc) = T0xdz(nzc) + rho_slab(I,jj,k)*h_slab(I,jj,k)
+            S0xdz(nzc) = S0xdz(nzc) + rho_slab(I,jj,k)*h_slab(I,jj,k)
           endif
         enddo
         kc(nz+1) = nzc+1
@@ -752,28 +770,28 @@ subroutine Calc_kappa_shear_vertex(u_in, v_in, h, T_in, S_in, tv, p_surf, kappa_
 
         !   Now determine kf, the fractional weight of interface kc when
         ! interpolating between interfaces kc and kc+1.
-        kf(1) = 0.0 ; dz_in_lay = h_slab(I,J,1)
+        kf(1) = 0.0 ; dz_in_lay = h_slab(I,jj,1)
         do k=2,nz
           if (kc(k) > kc(k-1)) then
-            kf(k) = 0.0 ; dz_in_lay = h_slab(I,J,k)
+            kf(k) = 0.0 ; dz_in_lay = h_slab(I,jj,k)
           else
-            kf(k) = dz_in_lay*Idz(kc(k)) ; dz_in_lay = dz_in_lay + h_slab(I,J,k)
+            kf(k) = dz_in_lay*Idz(kc(k)) ; dz_in_lay = dz_in_lay + h_slab(I,jj,k)
           endif
         enddo
         kf(nz+1) = 0.0
       else
         do k=1,nz
-          h_lay(k) = h_slab(I,J,k)
-          dz_lay(k) = dz_slab(I,J,k)
-          u0xdz(k) = u_slab(I,J,k)*h_lay(k) ; v0xdz(k) = v_slab(I,J,k)*h_lay(k)
+          h_lay(k) = h_slab(I,jj,k)
+          dz_lay(k) = dz_slab(I,jj,k)
+          u0xdz(k) = u_slab(I,jj,k)*h_lay(k) ; v0xdz(k) = v_slab(I,jj,k)*h_lay(k)
         enddo
         if (use_temperature) then
           do k=1,nz
-            T0xdz(k) = T_slab(I,J,k)*h_lay(k) ; S0xdz(k) = S_slab(I,J,k)*h_lay(k)
+            T0xdz(k) = T_slab(I,jj,k)*h_lay(k) ; S0xdz(k) = S_slab(I,jj,k)*h_lay(k)
           enddo
         else
           do k=1,nz
-            T0xdz(k) = rho_slab(I,J,k)*h_lay(k) ; S0xdz(k) = rho_slab(I,J,k)*h_lay(k)
+            T0xdz(k) = rho_slab(I,jj,k)*h_lay(k) ; S0xdz(k) = rho_slab(I,jj,k)*h_lay(k)
           enddo
         endif
         nzc = nz
@@ -797,11 +815,11 @@ subroutine Calc_kappa_shear_vertex(u_in, v_in, h, T_in, S_in, tv, p_surf, kappa_
     ! Extrapolate from the vertically reduced grid back to the original layers.
       if (nz == nzc) then
         do K=1,nz+1
-          kappa_3d(I,J,K) = kappa_avg(K)
+          kappa_3d(I,jj,K) = kappa_avg(K)
           if (CS%all_layer_TKE_bug) then
-            tke_3d(I,J,K) = tke(K)
+            tke_3d(I,jj,K) = tke(K)
           else
-            tke_3d(I,J,K) = tke_avg(K)
+            tke_3d(I,jj,K) = tke_avg(K)
           endif
         enddo
         if (CS%id_N2_mean>0) then ; do K=1,nz+1
@@ -819,11 +837,11 @@ subroutine Calc_kappa_shear_vertex(u_in, v_in, h, T_in, S_in, tv, p_surf, kappa_
       else
         do K=1,nz+1
           if (kf(K) == 0.0) then
-            kappa_3d(I,J,K) = kappa_avg(kc(K))
-            tke_3d(I,J,K) = tke_avg(kc(K))
+            kappa_3d(I,jj,K) = kappa_avg(kc(K))
+            tke_3d(I,jj,K) = tke_avg(kc(K))
           else
-            kappa_3d(I,J,K) = (1.0-kf(K)) * kappa_avg(kc(K)) + kf(K) * kappa_avg(kc(K)+1)
-            tke_3d(I,J,K) = (1.0-kf(K)) * tke_avg(kc(K)) + kf(K) * tke_avg(kc(K)+1)
+            kappa_3d(I,jj,K) = (1.0-kf(K)) * kappa_avg(kc(K)) + kf(K) * kappa_avg(kc(K)+1)
+            tke_3d(I,jj,K) = (1.0-kf(K)) * tke_avg(kc(K)) + kf(K) * tke_avg(kc(K)+1)
           endif
         enddo
         do K=1,nz+1
@@ -847,36 +865,42 @@ subroutine Calc_kappa_shear_vertex(u_in, v_in, h, T_in, S_in, tv, p_surf, kappa_
     ! call cpu_clock_end(Id_clock_setup)
     else  ! Land points, still inside the i-loop.
       do K=1,nz+1
-        kappa_3d(I,J,K) = 0.0 ; tke_3d(I,J,K) = 0.0
+        kappa_3d(I,jj,K) = 0.0 ; tke_3d(I,jj,K) = 0.0
       enddo
     endif ; enddo ! i-loop
   enddo ! end of J-loop
 
-  ! Store the columns' results back in the 3-d arrays for restarts or interpolation back to
-  ! tracer points.  h_vert is only used when VS_ThicknessMean is true, and only by the (host)
-  ! tracer-point averaging below, so its fill stays a host loop fed by a guarded copy-back of
-  ! the device-computed h_slab.
+  ! Store this block's columns back into the full-J 3-d arrays, for restarts or interpolation
+  ! back to tracer points.  These have to happen inside the block loop because the slabs they
+  ! read are only valid for the block that just ran.  h_vert is only used when VS_ThicknessMean
+  ! is true, and only by the (host) tracer-point averaging below, so its fill stays a host loop
+  ! fed by a guarded copy-back of the device-computed h_slab.
   if (CS%VS_ThicknessMean) then
     !$omp target update from(h_slab)
-    do J=JsB,JeB
+    do J=Jstart,Jend
+      jj = J - Jstart + 1
       do K=1,nz+1 ; do I=IsB,IeB
-        h_vert(I,J,k) = h_slab(I,J,k)
+        h_vert(I,J,k) = h_slab(I,jj,k)
       enddo ; enddo
     enddo
   endif
   if (CS%VS_viscosity_bug) then
-    do concurrent (K=1:nz+1, J=JsB:JeB, I=IsB:IeB)
-      kappa_vertex(I,J,K) = kappa_3d(I,J,K)
-      tke_io(I,J,K) = G%mask2dBu(I,J) * tke_3d(I,J,K)
+    do concurrent (K=1:nz+1, J=Jstart:Jend, I=IsB:IeB) DO_LOCALITY(local(jj))
+      jj = J - Jstart + 1
+      kappa_vertex(I,J,K) = kappa_3d(I,jj,K)
+      tke_io(I,J,K) = G%mask2dBu(I,J) * tke_3d(I,jj,K)
       kv_io(I,J,K) = ( G%mask2dBu(I,J) * kappa_vertex(I,J,K) ) * CS%Prandtl_turb
     enddo
   else
-    do concurrent (K=1:nz+1, J=JsB:JeB, I=IsB:IeB)
-      kappa_vertex(I,J,K) = kappa_3d(I,J,K)
-      tke_io(I,J,K) = tke_3d(I,J,K)
+    do concurrent (K=1:nz+1, J=Jstart:Jend, I=IsB:IeB) DO_LOCALITY(local(jj))
+      jj = J - Jstart + 1
+      kappa_vertex(I,J,K) = kappa_3d(I,jj,K)
+      tke_io(I,J,K) = tke_3d(I,jj,K)
       kv_io(I,J,K) = kappa_vertex(I,J,K) * CS%Prandtl_turb
     enddo
   endif
+
+  enddo ! end of Jstart block loop.
 
   ! The vertex-to-tracer-point averaging below, the checksums and post_data are all still on
   ! the host.  The diag_* transfer is guarded by the same conditions as their consumers.
@@ -2284,6 +2308,11 @@ function kappa_shear_init(Time, G, GV, US, param_file, diag, CS)
   ! This include declares and sets the variable "version".
 # include "version_variable.h"
   character(len=40)  :: mdl = "MOM_kappa_shear"  ! This module's name.
+#ifdef __NVCOMPILER_OPENMP_GPU
+  integer, parameter :: default_njblock = 0
+#else
+  integer, parameter :: default_njblock = 1
+#endif
 
   if (associated(CS)) then
     call MOM_error(WARNING, "kappa_shear_init called with an associated "// &
@@ -2452,6 +2481,16 @@ function kappa_shear_init(Time, G, GV, US, param_file, diag, CS)
                  "If true, do a simple average of the cell surface pressures to get a pressure "//&
                  "at the corner if VERTEX_SHEAR=True.  Otherwise mask out any land points in "//&
                  "the average.", default=.false., do_not_log=(just_read .or. (.not.CS%KS_at_vertex)))
+
+  call get_param(param_file, mdl, "KAPPA_SHEAR_NJBLOCK", CS%njblock, &
+                 "The J-direction block size used for the vertex scratch slabs in the "//&
+                 "shear-driven mixing calculations when VERTEX_SHEAR=True.  The default 0 "//&
+                 "setting dynamically uses the full J extent, which maximizes the parallelism "//&
+                 "available to a GPU but makes the scratch working set too large for a CPU "//&
+                 "cache; the default 1 setting on CPU builds restores row-at-a-time reuse.", &
+                 default=default_njblock, layoutParam=.true., &
+                 do_not_log=(just_read .or. (.not.CS%KS_at_vertex)))
+  if (CS%njblock < 0) call MOM_error(FATAL, "KAPPA_SHEAR_NJBLOCK must be >= 0.")
 
   call get_param(param_file, mdl, "KAPPA_SHEAR_ITER_BUG", CS%dKdQ_iteration_bug, &
                  "If true, use an older, dimensionally inconsistent estimate of the "//&
