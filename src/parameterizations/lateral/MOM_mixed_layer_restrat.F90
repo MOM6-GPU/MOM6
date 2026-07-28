@@ -953,10 +953,13 @@ subroutine mixedlayer_restrat_Bodner(CS, G, GV, US, h, uhtr, vhtr, tv, forces, d
   !    metrics, so every kernel in MOM6 is already in that regime.  G, GV and US are mapped there and
   !    stay present, which is why CS and tv are the only parents that need mapping here.
   !  - h, uhtr and vhtr are mapped for the whole run by initialize_MOM and are used present.
+  !  - Nothing is left to implicit copyin, including the pointer dummies from the PBL scheme: the
+  !    same switch that disables derived-type copyin leaves them reading uninitialized device
+  !    memory, which shows up as NaN rather than a fault.
   ! Fields that only one branch or one diagnostic touches are mapped within that branch instead.
   !$omp target data &
   !$omp   map(to: CS, tv) &
-  !$omp   map(to: CS%Cr_space, tv%T, tv%S, U_star_2d) &
+  !$omp   map(to: CS%Cr_space, tv%T, tv%S, U_star_2d, h_MLD) &
   !$omp   map(tofrom: CS%MLD_filtered, CS%MLD_filtered_slow, CS%wpup_filtered) &
   !$omp   map(from: little_h, big_H, wpup, htot, buoy_av, uDml_diag, vDml_diag) &
   !$omp   map(alloc: Rml_int, vol_dt_avail, uhml, vhml)
@@ -998,6 +1001,8 @@ subroutine mixedlayer_restrat_Bodner(CS, G, GV, US, h, uhtr, vhtr, tv, forces, d
   enddo
 
   ! Estimate w'u' at h-points, with a floor to avoid division by zero later.
+  ! BLD and bflux are dereferenced only by these branches, so they are mapped only around them.
+  !$omp target data map(to: BLD, bflux)
   if (allocated(tv%SpV_avg) .and. .not.(GV%Boussinesq .or. GV%semi_Boussinesq)) then
     do j=js-1,je+1 ; do i=is-1,ie+1
       ! This expression differs by a factor of 1. / (Rho_0 * SpV_avg) compared with the other
@@ -1034,6 +1039,7 @@ subroutine mixedlayer_restrat_Bodner(CS, G, GV, US, h, uhtr, vhtr, tv, forces, d
           * US%Z_to_L * GV%Z_to_H ! In [L H T-2 ~> m2 s-2 or kg m-1 s-2]
     enddo
   endif
+  !$omp end target data
 
   ! We filter w'u' with the same time scales used for "little h"
   do concurrent (j=js-1:je+1, i=is-1:ie+1)
