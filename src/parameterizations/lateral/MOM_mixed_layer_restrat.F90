@@ -2143,7 +2143,7 @@ logical function mixedlayer_restrat_init(Time, G, GV, US, param_file, diag, CS, 
   if (allocated(CS%wpup_filtered)) call pass_var(CS%wpup_filtered, G%domain)
 
   if (CS%use_Bodner) then
-    ! very important! 
+    ! very important!
     !$omp target update to(CS)
     !$omp target enter data map(to: CS%Cr_space)
     !$omp target enter data map(to: CS%MLD_filtered, CS%MLD_filtered_slow, CS%wpup_filtered)
