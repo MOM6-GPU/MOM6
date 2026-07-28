@@ -835,11 +835,6 @@ subroutine mixedlayer_restrat_Bodner(CS, G, GV, US, h, uhtr, vhtr, tv, forces, d
   real :: SpV_ml(SZI_(G)) ! Specific volume evaluated at the surface pressure [R-1 ~> m3 kg-1]
   real :: SpV_int(SZI_(G)) ! Specific volume integrated through the mixed layer [H R-1 ~> m4 kg-1 or m]
   real :: rho_ml(SZI_(G)) ! Potential density relative to the surface [R ~> kg m-3]
-  ! The density integral walks the mixed layer in tiles of njblock rows by nkblock layers, so that
-  ! the equation of state is handed enough points to be worth offloading without the scratch growing
-  ! past what a cache can hold.  MLE_NJBLOCK=MLE_NKBLOCK=1 (the CPU defaults) reduce these to the one
-  ! row upstream uses, produced and consumed in the same tile; 0 and 0 (the GPU defaults) make them
-  ! the whole halo-1 j domain by the whole column, which is one kernel launch.
   real :: rho_blk(SZI_(G), merge(G%jed-G%jsd+1, CS%njblock, CS%njblock==0), &
                            merge(GV%ke, CS%nkblock, CS%nkblock==0))
                           ! Potential density relative to the surface for a tile [R ~> kg m-3]
@@ -958,10 +953,6 @@ subroutine mixedlayer_restrat_Bodner(CS, G, GV, US, h, uhtr, vhtr, tv, forces, d
                  G%HI, haloshift=1, unscale=GV%H_to_mks)
   endif
 
-  ! The whole calculation below runs on the device.  Only plain local arrays and the PBL pointer
-  ! dummies are mapped: nothing of CS or tv is, because mapping a derived-type component costs the
-  ! kernels implicit copyin of that whole type and its scalars then read as zero.  Left alone, CS%
-  ! and tv% are copied in, and CS's filtered fields copied back, by the loops that use them.
   !$omp target enter data map(to: U_star_2d, h_MLD)
   !$omp target enter data map(alloc: little_h, big_H, wpup, htot, buoy_av, uDml_diag, vDml_diag)
   !$omp target enter data map(alloc: vol_dt_avail, uhml, vhml)
@@ -975,8 +966,7 @@ subroutine mixedlayer_restrat_Bodner(CS, G, GV, US, h, uhtr, vhtr, tv, forces, d
   enddo
 
   ! Calculate "big H", representative of the mixed layer depth, used in B22 formula (eq 27).
-  ! The two spatially-varying variants below are not offloaded, so they push their result to the
-  ! device for the kernels that follow.
+  ! not offloaded, send back to the host
   if (CS%MLD_grid) then
     !$omp target update from(little_h, CS%MLD_filtered_slow)
     do j=js-1,je+1 ; do i=is-1,ie+1
@@ -1003,7 +993,7 @@ subroutine mixedlayer_restrat_Bodner(CS, G, GV, US, h, uhtr, vhtr, tv, forces, d
   enddo
 
   ! Estimate w'u' at h-points, with a floor to avoid division by zero later.
-  ! BLD and bflux are dereferenced only by these branches, so they are mapped only around them.
+  ! needed here, otehrwe death
   !$omp target enter data map(to: BLD, bflux)
   if (allocated(tv%SpV_avg) .and. .not.(GV%Boussinesq .or. GV%semi_Boussinesq)) then
     do j=js-1,je+1 ; do i=is-1,ie+1
@@ -1033,8 +1023,6 @@ subroutine mixedlayer_restrat_Bodner(CS, G, GV, US, h, uhtr, vhtr, tv, forces, d
     enddo ; enddo
     !$omp target update to(wpup)
   else
-    ! w_star3 = max(0., -bflux(i,j)) * BLD(i,j), in [Z3 T-3 ~> m3 s-3], is written out in place
-    ! here rather than held in a scalar that would have to be made local to the concurrent loop.
     do concurrent (j=js-1:je+1, i=is-1:ie+1)
       wpup(i,j) = max( (cuberoot(CS%mstar * U_star_2d(i,j)**3 &
                                  + CS%nstar * (max(0., -bflux(i,j)) * BLD(i,j))))**2, CS%min_wstar2 ) &
@@ -1228,7 +1216,7 @@ subroutine mixedlayer_restrat_Bodner(CS, G, GV, US, h, uhtr, vhtr, tv, forces, d
 
   ! U - Component
   do concurrent (j=js:je, I=is-1:ie) &
-      DO_LOCALITY(local(k, dmu, grid_dsd, absf, h_sml, h_big, grd_b, r_wpup, psi_mag, IhTot, sigint, muzb, muza, hAtVel))
+      DO_LOCALITY(local(k,dmu,grid_dsd,absf,h_sml,h_big,grd_b,r_wpup,psi_mag,IhTot,sigint,muzb,muza,hAtVel))
     if (G%OBCmaskCu(I,j) > 0.) then
       grid_dsd = sqrt(0.5*( G%dxCu(I,j)**2 + G%dyCu(I,j)**2 )) * G%dyCu(I,j) ! [L2 ~> m2]
       absf = 0.5*(abs(G%CoriolisBu(I,J-1)) + abs(G%CoriolisBu(I,J)))  ! [T-1 ~> s-1]
@@ -1271,7 +1259,7 @@ subroutine mixedlayer_restrat_Bodner(CS, G, GV, US, h, uhtr, vhtr, tv, forces, d
 
   ! V- component
   do concurrent (J=js-1:je, i=is:ie) &
-      DO_LOCALITY(local(k, dmu, grid_dsd, absf, h_sml, h_big, grd_b, r_wpup, psi_mag, IhTot, sigint, muzb, muza, hAtVel))
+      DO_LOCALITY(local(k,dmu,grid_dsd,absf,h_sml,h_big,grd_b,r_wpup,psi_mag,IhTot,sigint,muzb,muza,hAtVel))
     if (G%OBCmaskCv(i,J) > 0.) then
       grid_dsd = sqrt(0.5*( G%dxCv(i,J)**2 + G%dyCv(i,J)**2 )) * G%dxCv(i,J) ! [L2 ~> m2]
       absf = 0.5*(abs(G%CoriolisBu(I-1,J)) + abs(G%CoriolisBu(I,J)))  ! [T-1 ~> s-1]
@@ -2154,13 +2142,8 @@ logical function mixedlayer_restrat_init(Time, G, GV, US, param_file, diag, CS, 
   if (allocated(CS%MLD_filtered_slow)) call pass_var(CS%MLD_filtered_slow, G%domain)
   if (allocated(CS%wpup_filtered)) call pass_var(CS%wpup_filtered, G%domain)
 
-  ! This CS is an inline member of MOM_control_struct, whose whole address range the solo
-  ! driver puts on the device with `enter data map(alloc: MOM_CSp)` -- allocated, never
-  ! copied.  Any later map(to:) of this CS (implicit or explicit) is therefore a present-
-  ! table no-op and kernels read zeros for its scalars.  `target update` always copies, so
-  ! issue it here, once the parameters above are set and BEFORE the component maps below,
-  ! whose attach then fixes this struct's array descriptors in the device copy.
   if (CS%use_Bodner) then
+    ! very important! 
     !$omp target update to(CS)
     !$omp target enter data map(to: CS%Cr_space)
     !$omp target enter data map(to: CS%MLD_filtered, CS%MLD_filtered_slow, CS%wpup_filtered)
