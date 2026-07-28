@@ -881,6 +881,13 @@ subroutine mixedlayer_restrat_Bodner(CS, G, GV, US, h, uhtr, vhtr, tv, forces, d
   real, parameter :: Lam2_eq = 11.       ! (Langmuir Number)^-2 assuming wind wave equilibrium [nondim]
   real, parameter :: two_thirds = 2./3.  ! [nondim]
   real :: dmu             ! Change in mu(z) across a layer [nondim]
+  ! Scalars of CS read by the kernels below.  They are copied to plain locals because the kernels
+  ! also use CS's array components, and mapping those costs CS its implicit copyin on the device.
+  real :: tau_bgrow, tau_bdecay ! Filter timescales for the boundary layer depth [T ~> s]
+  real :: tau_mgrow, tau_mdecay ! Filter timescales for the mixed layer depth [T ~> s]
+  real :: l_mstar, l_nstar ! Coefficients of u*^3 and w*^3 in the momentum flux [nondim]
+  real :: l_min_wstar2    ! Floor on the vertical momentum flux [Z2 T-2 ~> m2 s-2]
+  real :: l_MLE_tail_dh   ! Fractional depth by which the stream function is extended [nondim]
   logical :: line_is_empty, keep_going
   integer, dimension(2) :: EOSdom ! The i-computational domain for the equation of state
   integer :: EOSdom3(3,2) ! The (i,j,k) computational domain for the blocked equation of state calls
@@ -958,21 +965,24 @@ subroutine mixedlayer_restrat_Bodner(CS, G, GV, US, h, uhtr, vhtr, tv, forces, d
                  G%HI, haloshift=1, unscale=GV%H_to_mks)
   endif
 
-  ! CS and tv are mapped in their own region, and "always" is load-bearing: a parent mapped in the
-  ! same directive as its components, or mapped without "always", is superseded by them and its
-  ! scalars then read as zero on the device.  Dropping either gives NaN, not a fault.
-  !$omp target data map(always, to: CS, tv)
-  !$omp target data &
-  !$omp   map(to: CS%Cr_space, tv%T, tv%S, U_star_2d, h_MLD) &
-  !$omp   map(tofrom: CS%MLD_filtered, CS%MLD_filtered_slow, CS%wpup_filtered) &
-  !$omp   map(from: little_h, big_H, wpup, htot, buoy_av, uDml_diag, vDml_diag) &
-  !$omp   map(alloc: vol_dt_avail, uhml, vhml)
+  ! The whole calculation below runs on the device.  Only plain local arrays and the PBL pointer
+  ! dummies are mapped: nothing of CS or tv is, because mapping a derived-type component costs the
+  ! kernels implicit copyin of that whole type and its scalars then read as zero.  Left alone, CS%
+  ! and tv% are copied in, and CS's filtered fields copied back, by the loops that use them.
+  !$omp target enter data map(to: U_star_2d, h_MLD)
+  !$omp target enter data map(alloc: little_h, big_H, wpup, htot, buoy_av, uDml_diag, vDml_diag)
+  !$omp target enter data map(alloc: vol_dt_avail, uhml, vhml)
+
+  tau_bgrow = CS%BLD_growing_Tfilt ; tau_bdecay = CS%BLD_decaying_Tfilt
+  tau_mgrow = CS%MLD_growing_Tfilt ; tau_mdecay = CS%MLD_decaying_Tfilt
+  l_mstar = CS%mstar ; l_nstar = CS%nstar ; l_min_wstar2 = CS%min_wstar2
+  l_MLE_tail_dh = CS%MLE_tail_dh
 
   ! Apply time filter to h_MLD (to remove diurnal cycle) to obtain "little h".
   ! "little h" is representative of the active mixing layer depth, used in B22 formula (eq 27).
   do concurrent (j=js-1:je+1, i=is-1:ie+1)
     little_h(i,j) = rmean2ts(h_MLD(i,j), CS%MLD_filtered(i,j), &
-                             CS%BLD_growing_Tfilt, CS%BLD_decaying_Tfilt, dt)
+                             tau_bgrow, tau_bdecay, dt)
     CS%MLD_filtered(i,j) = little_h(i,j)
   enddo
 
@@ -997,7 +1007,7 @@ subroutine mixedlayer_restrat_Bodner(CS, G, GV, US, h, uhtr, vhtr, tv, forces, d
   else
     do concurrent (j=js-1:je+1, i=is-1:ie+1)
       big_H(i,j) = rmean2ts(little_h(i,j), CS%MLD_filtered_slow(i,j), &
-                            CS%MLD_growing_Tfilt, CS%MLD_decaying_Tfilt, dt)
+                            tau_mgrow, tau_mdecay, dt)
     enddo
   endif
   do concurrent (j=js-1:je+1, i=is-1:ie+1)
@@ -1006,7 +1016,7 @@ subroutine mixedlayer_restrat_Bodner(CS, G, GV, US, h, uhtr, vhtr, tv, forces, d
 
   ! Estimate w'u' at h-points, with a floor to avoid division by zero later.
   ! BLD and bflux are dereferenced only by these branches, so they are mapped only around them.
-  !$omp target data map(to: BLD, bflux)
+  !$omp target enter data map(to: BLD, bflux)
   if (allocated(tv%SpV_avg) .and. .not.(GV%Boussinesq .or. GV%semi_Boussinesq)) then
     do j=js-1,je+1 ; do i=is-1,ie+1
       ! This expression differs by a factor of 1. / (Rho_0 * SpV_avg) compared with the other
@@ -1038,17 +1048,18 @@ subroutine mixedlayer_restrat_Bodner(CS, G, GV, US, h, uhtr, vhtr, tv, forces, d
     ! w_star3 = max(0., -bflux(i,j)) * BLD(i,j), in [Z3 T-3 ~> m3 s-3], is written out in place
     ! here rather than held in a scalar that would have to be made local to the concurrent loop.
     do concurrent (j=js-1:je+1, i=is-1:ie+1)
-      wpup(i,j) = max( (cuberoot(CS%mstar * U_star_2d(i,j)**3 &
-                                 + CS%nstar * (max(0., -bflux(i,j)) * BLD(i,j))))**2, CS%min_wstar2 ) &
+      wpup(i,j) = max( (cuberoot(l_mstar * U_star_2d(i,j)**3 &
+                                 + l_nstar * (max(0., -bflux(i,j)) * BLD(i,j))))**2, l_min_wstar2 ) &
           * US%Z_to_L * GV%Z_to_H ! In [L H T-2 ~> m2 s-2 or kg m-1 s-2]
     enddo
   endif
-  !$omp end target data
+  !$omp target exit data map(release: BLD, bflux)
+
 
   ! We filter w'u' with the same time scales used for "little h"
   do concurrent (j=js-1:je+1, i=is-1:ie+1)
     wpup(i,j) = rmean2ts(wpup(i,j), CS%wpup_filtered(i,j), &
-                         CS%BLD_growing_Tfilt, CS%BLD_decaying_Tfilt, dt)
+                         tau_bgrow, tau_bdecay, dt)
     CS%wpup_filtered(i,j) = wpup(i,j)
   enddo
 
@@ -1114,7 +1125,7 @@ subroutine mixedlayer_restrat_Bodner(CS, G, GV, US, h, uhtr, vhtr, tv, forces, d
     EOSdom3(1,:) = EOS_domain(G%HI, halo=1)
 
     ! The tile scratch never leaves the device, and no other branch uses it.
-    !$omp target data map(alloc: rho_blk, p_blk, Rml_blk)
+    !$omp target enter data map(alloc: rho_blk, p_blk, Rml_blk)
 
     if (nkblock < nz) then
       ! The early-exit test below compares htot against big_H on the host, and big_H has been
@@ -1170,7 +1181,7 @@ subroutine mixedlayer_restrat_Bodner(CS, G, GV, US, h, uhtr, vhtr, tv, forces, d
       enddo
     enddo
 
-    !$omp end target data
+    !$omp target exit data map(release: rho_blk, p_blk, Rml_blk)
   else
     ! The Stanley and non-Boussinesq variants of the equation of state have no array-of-columns
     ! interface to block over, so they retain the original row-at-a-time form on the host.
@@ -1250,7 +1261,7 @@ subroutine mixedlayer_restrat_Bodner(CS, G, GV, US, h, uhtr, vhtr, tv, forces, d
       muza = muzb                           ! mu(z/MLD) for upper interface [nondim]
       hAtVel = 0.5*(h(i,j,k) + h(i+1,j,k))  ! Thickness at velocity point [H ~> m or kg m-2]
       sigint = sigint - (hAtVel * IhTot)    ! z/H for lower interface [nondim]
-      muzb = mu(sigint, CS%MLE_tail_dh)     ! mu(z/MLD) for lower interface [nondim]
+      muzb = mu(sigint, l_MLE_tail_dh)        ! mu(z/MLD) for lower interface [nondim]
       dmu = muza - muzb                     ! Change in mu(z) across layer [nondim]
       uhml(I,j,k) = dmu   ! Stash dmu in uhml: the columns run concurrently, so there is nowhere
                           ! else to keep a per-column profile.  It is scaled by psi_mag below.
@@ -1293,7 +1304,7 @@ subroutine mixedlayer_restrat_Bodner(CS, G, GV, US, h, uhtr, vhtr, tv, forces, d
       muza = muzb                           ! mu(z/MLD) for upper interface [nondim]
       hAtVel = 0.5*(h(i,j,k) + h(i,j+1,k))  ! Thickness at velocity point [H ~> m or kg m-2]
       sigint = sigint - (hAtVel * IhTot)    ! z/H for lower interface [nondim]
-      muzb = mu(sigint, CS%MLE_tail_dh)     ! mu(z/MLD) for lower interface [nondim]
+      muzb = mu(sigint, l_MLE_tail_dh)        ! mu(z/MLD) for lower interface [nondim]
       dmu = muza - muzb                     ! Change in mu(z) across layer [nondim]
       vhml(i,J,k) = dmu   ! Stash dmu in vhml, as for uhml above; scaled by psi_mag below.
       ! dmu*psi_mag is the transport in this layer [L2 H T-1 ~> m3 s-1 or kg s-1]
@@ -1329,8 +1340,8 @@ subroutine mixedlayer_restrat_Bodner(CS, G, GV, US, h, uhtr, vhtr, tv, forces, d
     !$omp target update from(vhml)
   endif
 
-  !$omp end target data
-  !$omp end target data
+  !$omp target exit data map(from: little_h, big_H, wpup, htot, buoy_av, uDml_diag, vDml_diag)
+  !$omp target exit data map(release: vol_dt_avail, uhml, vhml, U_star_2d, h_MLD)
 
   if (CS%id_uhml > 0 .or. CS%id_vhml > 0) &
     ! Remapped uhml and vhml require east/north halo updates of h
@@ -2154,6 +2165,14 @@ logical function mixedlayer_restrat_init(Time, G, GV, US, param_file, diag, CS, 
   if (allocated(CS%MLD_filtered)) call pass_var(CS%MLD_filtered, G%domain)
   if (allocated(CS%MLD_filtered_slow)) call pass_var(CS%MLD_filtered_slow, G%domain)
   if (allocated(CS%wpup_filtered)) call pass_var(CS%wpup_filtered, G%domain)
+
+  ! Map the array components the Bodner kernels use, once, as hor_visc_init and friends do.  Their
+  ! scalars cannot come along: mapping any component of a derived type costs that type its implicit
+  ! copyin, and its scalars then read as zero on the device, so those are hoisted in the routine.
+  if (CS%use_Bodner) then
+    !$omp target enter data map(to: CS%Cr_space)
+    !$omp target enter data map(to: CS%MLD_filtered, CS%MLD_filtered_slow, CS%wpup_filtered)
+  endif
 
 end function mixedlayer_restrat_init
 

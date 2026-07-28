@@ -3933,6 +3933,7 @@ subroutine initialize_MOM(Time, Time_init, param_file, dirs, CS, &
 
   CS%mixedlayer_restrat = mixedlayer_restrat_init(Time, G, GV, US, param_file, diag, &
                                                   CS%mixedlayer_restrat_CSp, restart_CSp)
+  !$omp target enter data map(alloc: CS%mixedlayer_restrat_CSp)
 
   if (GV%Boussinesq .and. associated(CS%visc%h_ML)) then
     ! This is here to allow for a transition of restart files between model versions.
