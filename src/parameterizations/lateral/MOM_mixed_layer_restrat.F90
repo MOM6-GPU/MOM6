@@ -947,18 +947,21 @@ subroutine mixedlayer_restrat_Bodner(CS, G, GV, US, h, uhtr, vhtr, tv, forces, d
   endif
 
   ! Everything from here to the diagnostics is evaluated on the device inside a single data region,
-  ! so no field crosses the bus between phases.  Two rules shape the map clauses:
-  !  - A derived type is mapped alongside its components, parent first.  nvfortran turns off implicit
-  !    derived-type copyin for any region that maps a component, and initialize_MOM maps the G%
-  !    metrics, so every kernel in MOM6 is already in that regime.  G, GV and US are mapped there and
-  !    stay present, which is why CS and tv are the only parents that need mapping here.
+  ! so no field crosses the bus between phases.  Three rules shape the map clauses:
+  !  - A derived type must be mapped for its components to be readable at all: nvfortran turns off
+  !    implicit derived-type copyin for any region that maps a component, and initialize_MOM maps the
+  !    G% metrics, so every kernel in MOM6 is already in that regime.  G, GV and US are mapped there
+  !    and stay present, which is why CS and tv are the only parents to map here.
+  !  - The parent must be mapped in an OUTER region, not in the same directive as its components.
+  !    Mapping a component implicitly creates a parent entry that supersedes an explicit map(to: CS)
+  !    in the same directive: the component descriptors attach, but the struct body is never copied,
+  !    so CS%mstar and friends silently read as zero while CS%Cr_space reads correctly.
   !  - h, uhtr and vhtr are mapped for the whole run by initialize_MOM and are used present.
-  !  - Nothing is left to implicit copyin, including the pointer dummies from the PBL scheme: the
-  !    same switch that disables derived-type copyin leaves them reading uninitialized device
-  !    memory, which shows up as NaN rather than a fault.
+  ! Nothing is left to implicit copyin, including the pointer dummies from the PBL scheme, which
+  ! would otherwise read uninitialized device memory and show up as NaN rather than as a fault.
   ! Fields that only one branch or one diagnostic touches are mapped within that branch instead.
+  !$omp target data map(always, to: CS, tv)
   !$omp target data &
-  !$omp   map(to: CS, tv) &
   !$omp   map(to: CS%Cr_space, tv%T, tv%S, U_star_2d, h_MLD) &
   !$omp   map(tofrom: CS%MLD_filtered, CS%MLD_filtered_slow, CS%wpup_filtered) &
   !$omp   map(from: little_h, big_H, wpup, htot, buoy_av, uDml_diag, vDml_diag) &
@@ -1310,6 +1313,7 @@ subroutine mixedlayer_restrat_Bodner(CS, G, GV, US, h, uhtr, vhtr, tv, forces, d
     !$omp target update from(vhml)
   endif
 
+  !$omp end target data
   !$omp end target data
 
   if (CS%id_uhml > 0 .or. CS%id_vhml > 0) &
