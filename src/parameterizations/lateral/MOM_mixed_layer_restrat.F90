@@ -958,20 +958,8 @@ subroutine mixedlayer_restrat_Bodner(CS, G, GV, US, h, uhtr, vhtr, tv, forces, d
                  G%HI, haloshift=1, unscale=GV%H_to_mks)
   endif
 
-  ! Everything from here to the diagnostics is evaluated on the device inside a single data region,
-  ! so no field crosses the bus between phases.  Three rules shape the map clauses:
-  !  - A derived type must be mapped for its components to be readable at all: nvfortran turns off
-  !    implicit derived-type copyin for any region that maps a component, and initialize_MOM maps the
-  !    G% metrics, so every kernel in MOM6 is already in that regime.  G, GV and US are mapped there
-  !    and stay present, which is why CS and tv are the only parents to map here.
-  !  - The parent must be mapped in an OUTER region, not in the same directive as its components.
-  !    Mapping a component implicitly creates a parent entry that supersedes an explicit map(to: CS)
-  !    in the same directive: the component descriptors attach, but the struct body is never copied,
-  !    so CS%mstar and friends silently read as zero while CS%Cr_space reads correctly.
-  !  - h, uhtr and vhtr are mapped for the whole run by initialize_MOM and are used present.
-  ! Nothing is left to implicit copyin, including the pointer dummies from the PBL scheme, which
-  ! would otherwise read uninitialized device memory and show up as NaN rather than as a fault.
-  ! Fields that only one branch or one diagnostic touches are mapped within that branch instead.
+  ! CS and tv are mapped in their own region: a parent mapped in the same directive as its
+  ! components is superseded by them, and its scalars then read as zero on the device.
   !$omp target data map(always, to: CS, tv)
   !$omp target data &
   !$omp   map(to: CS%Cr_space, tv%T, tv%S, U_star_2d, h_MLD) &
