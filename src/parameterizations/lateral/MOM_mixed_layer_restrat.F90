@@ -958,8 +958,9 @@ subroutine mixedlayer_restrat_Bodner(CS, G, GV, US, h, uhtr, vhtr, tv, forces, d
                  G%HI, haloshift=1, unscale=GV%H_to_mks)
   endif
 
-  ! CS and tv are mapped in their own region: a parent mapped in the same directive as its
-  ! components is superseded by them, and its scalars then read as zero on the device.
+  ! CS and tv are mapped in their own region, and "always" is load-bearing: a parent mapped in the
+  ! same directive as its components, or mapped without "always", is superseded by them and its
+  ! scalars then read as zero on the device.  Dropping either gives NaN, not a fault.
   !$omp target data map(always, to: CS, tv)
   !$omp target data &
   !$omp   map(to: CS%Cr_space, tv%T, tv%S, U_star_2d, h_MLD) &
