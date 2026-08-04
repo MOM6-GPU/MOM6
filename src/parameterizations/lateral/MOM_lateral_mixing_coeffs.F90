@@ -274,7 +274,7 @@ subroutine calc_resoln_function(h, tv, G, GV, US, CS, MEKE, OBC, dt)
          "Module must be initialized before it is used.")
 
   if (CS%calculate_cg1) then
-    !$omp target update from(h)
+    !$omp target enter data map(to: tv, tv%T, tv%S)
     if (.not. allocated(CS%cg1)) call MOM_error(FATAL, &
       "calc_resoln_function: %cg1 is not associated with Resoln_scaled_Kh.")
     if (CS%khth_use_ebt_struct .or. CS%kdgl90_use_ebt_struct &
@@ -294,6 +294,9 @@ subroutine calc_resoln_function(h, tv, G, GV, US, CS, MEKE, OBC, dt)
     else
       call wave_speed(h, tv, G, GV, US, CS%cg1, CS%wave_speed)
     endif
+    !$omp target exit data map(release: tv%T, tv%S, tv)
+    ! cg1 is calculated on the device, but the halo update below runs on the host.
+    !$omp target update from(CS%cg1)
 
     call create_group_pass(CS%pass_cg1, CS%cg1, G%Domain)
     call do_group_pass(CS%pass_cg1, G%Domain)
