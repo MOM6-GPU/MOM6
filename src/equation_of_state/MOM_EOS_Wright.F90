@@ -12,6 +12,10 @@ use MOM_hor_index, only : hor_index_type
 implicit none ; private
 
 public buggy_Wright_EOS
+! Exposed as a device-callable (declare target) elemental so whole-column GPU kernels
+! can compute density derivatives in-region without polymorphic dispatch.
+public calculate_density_derivs_elem_buggy_Wright_loc
+!$omp declare target(calculate_density_derivs_elem_buggy_Wright_loc)
 public int_density_dz_wright, int_spec_vol_dp_wright
 public avg_spec_vol_buggy_Wright
 public set_params_buggy_Wright

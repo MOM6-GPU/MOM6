@@ -10,6 +10,10 @@ use MOM_EOS_base_type, only : EOS_base
 implicit none ; private
 
 public Roquet_rho_EOS
+! Exposed as a device-callable (declare target) elemental so whole-column GPU kernels
+! can compute density derivatives in-region without polymorphic dispatch.
+public calculate_density_derivs_elem_Roquet_rho_loc
+!$omp declare target(calculate_density_derivs_elem_Roquet_rho_loc)
 
 real, parameter :: Pa2kb  = 1.e-8 !< Conversion factor between Pa and kbar [kbar Pa-1]
 !>@{ Parameters in the Roquet_rho (Roquet density) equation of state
