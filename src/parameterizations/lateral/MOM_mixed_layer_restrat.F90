@@ -917,7 +917,9 @@ subroutine mixedlayer_restrat_Bodner(CS, G, GV, US, h, uhtr, vhtr, tv, forces, d
   if (associated(bflux)) &
     call pass_var(bflux, G%domain, halo=1)
 
-  ! Extract the friction velocity from the forcing type.
+  ! Extract the friction velocity from the forcing type.  find_ustar computes on the device
+  ! when U_star_2d is already present there, so it only needs a device allocation, not a copy.
+  !$omp target enter data map(alloc: U_star_2d)
   call find_ustar(forces, tv, U_star_2d, G, GV, US, halo=1)
 
   Lam2_available = present(Lam2)
@@ -941,6 +943,7 @@ subroutine mixedlayer_restrat_Bodner(CS, G, GV, US, h, uhtr, vhtr, tv, forces, d
   endif
 
   if (CS%debug) then
+    !$omp target update from(U_star_2d)
     call hchksum(h,'mixed_Bodner: h', G%HI, haloshift=1, unscale=GV%H_to_mks)
     call hchksum(BLD, 'mle_Bodner: BLD', G%HI, haloshift=1, unscale=US%Z_to_m)
     call hchksum(h_MLD, 'mle_Bodner: h_MLD', G%HI, haloshift=1, unscale=GV%H_to_mks)
@@ -953,7 +956,7 @@ subroutine mixedlayer_restrat_Bodner(CS, G, GV, US, h, uhtr, vhtr, tv, forces, d
                  G%HI, haloshift=1, unscale=GV%H_to_mks)
   endif
 
-  !$omp target enter data map(to: U_star_2d, h_MLD, BLD, bflux)
+  !$omp target enter data map(to: h_MLD, BLD, bflux)
   !$omp target enter data map(alloc: little_h, big_H, wpup, htot, buoy_av, uDml_diag, vDml_diag)
   !$omp target enter data map(alloc: vol_dt_avail, uhml, vhml)
 
@@ -1311,6 +1314,9 @@ subroutine mixedlayer_restrat_Bodner(CS, G, GV, US, h, uhtr, vhtr, tv, forces, d
   if (CS%id_vhml > 0) then
     !$omp target update from(vhml)
   endif
+
+  ! U_star_2d is computed on the device and only read back when it is being diagnosed.
+  !$omp target update from(U_star_2d) if(CS%id_ustar > 0)
 
   !$omp target exit data map(from: little_h, big_H, wpup, htot, buoy_av, uDml_diag, vDml_diag)
   !$omp target exit data map(release: vol_dt_avail, uhml, vhml, U_star_2d, h_MLD, BLD, bflux)
