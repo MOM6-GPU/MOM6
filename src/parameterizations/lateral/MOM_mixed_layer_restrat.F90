@@ -2144,12 +2144,12 @@ logical function mixedlayer_restrat_init(Time, G, GV, US, param_file, diag, CS, 
   if (allocated(CS%MLD_filtered_slow)) call pass_var(CS%MLD_filtered_slow, G%domain)
   if (allocated(CS%wpup_filtered)) call pass_var(CS%wpup_filtered, G%domain)
 
-  if (CS%use_Bodner) then
-    ! very important!
-    !$omp target update to(CS)
-    !$omp target enter data map(to: CS%Cr_space)
-    !$omp target enter data map(to: CS%MLD_filtered, CS%MLD_filtered_slow, CS%wpup_filtered)
-  endif
+  ! The driver maps the whole control structure without copying its contents, so the scalar
+  ! components must be pushed to the device before the array components are attached to it.
+  !$omp target update to(CS) if(CS%use_Bodner)
+  !$omp target enter data map(to: CS%Cr_space) if(CS%use_Bodner)
+  !$omp target enter data map(to: CS%MLD_filtered, CS%MLD_filtered_slow, CS%wpup_filtered) &
+  !$omp   if(CS%use_Bodner)
 
 end function mixedlayer_restrat_init
 
