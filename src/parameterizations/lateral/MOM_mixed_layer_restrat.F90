@@ -211,6 +211,9 @@ subroutine mixedlayer_restrat(h, uhtr, vhtr, tv, forces, dt, MLD, h_MLD, bflux, 
     else
       call mixedlayer_restrat_Bodner(CS, G, GV, US, h, uhtr, vhtr, tv, forces, dt, MLD, h_MLD, bflux)
     endif
+    ! The Bodner scheme updates h, uhtr and vhtr on the device.  Refresh the host copies here,
+    ! since the caller runs the halo update on them and then pushes them back to the device.
+    !$omp target update from(h, uhtr, vhtr)
   else
     ! Implementation of Fox-Kemper et al., 2008, to work in general coordinates
     call mixedlayer_restrat_OM4(h, uhtr, vhtr, tv, forces, dt, h_MLD, VarMix, G, GV, US, CS)
@@ -1303,22 +1306,20 @@ subroutine mixedlayer_restrat_Bodner(CS, G, GV, US, h, uhtr, vhtr, tv, forces, d
         ((uhml(I,j,k) - uhml(I-1,j,k)) + (vhml(i,J,k) - vhml(i,J-1,k)))
   enddo
 
-  ! h, uhtr and vhtr stay mapped for the whole run, but step_MOM_dynamics pushes the host copies
-  ! back to the device after this call, so the values just computed here have to reach the host.
-  !$omp target update from(h, uhtr, vhtr)
-
-  ! uhml and vhml are otherwise device-only; retrieve them only when they are being diagnosed.
-  if (CS%id_uhml > 0) then
-    !$omp target update from(uhml)
-  endif
-  if (CS%id_vhml > 0) then
-    !$omp target update from(vhml)
-  endif
-
-  ! U_star_2d is computed on the device and only read back when it is being diagnosed.
+  ! The remaining device arrays are subroutine scratch: read back only the ones that a
+  ! host-side diagnostic below actually consumes, then release everything.
+  !$omp target update from(uhml) if(CS%id_uhml > 0)
+  !$omp target update from(vhml) if(CS%id_vhml > 0)
   !$omp target update from(U_star_2d) if(CS%id_ustar > 0)
+  !$omp target update from(wpup) if(CS%id_wpup > 0)
+  !$omp target update from(buoy_av) if(CS%id_Rml > 0)
+  !$omp target update from(little_h) if(CS%id_BLD > 0)
+  !$omp target update from(big_H) if(CS%id_MLD > 0)
+  !$omp target update from(uDml_diag) if(CS%id_uDml > 0 .or. CS%id_uml > 0)
+  !$omp target update from(vDml_diag) if(CS%id_vDml > 0 .or. CS%id_vml > 0)
+  !$omp target update from(htot) if(CS%id_uml > 0 .or. CS%id_vml > 0)
 
-  !$omp target exit data map(from: little_h, big_H, wpup, htot, buoy_av, uDml_diag, vDml_diag)
+  !$omp target exit data map(release: little_h, big_H, wpup, htot, buoy_av, uDml_diag, vDml_diag)
   !$omp target exit data map(release: vol_dt_avail, uhml, vhml, U_star_2d, h_MLD, BLD, bflux)
 
   if (CS%id_uhml > 0 .or. CS%id_vhml > 0) &
