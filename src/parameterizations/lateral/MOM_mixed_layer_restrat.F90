@@ -878,7 +878,7 @@ subroutine mixedlayer_restrat_Bodner(CS, G, GV, US, h, uhtr, vhtr, tv, forces, d
                           ! fractional power [Z2 s2 T-2 m-2 ~> 1]
   real, parameter :: Lam2_eq = 11.       ! (Langmuir Number)^-2 assuming wind wave equilibrium [nondim]
   real, parameter :: two_thirds = 2./3.  ! [nondim]
-  real :: dmu             ! Change in mu(z) across a layer [nondim]
+  real :: dmu(SZK_(GV))   ! Change in mu(z) across layer k [nondim]
   logical :: line_is_empty, keep_going
   integer, dimension(2) :: EOSdom ! The i-computational domain for the equation of state
   integer :: EOSdom3(3,2) ! The (i,j,k) computational domain for the blocked equation of state calls
@@ -1217,8 +1217,13 @@ subroutine mixedlayer_restrat_Bodner(CS, G, GV, US, h, uhtr, vhtr, tv, forces, d
   endif
 
   ! U - Component
-  do concurrent (j=js:je, I=is-1:ie) &
-      DO_LOCALITY(local(k,dmu,grid_dsd,absf,h_sml,h_big,grd_b,r_wpup,psi_mag,IhTot,sigint,muzb,muza,hAtVel))
+  ! These loops are OpenMP target constructs rather than do concurrent because they need the
+  ! per-column dmu profile as a private automatic array, which do concurrent local() cannot
+  ! yet express without crashing nvfortran (private() handles it correctly).
+  !$omp target teams loop collapse(2) &
+  !$omp   private(k, dmu, grid_dsd, absf, h_sml, h_big, grd_b, r_wpup, psi_mag, IhTot, &
+  !$omp           sigint, muzb, muza, hAtVel)
+  do j=js,je ; do I=is-1,ie
     if (G%OBCmaskCu(I,j) > 0.) then
       grid_dsd = sqrt(0.5*( G%dxCu(I,j)**2 + G%dyCu(I,j)**2 )) * G%dyCu(I,j) ! [L2 ~> m2]
       absf = 0.5*(abs(G%CoriolisBu(I,J-1)) + abs(G%CoriolisBu(I,J)))  ! [T-1 ~> s-1]
@@ -1239,29 +1244,29 @@ subroutine mixedlayer_restrat_Bodner(CS, G, GV, US, h, uhtr, vhtr, tv, forces, d
       muza = muzb                           ! mu(z/MLD) for upper interface [nondim]
       hAtVel = 0.5*(h(i,j,k) + h(i+1,j,k))  ! Thickness at velocity point [H ~> m or kg m-2]
       sigint = sigint - (hAtVel * IhTot)    ! z/H for lower interface [nondim]
-      muzb = mu(sigint, CS%MLE_tail_dh)       ! mu(z/MLD) for lower interface [nondim]
-      dmu = muza - muzb                     ! Change in mu(z) across layer [nondim]
-      uhml(I,j,k) = dmu   ! Stash dmu in uhml: the columns run concurrently, so there is nowhere
-                          ! else to keep a per-column profile.  It is scaled by psi_mag below.
-      ! dmu*psi_mag is the transport in this layer [L2 H T-1 ~> m3 s-1]
+      muzb = mu(sigint, CS%MLE_tail_dh)     ! mu(z/MLD) for lower interface [nondim]
+      dmu(k) = muza - muzb                  ! Change in mu(z) across layer [nondim]
+      ! dmu(k)*psi_mag is the transport in this layer [L2 H T-1 ~> m3 s-1]
       ! Limit magnitude (psi_mag) if it would violate CFL
-      if (dmu*psi_mag > 0.0) then
-        if (dmu*psi_mag > vol_dt_avail(i,j,k)) psi_mag = vol_dt_avail(i,j,k) / dmu
-      elseif (dmu*psi_mag < 0.0) then
-        if (-dmu*psi_mag > vol_dt_avail(i+1,j,k)) psi_mag = -vol_dt_avail(i+1,j,k) / dmu
+      if (dmu(k)*psi_mag > 0.0) then
+        if (dmu(k)*psi_mag > vol_dt_avail(i,j,k)) psi_mag = vol_dt_avail(i,j,k) / dmu(k)
+      elseif (dmu(k)*psi_mag < 0.0) then
+        if (-dmu(k)*psi_mag > vol_dt_avail(i+1,j,k)) psi_mag = -vol_dt_avail(i+1,j,k) / dmu(k)
       endif
     enddo ! These loops cannot be fused because psi_mag applies to the whole column
     do k=1,nz
-      uhml(I,j,k) = uhml(I,j,k) * psi_mag  ! [L2 H T-1 ~> m3 s-1 or kg s-1]
+      uhml(I,j,k) = dmu(k) * psi_mag  ! [L2 H T-1 ~> m3 s-1 or kg s-1]
       uhtr(I,j,k) = uhtr(I,j,k) + uhml(I,j,k) * dt ! [L2 H ~> m3 or kg]
     enddo
 
     uDml_diag(I,j) = psi_mag
-  enddo
+  enddo ; enddo
 
   ! V- component
-  do concurrent (J=js-1:je, i=is:ie) &
-      DO_LOCALITY(local(k,dmu,grid_dsd,absf,h_sml,h_big,grd_b,r_wpup,psi_mag,IhTot,sigint,muzb,muza,hAtVel))
+  !$omp target teams loop collapse(2) &
+  !$omp   private(k, dmu, grid_dsd, absf, h_sml, h_big, grd_b, r_wpup, psi_mag, IhTot, &
+  !$omp           sigint, muzb, muza, hAtVel)
+  do J=js-1,je ; do i=is,ie
     if (G%OBCmaskCv(i,J) > 0.) then
       grid_dsd = sqrt(0.5*( G%dxCv(i,J)**2 + G%dyCv(i,J)**2 )) * G%dxCv(i,J) ! [L2 ~> m2]
       absf = 0.5*(abs(G%CoriolisBu(I-1,J)) + abs(G%CoriolisBu(I,J)))  ! [T-1 ~> s-1]
@@ -1282,24 +1287,23 @@ subroutine mixedlayer_restrat_Bodner(CS, G, GV, US, h, uhtr, vhtr, tv, forces, d
       muza = muzb                           ! mu(z/MLD) for upper interface [nondim]
       hAtVel = 0.5*(h(i,j,k) + h(i,j+1,k))  ! Thickness at velocity point [H ~> m or kg m-2]
       sigint = sigint - (hAtVel * IhTot)    ! z/H for lower interface [nondim]
-      muzb = mu(sigint, CS%MLE_tail_dh)       ! mu(z/MLD) for lower interface [nondim]
-      dmu = muza - muzb                     ! Change in mu(z) across layer [nondim]
-      vhml(i,J,k) = dmu   ! Stash dmu in vhml, as for uhml above; scaled by psi_mag below.
-      ! dmu*psi_mag is the transport in this layer [L2 H T-1 ~> m3 s-1 or kg s-1]
+      muzb = mu(sigint, CS%MLE_tail_dh)     ! mu(z/MLD) for lower interface [nondim]
+      dmu(k) = muza - muzb                  ! Change in mu(z) across layer [nondim]
+      ! dmu(k)*psi_mag is the transport in this layer [L2 H T-1 ~> m3 s-1 or kg s-1]
       ! Limit magnitude (psi_mag) if it would violate CFL
-      if (dmu*psi_mag > 0.0) then
-        if (dmu*psi_mag > vol_dt_avail(i,j,k)) psi_mag = vol_dt_avail(i,j,k) / dmu
-      elseif (dmu*psi_mag < 0.0) then
-        if (-dmu*psi_mag > vol_dt_avail(i,j+1,k)) psi_mag = -vol_dt_avail(i,j+1,k) / dmu
+      if (dmu(k)*psi_mag > 0.0) then
+        if (dmu(k)*psi_mag > vol_dt_avail(i,j,k)) psi_mag = vol_dt_avail(i,j,k) / dmu(k)
+      elseif (dmu(k)*psi_mag < 0.0) then
+        if (-dmu(k)*psi_mag > vol_dt_avail(i,j+1,k)) psi_mag = -vol_dt_avail(i,j+1,k) / dmu(k)
       endif
     enddo ! These loops cannot be fused because psi_mag applies to the whole column
     do k=1,nz
-      vhml(i,J,k) = vhml(i,J,k) * psi_mag   ! [L2 H T-1 ~> m3 s-1 or kg s-1]
+      vhml(i,J,k) = dmu(k) * psi_mag   ! [L2 H T-1 ~> m3 s-1 or kg s-1]
       vhtr(i,J,k) = vhtr(i,J,k) + vhml(i,J,k) * dt ! [L2 H ~> m3 or kg]
     enddo
 
     vDml_diag(i,J) = psi_mag
-  enddo
+  enddo ; enddo
 
   do concurrent (j=js:je, k=1:nz, i=is:ie)
     h(i,j,k) = h(i,j,k) - dt*G%IareaT(i,j) * &
