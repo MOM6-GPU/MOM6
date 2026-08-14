@@ -1024,9 +1024,9 @@ subroutine mixedlayer_restrat_Bodner(CS, G, GV, US, h, uhtr, vhtr, tv, forces, d
     enddo ; enddo
     !$omp target update to(wpup)
   else
-    do concurrent (j=js-1:je+1, i=is-1:ie+1)
-      wpup(i,j) = max( (cuberoot(CS%mstar * U_star_2d(i,j)**3 &
-                                 + CS%nstar * (max(0., -bflux(i,j)) * BLD(i,j))))**2, CS%min_wstar2 ) &
+    do concurrent (j=js-1:je+1, i=is-1:ie+1) DO_LOCALITY(local(w_star3))
+      w_star3 = max(0., -bflux(i,j)) * BLD(i,j)    ! In [Z3 T-3 ~> m3 s-3]
+      wpup(i,j) = max( (cuberoot(CS%mstar * U_star_2d(i,j)**3 + CS%nstar * w_star3))**2, CS%min_wstar2 ) &
           * US%Z_to_L * GV%Z_to_H ! In [L H T-2 ~> m2 s-2 or kg m-1 s-2]
     enddo
   endif
