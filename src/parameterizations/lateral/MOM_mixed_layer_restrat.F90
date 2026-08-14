@@ -953,7 +953,7 @@ subroutine mixedlayer_restrat_Bodner(CS, G, GV, US, h, uhtr, vhtr, tv, forces, d
                  G%HI, haloshift=1, unscale=GV%H_to_mks)
   endif
 
-  !$omp target enter data map(to: U_star_2d, h_MLD)
+  !$omp target enter data map(to: U_star_2d, h_MLD, BLD, bflux)
   !$omp target enter data map(alloc: little_h, big_H, wpup, htot, buoy_av, uDml_diag, vDml_diag)
   !$omp target enter data map(alloc: vol_dt_avail, uhml, vhml)
 
@@ -993,8 +993,6 @@ subroutine mixedlayer_restrat_Bodner(CS, G, GV, US, h, uhtr, vhtr, tv, forces, d
   enddo
 
   ! Estimate w'u' at h-points, with a floor to avoid division by zero later.
-  ! needed here, otehrwe death
-  !$omp target enter data map(to: BLD, bflux)
   if (allocated(tv%SpV_avg) .and. .not.(GV%Boussinesq .or. GV%semi_Boussinesq)) then
     do j=js-1,je+1 ; do i=is-1,ie+1
       ! This expression differs by a factor of 1. / (Rho_0 * SpV_avg) compared with the other
@@ -1029,8 +1027,6 @@ subroutine mixedlayer_restrat_Bodner(CS, G, GV, US, h, uhtr, vhtr, tv, forces, d
           * US%Z_to_L * GV%Z_to_H ! In [L H T-2 ~> m2 s-2 or kg m-1 s-2]
     enddo
   endif
-  !$omp target exit data map(release: BLD, bflux)
-
 
   ! We filter w'u' with the same time scales used for "little h"
   do concurrent (j=js-1:je+1, i=is-1:ie+1)
@@ -1317,7 +1313,7 @@ subroutine mixedlayer_restrat_Bodner(CS, G, GV, US, h, uhtr, vhtr, tv, forces, d
   endif
 
   !$omp target exit data map(from: little_h, big_H, wpup, htot, buoy_av, uDml_diag, vDml_diag)
-  !$omp target exit data map(release: vol_dt_avail, uhml, vhml, U_star_2d, h_MLD)
+  !$omp target exit data map(release: vol_dt_avail, uhml, vhml, U_star_2d, h_MLD, BLD, bflux)
 
   if (CS%id_uhml > 0 .or. CS%id_vhml > 0) &
     ! Remapped uhml and vhml require east/north halo updates of h
