@@ -105,13 +105,17 @@ subroutine wave_speed(h, tv, G, GV, US, cg1, CS, halo_size, use_ebt_mode, mono_N
     pres, &       ! Interface pressure [R L2 T-2 ~> Pa]
     T_int, &      ! Temperature interpolated to interfaces [C ~> degC]
     S_int, &      ! Salinity interpolated to interfaces [S ~> ppt]
-    H_top, &      ! The distance of each filtered interface from the ocean surface [H ~> m or kg m-2]
-    H_bot, &      ! The distance of each filtered interface from the bottom [H ~> m or kg m-2]
     gprime        ! The reduced gravity across each interface [L2 H-1 T-2 ~> m s-2 or m4 s-2 kg-1].
-  real, dimension(merge(G%ied-G%isd+1, CS%niblock, CS%niblock==0), &
-                  merge(G%jed-G%jsd+1, CS%njblock, CS%njblock==0), SZK_(GV)) :: &
+  real, dimension(SZK_(GV)) :: &
     Igl, Igu      ! The inverse of the reduced gravity across an interface times
                   ! the thickness of the layer below (Igl) or above (Igu) it, in [T2 L-2 ~> s2 m-2].
+  real, dimension(SZK_(GV)+1) :: &
+    H_top, &      ! The distance of each filtered (or merged) interface from the ocean surface,
+                  ! recomputed as a column-local temporary each time it is needed
+                  ! [H ~> m or kg m-2]
+    H_bot         ! The distance of each filtered (or merged) interface from the bottom,
+                  ! recomputed as a column-local temporary each time it is needed
+                  ! [H ~> m or kg m-2]
   real, dimension(merge(G%ied-G%isd+1, CS%niblock, CS%niblock==0), &
                   merge(G%jed-G%jsd+1, CS%njblock, CS%njblock==0), SZK_(GV)+1) :: &
     Hf, &         ! Layer thicknesses after very thin layers are combined [H ~> m or kg m-2]
@@ -127,12 +131,11 @@ subroutine wave_speed(h, tv, G, GV, US, cg1, CS, halo_size, use_ebt_mode, mono_N
   real, dimension(merge(G%ied-G%isd+1, CS%niblock, CS%niblock==0), &
                   merge(G%jed-G%jsd+1, CS%njblock, CS%njblock==0), SZK_(GV)) :: &
     mode_struct   ! The mode structure [nondim], but it is also temporarily
-                  ! in units of [L2 T-2 ~> m2 s-2] after it is modified inside of tdma6_3d.
-  real, dimension(merge(G%ied-G%isd+1, CS%niblock, CS%niblock==0), &
-                  merge(G%jed-G%jsd+1, CS%njblock, CS%njblock==0), SZK_(GV)) :: &
-    I_beta, &     ! A temporary variable in the tridiagonal solve [L2 T-2 ~> m2 s-2]
-    yy            ! A temporary variable in the tridiagonal solve with the same units as
-                  ! mode_struct on entry to the solve [nondim]
+                  ! in units of [L2 T-2 ~> m2 s-2] after it is modified inside of tdma6_col.
+  real, dimension(SZK_(GV)) :: &
+    I_beta, &     ! A column-local temporary variable in the tridiagonal solve [L2 T-2 ~> m2 s-2]
+    yy            ! A column-local temporary variable in the tridiagonal solve with the same
+                  ! units as mode_struct on entry to the solve [nondim]
   integer, dimension(merge(G%ied-G%isd+1, CS%niblock, CS%niblock==0), &
                      merge(G%jed-G%jsd+1, CS%njblock, CS%njblock==0)) :: &
     nkc           ! The number of layers in each column after merging, or 0 if no wave speed
@@ -178,6 +181,7 @@ subroutine wave_speed(h, tv, G, GV, US, cg1, CS, halo_size, use_ebt_mode, mono_N
   integer, dimension(merge(G%ied-G%isd+1, CS%niblock, CS%niblock==0), &
                      merge(G%jed-G%jsd+1, CS%njblock, CS%njblock==0)) :: &
     kf            ! The number of active layers after filtering.
+  integer :: max_kf     ! maximum value of kf
   integer, parameter :: max_itt = 10
   logical :: use_EOS    ! If true, density or specific volume is calculated from T & S using an equation of state.
   logical :: nonBous    ! If true, do not make the Boussinesq approximation.
@@ -186,8 +190,8 @@ subroutine wave_speed(h, tv, G, GV, US, cg1, CS, halo_size, use_ebt_mode, mono_N
   integer :: kc         ! The number of layers in the column after merging
   integer :: i, j, k, k2, itt, is, ie, js, je, nz, halo
   integer :: nii, njj ! The declared horizontal extents of the blocked working arrays, which
-                  ! tridiag_det_3d and tdma6_3d need in order to index them the same way that they
-                  ! are indexed here.  These are also the strides of the block loops.
+                  ! tdma6_col needs in order to index mode_struct the same way that it is indexed
+                  ! here.  These are also the strides of the block loops.
   integer :: isb, ieb ! The first and last i-indices of the current block.
   integer :: jsb, jeb ! The first and last j-indices of the current block.
   integer :: iie, jje ! The number of columns actually in the current block, which is smaller
@@ -222,7 +226,7 @@ subroutine wave_speed(h, tv, G, GV, US, cg1, CS, halo_size, use_ebt_mode, mono_N
   ! otherwise manage their transfers implicitly.
   !$omp target enter data map(alloc: Hf, Tf, Sf, Rf, pres, T_int, S_int, dRho_dT, dRho_dS)
   !$omp target enter data map(alloc: dSpV_dT, dSpV_dS, H_top, H_bot, gprime, Igl, Igu)
-  !$omp target enter data map(alloc: Hc, Tc, Sc, Rc, mode_struct, I_beta, yy)
+  !$omp target enter data map(alloc: Hc, Tc, Sc, Rc, mode_struct)
   !$omp target enter data map(alloc: htot, kf, nkc)
 
   l_use_ebt_mode = CS%use_ebt_mode
@@ -240,6 +244,7 @@ subroutine wave_speed(h, tv, G, GV, US, cg1, CS, halo_size, use_ebt_mode, mono_N
   endif
 
   nonBous = .not.(GV%Boussinesq .or. GV%semi_Boussinesq)
+  max_kf = 0
   H_to_pres = GV%H_to_RZ * GV%g_Earth
   ! Note that g_Rho0 = H_to_pres / GV%Rho0**2
   if (.not.nonBous) g_Rho0 = GV%g_Earth*GV%H_to_Z / GV%Rho0
@@ -275,7 +280,8 @@ subroutine wave_speed(h, tv, G, GV, US, cg1, CS, halo_size, use_ebt_mode, mono_N
     ! at the top), and find the interface quantities that the equation of state
     ! needs.  Each column can be worked upon one at a time.
     do concurrent (jj=1:jje, ii=1:iie) &
-      DO_LOCALITY(local(i, j, k, hmin, H_here, HxT_here, HxS_here, HxR_here))
+      DO_LOCALITY(local(i, j, k, hmin, H_here, HxT_here, HxS_here, HxR_here)) &
+      DO_LOCALITY(reduce(max:max_kf))
       i = isb + ii - 1
       j = jsb + jj - 1
       htot(ii,jj) = 0.0
@@ -339,15 +345,15 @@ subroutine wave_speed(h, tv, G, GV, US, cg1, CS, halo_size, use_ebt_mode, mono_N
         Tf(ii,jj,k) = Tf(ii,jj,kf(ii,jj)) ; Sf(ii,jj,k) = Sf(ii,jj,kf(ii,jj))
         Rf(ii,jj,k) = Rf(ii,jj,kf(ii,jj))
       enddo
+      max_kf = max(max_kf, kf(ii,jj))
 
       if (use_EOS) then
-        pres(ii,jj,1) = 0.0 ; H_top(ii,jj,1) = 0.0
+        pres(ii,jj,1) = 0.0
         T_int(ii,jj,1) = Tf(ii,jj,1) ; S_int(ii,jj,1) = Sf(ii,jj,1)
         do K=2,nz+1
           pres(ii,jj,K) = pres(ii,jj,K-1) + H_to_pres*Hf(ii,jj,k-1)
           T_int(ii,jj,K) = 0.5*(Tf(ii,jj,k)+Tf(ii,jj,k-1))
           S_int(ii,jj,K) = 0.5*(Sf(ii,jj,k)+Sf(ii,jj,k-1))
-          H_top(ii,jj,K) = H_top(ii,jj,K-1) + Hf(ii,jj,k-1)
         enddo
       endif
     enddo
@@ -358,7 +364,7 @@ subroutine wave_speed(h, tv, G, GV, US, cg1, CS, halo_size, use_ebt_mode, mono_N
         do jj=1,jje ; do ii=1,iie
           call calculate_specific_vol_derivs(T_int(ii,jj,:), S_int(ii,jj,:), pres(ii,jj,:), &
                                              dSpV_dT(ii,jj,:), dSpV_dS(ii,jj,:), &
-                                             tv%eqn_of_state, (/2,nz+1/) )
+                                             tv%eqn_of_state, (/2,max_kf+1/) )
         enddo ; enddo
         !$omp target update to(dSpV_dT, dSpV_dS)
       else
@@ -366,18 +372,20 @@ subroutine wave_speed(h, tv, G, GV, US, cg1, CS, halo_size, use_ebt_mode, mono_N
         ! blocked arrays are 1, so they span the columns that are actually in this block.
         EOSdom(1,1) = 1 ; EOSdom(1,2) = iie
         EOSdom(2,1) = 1 ; EOSdom(2,2) = jje
-        EOSdom(3,1) = 2 ; EOSdom(3,2) = nz+1
+        EOSdom(3,1) = 2 ; EOSdom(3,2) = max_kf+1
         call calculate_density_derivs(T_int, S_int, pres, drho_dT, drho_dS, &
                                       tv%eqn_of_state, EOSdom)
       endif
     endif
 
     ! From this point, we can work on individual columns without causing memory to have page faults.
-    do concurrent (jj=1:jje, ii=1:iie) &
-      DO_LOCALITY(local(i, j, k, k2, itt, kc, do_merge, I_Htot, I_Hnew)) &
-      DO_LOCALITY(local(det, ddet, lam, dlam, lam0, cg1_est, speed2_tot)) &
-      DO_LOCALITY(local(drxh_sum, dSpVxh_sum, hw, sum_hc, gp, N2min)) &
-      DO_LOCALITY(local(ms_min, ms_max, ms_sq, below_mono_N2_frac, below_mono_N2_depth))
+    !$omp target teams loop collapse(2) private( i, j, k, k2, itt, kc, do_merge, I_Htot, I_Hnew, &
+    !$omp &                                      det, ddet, lam, dlam, lam0, cg1_est, speed2_tot, &
+    !$omp &                                      drxh_sum, dSpVxh_sum, hw, sum_hc, gp, N2min, &
+    !$omp &                                      ms_min, ms_max, ms_sq, below_mono_N2_frac, &
+    !$omp &                                      below_mono_N2_depth, Igu, Igl, H_top, H_bot, &
+    !$omp &                                      I_beta, yy)
+    do jj=1,jje ; do ii=1,iie
       i = isb + ii - 1
       j = jsb + jj - 1
       nkc(ii,jj) = 0
@@ -391,21 +399,23 @@ subroutine wave_speed(h, tv, G, GV, US, cg1, CS, halo_size, use_ebt_mode, mono_N
             ! clusters of massless layers at interfaces that can be grouped into 2 or 3 layers.
             ! For a uniform stratification and a huge number of layers uniformly distributed in
             ! density, this estimate is too large (as is desired) by a factor of pi^2/6 ~= 1.64.
-            if (H_top(ii,jj,kf(ii,jj)) > 0.0) then
-              ! This is 1.0 / (H_top(ii,jj,K) + H_bot(ii,jj,K)) for all K.
-              I_Htot = 1.0 / (H_top(ii,jj,kf(ii,jj)) + Hf(ii,jj,kf(ii,jj)))
-              H_bot(ii,jj,kf(ii,jj)+1) = 0.0
+            H_top(1) = 0.0
+            do K=2,kf(ii,jj) ; H_top(K) = H_top(K-1) + Hf(ii,jj,k-1) ; enddo
+            if (H_top(kf(ii,jj)) > 0.0) then
+              ! This is 1.0 / (H_top(K) + H_bot(K)) for all K.
+              I_Htot = 1.0 / (H_top(kf(ii,jj)) + Hf(ii,jj,kf(ii,jj)))
+              H_bot(kf(ii,jj)+1) = 0.0
               if (nonBous) then
                 do K=kf(ii,jj),2,-1
-                  H_bot(ii,jj,K) = H_bot(ii,jj,K+1) + Hf(ii,jj,k)
-                  dSpVxh_sum = dSpVxh_sum + ((H_top(ii,jj,K) * H_bot(ii,jj,K)) * I_Htot) * &
+                  H_bot(K) = H_bot(K+1) + Hf(ii,jj,k)
+                  dSpVxh_sum = dSpVxh_sum + ((H_top(K) * H_bot(K)) * I_Htot) * &
                       min(0.0, dSpV_dT(ii,jj,K)*(Tf(ii,jj,k)-Tf(ii,jj,k-1)) + &
                           dSpV_dS(ii,jj,K)*(Sf(ii,jj,k)-Sf(ii,jj,k-1)))
                 enddo
               else
                 do K=kf(ii,jj),2,-1
-                  H_bot(ii,jj,K) = H_bot(ii,jj,K+1) + Hf(ii,jj,k)
-                  drxh_sum = drxh_sum + ((H_top(ii,jj,K) * H_bot(ii,jj,K)) * I_Htot) * &
+                  H_bot(K) = H_bot(K+1) + Hf(ii,jj,k)
+                  drxh_sum = drxh_sum + ((H_top(K) * H_bot(K)) * I_Htot) * &
                       max(0.0, drho_dT(ii,jj,K)*(Tf(ii,jj,k)-Tf(ii,jj,k-1)) + &
                           drho_dS(ii,jj,K)*(Sf(ii,jj,k)-Sf(ii,jj,k-1)))
                 enddo
@@ -432,22 +442,22 @@ subroutine wave_speed(h, tv, G, GV, US, cg1, CS, halo_size, use_ebt_mode, mono_N
         else  ! .not. (use_EOS)
           drxh_sum = 0.0 ; dSpVxh_sum = 0.0
           if (better_est) then
-            H_top(ii,jj,1) = 0.0
-            do K=2,kf(ii,jj) ; H_top(ii,jj,K) = H_top(ii,jj,K-1) + Hf(ii,jj,k-1) ; enddo
-            if (H_top(ii,jj,kf(ii,jj)) > 0.0) then
-              ! This is 1.0 / (H_top(ii,jj,K) + H_bot(ii,jj,K)) for all K.
-              I_Htot = 1.0 / (H_top(ii,jj,kf(ii,jj)) + Hf(ii,jj,kf(ii,jj)))
-              H_bot(ii,jj,kf(ii,jj)+1) = 0.0
+            H_top(1) = 0.0
+            do K=2,kf(ii,jj) ; H_top(K) = H_top(K-1) + Hf(ii,jj,k-1) ; enddo
+            if (H_top(kf(ii,jj)) > 0.0) then
+              ! This is 1.0 / (H_top(K) + H_bot(K)) for all K.
+              I_Htot = 1.0 / (H_top(kf(ii,jj)) + Hf(ii,jj,kf(ii,jj)))
+              H_bot(kf(ii,jj)+1) = 0.0
               if (nonBous) then
                 do K=kf(ii,jj),2,-1
-                  H_bot(ii,jj,K) = H_bot(ii,jj,K+1) + Hf(ii,jj,k)
-                  dSpVxh_sum = dSpVxh_sum + ((H_top(ii,jj,K) * H_bot(ii,jj,K)) * I_Htot) * &
+                  H_bot(K) = H_bot(K+1) + Hf(ii,jj,k)
+                  dSpVxh_sum = dSpVxh_sum + ((H_top(K) * H_bot(K)) * I_Htot) * &
                       min(0.0, (Rf(ii,jj,k-1)-Rf(ii,jj,k)) / (Rf(ii,jj,k)*Rf(ii,jj,k-1)))
                 enddo
               else
                 do K=kf(ii,jj),2,-1
-                  H_bot(ii,jj,K) = H_bot(ii,jj,K+1) + Hf(ii,jj,k)
-                  drxh_sum = drxh_sum + ((H_top(ii,jj,K) * H_bot(ii,jj,K)) * I_Htot) * &
+                  H_bot(K) = H_bot(K+1) + Hf(ii,jj,k)
+                  drxh_sum = drxh_sum + ((H_top(K) * H_bot(K)) * I_Htot) * &
                              max(0.0,Rf(ii,jj,k)-Rf(ii,jj,k-1))
                 enddo
               endif
@@ -633,14 +643,14 @@ subroutine wave_speed(h, tv, G, GV, US, cg1, CS, halo_size, use_ebt_mode, mono_N
           if (kc >= 2) then
             speed2_tot = 0.0
             if (better_est) then
-              H_top(ii,jj,1) = 0.0 ; H_bot(ii,jj,kc+1) = 0.0
-              do K=2,kc+1 ; H_top(ii,jj,K) = H_top(ii,jj,K-1) + Hc(ii,jj,k-1) ; enddo
-              do K=kc,2,-1 ; H_bot(ii,jj,K) = H_bot(ii,jj,K+1) + Hc(ii,jj,k) ; enddo
-              I_Htot = 0.0 ; if (H_top(ii,jj,kc+1) > 0.0) I_Htot = 1.0 / H_top(ii,jj,kc+1)
+              H_top(1) = 0.0 ; H_bot(kc+1) = 0.0
+              do K=2,kc+1 ; H_top(K) = H_top(K-1) + Hc(ii,jj,k-1) ; enddo
+              do K=kc,2,-1 ; H_bot(K) = H_bot(K+1) + Hc(ii,jj,k) ; enddo
+              I_Htot = 0.0 ; if (H_top(kc+1) > 0.0) I_Htot = 1.0 / H_top(kc+1)
             endif
 
             if (l_use_ebt_mode) then
-              Igu(ii,jj,1) = 0. ! Neumann condition for pressure modes
+              Igu(1) = 0. ! Neumann condition for pressure modes
               sum_hc = Hc(ii,jj,1)
               N2min = gprime(ii,jj,2)/Hc(ii,jj,1)
 
@@ -672,24 +682,24 @@ subroutine wave_speed(h, tv, G, GV, US, cg1, CS, halo_size, use_ebt_mode, mono_N
                   endif
                 endif
 
-                Igu(ii,jj,k) = 1.0/(gp*Hc(ii,jj,k))
-                Igl(ii,jj,k-1) = 1.0/(gp*Hc(ii,jj,k-1))
+                Igu(k) = 1.0/(gp*Hc(ii,jj,k))
+                Igl(k-1) = 1.0/(gp*Hc(ii,jj,k-1))
                 sum_hc = sum_hc + Hc(ii,jj,k)
 
                 if (better_est) then
                   ! Estimate that the ebt_mode is sqrt(2) times the speed of the flat bottom modes.
-                  speed2_tot = speed2_tot + 2.0 * gprime(ii,jj,K)*((H_top(ii,jj,K) * H_bot(ii,jj,K)) * I_Htot)
+                  speed2_tot = speed2_tot + 2.0 * gprime(ii,jj,K)*((H_top(K) * H_bot(K)) * I_Htot)
                 else ! The ebt_mode wave should be faster than the flat-bottom mode, so 0.707 should be > 1?
                   speed2_tot = speed2_tot + gprime(ii,jj,K)*(Hc(ii,jj,k-1)+Hc(ii,jj,k))*0.707
                 endif
               enddo
-             !Igl(ii,jj,kc) = 0. ! Neumann condition for pressure modes
-              Igl(ii,jj,kc) = 2.*Igu(ii,jj,kc) ! Dirichlet condition for pressure modes
+             !Igl(kc) = 0. ! Neumann condition for pressure modes
+              Igl(kc) = 2.*Igu(kc) ! Dirichlet condition for pressure modes
             else ! .not. l_use_ebt_mode
               do K=2,kc
-                Igl(ii,jj,K) = 1.0/(gprime(ii,jj,K)*Hc(ii,jj,k)) ; Igu(ii,jj,K) = 1.0/(gprime(ii,jj,K)*Hc(ii,jj,k-1))
+                Igl(K) = 1.0/(gprime(ii,jj,K)*Hc(ii,jj,k)) ; Igu(K) = 1.0/(gprime(ii,jj,K)*Hc(ii,jj,k-1))
                 if (better_est) then
-                  speed2_tot = speed2_tot + gprime(ii,jj,K)*((H_top(ii,jj,K) * H_bot(ii,jj,K)) * I_Htot)
+                  speed2_tot = speed2_tot + gprime(ii,jj,K)*((H_top(K) * H_bot(K)) * I_Htot)
                 else
                   speed2_tot = speed2_tot + gprime(ii,jj,K)*(Hc(ii,jj,k-1)+Hc(ii,jj,k))
                 endif
@@ -718,8 +728,7 @@ subroutine wave_speed(h, tv, G, GV, US, cg1, CS, halo_size, use_ebt_mode, mono_N
                 ! The last two rows of the pressure equation matrix are
                 !    |    ...  0  igu(kc-1)  b(kc-1)-lam  igl(kc-1)  |
                 !    \    ...  0     0        igu(kc)     b(kc)-lam  /
-                call tridiag_det_3d(Igu, Igl, 1, nii, 1, njj, nz, ii, jj, 1, kc, lam, det, ddet, &
-                                    row_scale=c2_scale)
+                call tridiag_det(Igu, Igl, 1, kc, lam, det, ddet, row_scale=c2_scale)
               else
                 ! This initialization of det,ddet imply Dirichlet boundary conditions for vertical
                 ! velocity modes, so that first 3 rows of the matrix are
@@ -730,8 +739,7 @@ subroutine wave_speed(h, tv, G, GV, US, cg1, CS, halo_size, use_ebt_mode, mono_N
                 !    |    ...   0  igu(kc-2)  b(kc-2)-lam  igl(kc-2)     0       |
                 !    |    ...   0     0        igu(kc-1)  b(kc-1)-lam  igl(kc-1) |
                 !    \    ...   0     0           0        igu(kc)    b(kc)-lam  /
-                call tridiag_det_3d(Igu, Igl, 1, nii, 1, njj, nz, ii, jj, 2, kc, lam, det, ddet, &
-                                    row_scale=c2_scale)
+                call tridiag_det(Igu, Igl, 2, kc, lam, det, ddet, row_scale=c2_scale)
               endif
               ! Use Newton's method iteration to find a new estimate of lam.
 
@@ -747,8 +755,8 @@ subroutine wave_speed(h, tv, G, GV, US, cg1, CS, halo_size, use_ebt_mode, mono_N
               endif
 
               if (calc_modal_structure) then
-                call tdma6_3d(kc, Igu, Igl, 1, nii, 1, njj, nz, ii, jj, lam, mode_struct, I_beta, yy)
-                ! Note that tdma6_3d changes the units of mode_struct to [L2 T-2 ~> m2 s-2]
+                call tdma6_col(kc, Igu, Igl, 1, nii, 1, njj, nz, ii, jj, lam, mode_struct, I_beta, yy)
+                ! Note that tdma6_col changes the units of mode_struct to [L2 T-2 ~> m2 s-2]
                 ms_min = mode_struct(ii,jj,1)
                 ms_max = mode_struct(ii,jj,1)
                 ms_sq = mode_struct(ii,jj,1)**2
@@ -797,7 +805,7 @@ subroutine wave_speed(h, tv, G, GV, US, cg1, CS, halo_size, use_ebt_mode, mono_N
           do k=1,nz ; modal_structure(i,j,k) = 0. ; enddo
         endif
       endif
-    enddo ! column loop
+    enddo ; enddo ! column loop
 
     !   Remapping done on the host to avoid accessing polymorphic Recon1d type on device
     if (present(modal_structure)) then
@@ -820,7 +828,7 @@ subroutine wave_speed(h, tv, G, GV, US, cg1, CS, halo_size, use_ebt_mode, mono_N
 
   !$omp target exit data map(delete: Hf, Tf, Sf, Rf, pres, T_int, S_int, dRho_dT, dRho_dS)
   !$omp target exit data map(delete: dSpV_dT, dSpV_dS, H_top, H_bot, gprime, Igl, Igu)
-  !$omp target exit data map(delete: Hc, Tc, Sc, Rc, mode_struct, I_beta, yy)
+  !$omp target exit data map(delete: Hc, Tc, Sc, Rc, mode_struct)
   !$omp target exit data map(delete: htot, kf, nkc)
 
 end subroutine wave_speed
@@ -875,27 +883,28 @@ pure subroutine tdma6(n, a, c, lam, y)
 
 end subroutine tdma6
 
-!> Solve the same non-symmetric tridiagonal problem as tdma6 for a single column of a set of
-!! 3-dimensional arrays, addressing that column by its i- and j-indices.
+!> Solve the same non-symmetric tridiagonal problem as tdma6 for a single column of a
+!! 3-dimensional array of right hand sides, addressing that column by its i- and j-indices.
+!! The matrix diagonals and the elimination workspace are column-local arrays.
 !!
-pure subroutine tdma6_3d(n, a, c, isl, iel, jsl, jel, nk, i, j, lam, y, I_beta, yy)
+pure subroutine tdma6_col(n, a, c, isl, iel, jsl, jel, nk, i, j, lam, y, I_beta, yy)
   integer, intent(in)    :: n   !< Number of rows of matrix
-  integer, intent(in)    :: isl !< Lower i-bound of the 3-d arrays
-  integer, intent(in)    :: iel !< Upper i-bound of the 3-d arrays
-  integer, intent(in)    :: jsl !< Lower j-bound of the 3-d arrays
-  integer, intent(in)    :: jel !< Upper j-bound of the 3-d arrays
-  integer, intent(in)    :: nk  !< Vertical extent of the 3-d arrays
-  real, dimension(isl:iel,jsl:jel,nk), intent(in) :: a !< Lower diagonal   [T2 L-2 ~> s2 m-2]
-  real, dimension(isl:iel,jsl:jel,nk), intent(in) :: c !< Upper diagonal   [T2 L-2 ~> s2 m-2]
+  integer, intent(in)    :: isl !< Lower i-bound of the 3-d right hand side array
+  integer, intent(in)    :: iel !< Upper i-bound of the 3-d right hand side array
+  integer, intent(in)    :: jsl !< Lower j-bound of the 3-d right hand side array
+  integer, intent(in)    :: jel !< Upper j-bound of the 3-d right hand side array
+  integer, intent(in)    :: nk  !< Vertical extent of the arrays
+  real, dimension(nk), intent(in) :: a !< Lower diagonal   [T2 L-2 ~> s2 m-2]
+  real, dimension(nk), intent(in) :: c !< Upper diagonal   [T2 L-2 ~> s2 m-2]
   integer, intent(in)    :: i   !< The i-index of the column to work on
   integer, intent(in)    :: j   !< The j-index of the column to work on
   real,    intent(in)    :: lam !< Scalar subtracted from leading diagonal [T2 L-2 ~> s2 m-2]
   real, dimension(isl:iel,jsl:jel,nk), intent(inout) :: y !< RHS on entry [A ~> a], result on exit
                                                      !! [A L2 T-2 ~> a m2 s-2]
-  real, dimension(isl:iel,jsl:jel,nk), intent(inout) :: I_beta !< Workspace holding the inverse of the
-                                                     !! leading diagonal after elimination [L2 T-2 ~> m2 s-2]
-  real, dimension(isl:iel,jsl:jel,nk), intent(inout) :: yy !< Workspace holding the forward-eliminated right
-                                                     !! hand side, with the same units as y on entry [A ~> a]
+  real, dimension(nk), intent(inout) :: I_beta !< Workspace holding the inverse of the leading
+                                               !! diagonal after elimination [L2 T-2 ~> m2 s-2]
+  real, dimension(nk), intent(inout) :: yy !< Workspace holding the forward-eliminated right hand
+                                           !! side, with the same units as y on entry [A ~> a]
   !$omp declare target
 
   ! Local variables
@@ -905,38 +914,38 @@ pure subroutine tdma6_3d(n, a, c, isl, iel, jsl, jel, nk, i, j, lam, y, I_beta, 
   integer :: k, m
 
   lambda = lam
-  beta = (a(i,j,1)+c(i,j,1)) - lambda
+  beta = (a(1)+c(1)) - lambda
   if (beta==0.) then ! lam was chosen too perfectly
     ! Change lambda and redo this first row
     lambda = (1. + 1.e-5) * lambda
-    beta = (a(i,j,1)+c(i,j,1)) - lambda
+    beta = (a(1)+c(1)) - lambda
   endif
-  I_beta(i,j,1) = 1. / beta
-  yy(i,j,1) = y(i,j,1)
+  I_beta(1) = 1. / beta
+  yy(1) = y(i,j,1)
   do k = 2, n
-    beta = ( (a(i,j,k)+c(i,j,k)) - lambda ) - a(i,j,k) * c(i,j,k-1) * I_beta(i,j,k-1)
+    beta = ( (a(k)+c(k)) - lambda ) - a(k) * c(k-1) * I_beta(k-1)
     ! Perhaps the following 0 needs to become a tolerance to handle underflow?
     if (beta==0.) then ! lam was chosen too perfectly
       ! Change lambda and redo everything up to row k
       lambda = (1. + 1.e-5) * lambda
-      I_beta(i,j,1) = 1. / ( (a(i,j,1)+c(i,j,1)) - lambda )
+      I_beta(1) = 1. / ( (a(1)+c(1)) - lambda )
       do m = 2, k
-        I_beta(i,j,m) = 1. / ( ( (a(i,j,m)+c(i,j,m)) - lambda ) - &
-                               a(i,j,m) * c(i,j,m-1) * I_beta(i,j,m-1) )
-        yy(i,j,m) = y(i,j,m) + a(i,j,m) * yy(i,j,m-1) * I_beta(i,j,m-1)
+        I_beta(m) = 1. / ( ( (a(m)+c(m)) - lambda ) - &
+                           a(m) * c(m-1) * I_beta(m-1) )
+        yy(m) = y(i,j,m) + a(m) * yy(m-1) * I_beta(m-1)
       enddo
     else
-      I_beta(i,j,k) = 1. / beta
+      I_beta(k) = 1. / beta
     endif
-    yy(i,j,k) = y(i,j,k) + a(i,j,k) * yy(i,j,k-1) * I_beta(i,j,k-1)
+    yy(k) = y(i,j,k) + a(k) * yy(k-1) * I_beta(k-1)
   enddo
   ! The units of y change by a factor of [L2 T-2 ~> m2 s-2] in the following lines.
-  y(i,j,n) = yy(i,j,n) * I_beta(i,j,n)
+  y(i,j,n) = yy(n) * I_beta(n)
   do k = n-1, 1, -1
-    y(i,j,k) = ( yy(i,j,k) + c(i,j,k) * y(i,j,k+1) ) * I_beta(i,j,k)
+    y(i,j,k) = ( yy(k) + c(k) * y(i,j,k+1) ) * I_beta(k)
   enddo
 
-end subroutine tdma6_3d
+end subroutine tdma6_col
 
 !> Calculates the wave speeds for the first few barolinic modes.
 subroutine wave_speeds(h, tv, G, GV, US, nmodes, cn, CS, w_struct, u_struct, u_struct_max, u_struct_bot, Nb, int_w2, &
@@ -1796,69 +1805,6 @@ pure subroutine tridiag_det(a, c, ks, ke, lam, det, ddet, row_scale)
   enddo
 
 end subroutine tridiag_det
-
-!> Calculate the determinant of the same tridiagonal matrix as tridiag_det, and its derivative
-!! with lam, for a single column of a set of 3-dimensional arrays addressed by its i- and
-!! j-indices.
-!!
-pure subroutine tridiag_det_3d(a, c, isl, iel, jsl, jel, nk, i, j, ks, ke, lam, det, ddet, row_scale)
-  integer, intent(in) :: isl   !< Lower i-bound of the 3-d arrays
-  integer, intent(in) :: iel   !< Upper i-bound of the 3-d arrays
-  integer, intent(in) :: jsl   !< Lower j-bound of the 3-d arrays
-  integer, intent(in) :: jel   !< Upper j-bound of the 3-d arrays
-  integer, intent(in) :: nk    !< Vertical extent of the 3-d arrays
-  real, dimension(isl:iel,jsl:jel,nk), intent(in) :: a !< Lower diagonal of matrix (first entry unused)
-                                          !! [T2 L-2 ~> s2 m-2]
-  real, dimension(isl:iel,jsl:jel,nk), intent(in) :: c !< Upper diagonal of matrix (last entry unused)
-                                          !! [T2 L-2 ~> s2 m-2]
-  integer, intent(in) :: i     !< The i-index of the column to work on
-  integer, intent(in) :: j     !< The j-index of the column to work on
-  integer, intent(in) :: ks    !< Starting index to use in determinant
-  integer, intent(in) :: ke    !< Ending index to use in determinant
-  real,    intent(in) :: lam   !< Value subtracted from b [T2 L-2 ~> s2 m-2]
-  real,               intent(out):: det   !< Determinant of the matrix in dynamically rescaled units that
-                                          !! depend on the number of rows and the cumulative magnitude of
-                                          !! det and are therefore difficult to interpret, but the units
-                                          !! of det/ddet are always in [T2 L-2 ~> s2 m-2]
-  real,               intent(out):: ddet  !< Derivative of determinant with lam in units that are dynamically
-                                          !! rescaled along with those of det, such that the units of
-                                          !! det/ddet are always in [T2 L-2 ~> s2 m-2]
-  real,    intent(in) :: row_scale !< A scaling factor of the rows of the matrix to
-                                          !! limit the growth of the determinant [L2 s2 T-2 m-2 ~> 1]
-  !$omp declare target
-
-  ! Local variables
-  real :: detKm1, detKm2   ! Cumulative value of the determinant for the previous two layers in units
-                           ! that vary with the number of layers that have been worked on [various]
-  real :: ddetKm1, ddetKm2 ! Derivative of the cumulative determinant with lam for the previous two
-                           ! layers [various], but the units of detKm1/ddetKm1 are [T2 L-2 ~> s2 m-2]
-  real, parameter :: rescale = 1024.0**4 ! max value of determinant allowed before rescaling [nondim]
-  real :: I_rescale ! inverse of rescale [nondim]
-  integer :: k      ! row (layer interface) index
-
-  I_rescale = 1.0 / rescale
-
-  detKm1 = 1.0 ; ddetKm1 = 0.0
-  det = (a(i,j,ks)+c(i,j,ks)) - lam ; ddet = -1.0
-  do k=ks+1,ke
-    ! Shift variables and rescale rows to avoid over- or underflow.
-    detKm2 = row_scale*detKm1 ; ddetKm2 = row_scale*ddetKm1
-    detKm1 = row_scale*det    ; ddetKm1 = row_scale*ddet
-
-    det =  ((a(i,j,k)+c(i,j,k))-lam)*detKm1  - (a(i,j,k)*c(i,j,k-1))*detKm2
-    ddet = ((a(i,j,k)+c(i,j,k))-lam)*ddetKm1 - (a(i,j,k)*c(i,j,k-1))*ddetKm2 - detKm1
-
-    ! Rescale det & ddet if det is getting too large or too small.
-    if (abs(det) > rescale) then
-      det = I_rescale*det ; detKm1 = I_rescale*detKm1
-      ddet = I_rescale*ddet ; ddetKm1 = I_rescale*ddetKm1
-    elseif (abs(det) < I_rescale) then
-      det = rescale*det ; detKm1 = rescale*detKm1
-      ddet = rescale*ddet ; ddetKm1 = rescale*ddetKm1
-    endif
-  enddo
-
-end subroutine tridiag_det_3d
 
 !> Initialize control structure for MOM_wave_speed
 subroutine wave_speed_init(CS, GV, param_file, use_ebt_mode, mono_N2_column_fraction, mono_N2_depth, &
