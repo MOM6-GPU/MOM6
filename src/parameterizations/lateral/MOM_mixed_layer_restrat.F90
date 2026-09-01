@@ -933,7 +933,10 @@ subroutine mixedlayer_restrat_Bodner(CS, G, GV, US, h, uhtr, vhtr, tv, forces, d
   Lam2_available = present(Lam2)
   if (Lam2_available) Lam2_available = associated(Lam2)
 
-  ! Wave Enhanced of ustar following Eq. 28 in Bodner23
+  ! Wave Enhanced of ustar following Eq. 28 in Bodner23.  Lam2 is a host-side pointer that is
+  ! not mapped, so this scaling stays on the host and U_star_2d is round-tripped around it.  The
+  ! transfers are guarded because WAVE_ENHANCED_USTAR is off by default.
+  !$omp target update from(U_star_2d) if(CS%wave_enhanced_ustar)
   if (CS%wave_enhanced_ustar) then
     if (Lam2_available) then
       call pass_var(Lam2, G%domain, halo=1)
@@ -949,6 +952,7 @@ subroutine mixedlayer_restrat_Bodner(CS, G, GV, US, h, uhtr, vhtr, tv, forces, d
       enddo ; enddo
     endif
   endif
+  !$omp target update to(U_star_2d) if(CS%wave_enhanced_ustar)
 
   if (CS%debug) then
     !$omp target update from(U_star_2d)
