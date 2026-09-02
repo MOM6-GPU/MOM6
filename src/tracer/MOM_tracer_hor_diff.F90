@@ -250,8 +250,7 @@ subroutine tracer_hordiff(h, dt, MEKE, VarMix, visc, G, GV, US, CS, Reg, tv, do_
   if (do_online) then
     if (use_VarMix) then
       MEKE_KhTr_fac = MEKE%KhTr_fac
-      !$omp target enter data map(to: VarMix, VarMix%SN_u, VarMix%L2u, VarMix%Res_fn_h, &
-      !$omp   VarMix%Rd_dx_h, MEKE, MEKE%Kh)
+      !$omp target enter data map(to: MEKE, MEKE%Kh)
       do concurrent (j=js:je, I=is-1:ie)
         Kh_loc = CS%KhTr
         if (use_Eady) Kh_loc = Kh_loc + CS%KhTr_Slope_Cff*VarMix%L2u(I,j)*VarMix%SN_u(I,j)
@@ -284,8 +283,7 @@ subroutine tracer_hordiff(h, dt, MEKE, VarMix, visc, G, GV, US, CS, Reg, tv, do_
           Kh_v(i,J,1) = max(Kh_loc, CS%KhTr_min) ! Re-apply min
         endif
       enddo
-      !$omp target exit data map(release: VarMix, VarMix%SN_u, VarMix%L2u, VarMix%SN_v, &
-      !$omp   VarMix%L2v, VarMix%Res_fn_h, VarMix%Rd_dx_h, MEKE, MEKE%Kh)
+      !$omp target exit data map(release: MEKE, MEKE%Kh)
 
       do concurrent (j=js:je, I=is-1:ie)
         khdt_x(I,j) = dt*(Kh_u(I,j,1)*(G%dy_Cu(I,j)*G%IdxCu(I,j)))
@@ -294,6 +292,7 @@ subroutine tracer_hordiff(h, dt, MEKE, VarMix, visc, G, GV, US, CS, Reg, tv, do_
         khdt_y(i,J) = dt*(Kh_v(i,J,1)*(G%dx_Cv(i,J)*G%IdyCv(i,J)))
       enddo
     elseif (Resoln_scaled) then
+      !$omp target update from(VarMix%Res_fn_h)
       !$OMP parallel do default(shared) private(Res_fn)
       do j=js,je ; do I=is-1,ie
         Res_fn = 0.5 * (VarMix%Res_fn_h(i,j) + VarMix%Res_fn_h(i+1,j))
@@ -535,21 +534,43 @@ subroutine tracer_hordiff(h, dt, MEKE, VarMix, visc, G, GV, US, CS, Reg, tv, do_
         enddo
       enddo
     enddo
+
     if (CS%KhTr_use_vert_struct) then
-      do K=2,nz+1
-        do J=js-1,je
-          do i=is,ie
-            Coef_y(i,J,K) = Coef_y(i,J,1) * 0.5 * ( VarMix%khtr_struct(i,j,k-1) + VarMix%khtr_struct(i,j+1,k-1) )
+      if (CS%full_depth_khtr_min) then
+        do K=2,nz+1
+          do J=js-1,je
+            do i=is,ie
+              Coef_y(i,J,K) = Coef_y(i,J,1) * 0.5 * ( VarMix%khtr_struct(i,j,k-1) + VarMix%khtr_struct(i,j+1,k-1) )
+              Coef_min = I_numitts * dt * (CS%KhTr_min*(G%dx_Cv(i,J)*G%IdyCv(i,J)))
+              Coef_y(i,J,K) = max(Coef_y(i,J,K), Coef_min)
+            enddo
           enddo
         enddo
-      enddo
-      do k=2,nz+1
-        do j=js,je
-          do I=is-1,ie
-            Coef_x(I,j,K) = Coef_x(I,j,1) * 0.5 * ( VarMix%khtr_struct(i,j,k-1) + VarMix%khtr_struct(i+1,j,k-1) )
+        do k=2,nz+1
+          do j=js,je
+            do I=is-1,ie
+              Coef_x(I,j,K) = Coef_x(I,j,1) * 0.5 * ( VarMix%khtr_struct(i,j,k-1) + VarMix%khtr_struct(i+1,j,k-1) )
+              Coef_min = I_numitts * dt * (CS%KhTr_min*(G%dy_Cu(I,j)*G%IdxCu(I,j)))
+              Coef_x(I,j,K) = max(Coef_x(I,j,K), Coef_min)
+            enddo
           enddo
         enddo
-      enddo
+      else
+        do K=2,nz+1
+          do J=js-1,je
+            do i=is,ie
+              Coef_y(i,J,K) = Coef_y(i,J,1) * 0.5 * ( VarMix%ebt_struct(i,j,k-1) + VarMix%ebt_struct(i,j+1,k-1) )
+            enddo
+          enddo
+        enddo
+        do k=2,nz+1
+          do j=js,je
+            do I=is-1,ie
+              Coef_x(I,j,K) = Coef_x(I,j,1) * 0.5 * ( VarMix%ebt_struct(i,j,k-1) + VarMix%ebt_struct(i+1,j,k-1) )
+            enddo
+          enddo
+        enddo
+      endif
     endif
 
     do itt=1,num_itts
@@ -673,13 +694,24 @@ subroutine tracer_hordiff(h, dt, MEKE, VarMix, visc, G, GV, US, CS, Reg, tv, do_
       Kh_u(I,j,:) = G%mask2dCu(I,j)*Kh_u(I,j,1)
     enddo ; enddo
     if (CS%KhTr_use_vert_struct) then
-      do K=2,nz+1
-        do j=js,je
-          do I=is-1,ie
-            Kh_u(I,j,K) = Kh_u(I,j,1) * 0.5 * ( VarMix%khtr_struct(i,j,k-1) + VarMix%khtr_struct(i+1,j,k-1) )
+      if (CS%full_depth_khtr_min) then
+        do K=2,nz+1
+          do j=js,je
+            do I=is-1,ie
+              Kh_u(I,j,K) = Kh_u(I,j,1) * 0.5 * ( VarMix%khtr_struct(i,j,k-1) + VarMix%khtr_struct(i+1,j,k-1) )
+              Kh_u(I,j,K) = max(Kh_u(I,j,K), CS%KhTr_min)
+            enddo
           enddo
         enddo
-      enddo
+      else
+        do K=2,nz+1
+          do j=js,je
+            do I=is-1,ie
+              Kh_u(I,j,K) = Kh_u(I,j,1) * 0.5 * ( VarMix%khtr_struct(i,j,k-1) + VarMix%khtr_struct(i+1,j,k-1) )
+            enddo
+          enddo
+        enddo
+      endif
     endif
     call post_data(CS%id_KhTr_u, Kh_u, CS%diag)
   endif
@@ -689,13 +721,24 @@ subroutine tracer_hordiff(h, dt, MEKE, VarMix, visc, G, GV, US, CS, Reg, tv, do_
       Kh_v(i,J,:) = G%mask2dCv(i,J)*Kh_v(i,J,1)
     enddo ; enddo
     if (CS%KhTr_use_vert_struct) then
-      do K=2,nz+1
-        do J=js-1,je
-          do i=is,ie
-            Kh_v(i,J,K) = Kh_v(i,J,1) * 0.5 * ( VarMix%khtr_struct(i,j,k-1) + VarMix%khtr_struct(i,j+1,k-1) )
+      if (CS%full_depth_khtr_min) then
+        do K=2,nz+1
+          do J=js-1,je
+            do i=is,ie
+              Kh_v(i,J,K) = Kh_v(i,J,1) * 0.5 * ( VarMix%khtr_struct(i,j,k-1) + VarMix%khtr_struct(i,j+1,k-1) )
+              Kh_v(i,J,K) = max(Kh_v(i,J,K), CS%KhTr_min)
+            enddo
           enddo
         enddo
-      enddo
+      else
+        do K=2,nz+1
+          do J=js-1,je
+            do i=is,ie
+              Kh_v(i,J,K) = Kh_v(i,J,1) * 0.5 * ( VarMix%khtr_struct(i,j,k-1) + VarMix%khtr_struct(i,j+1,k-1) )
+            enddo
+          enddo
+        enddo
+      endif
     endif
     call post_data(CS%id_KhTr_v, Kh_v, CS%diag)
   endif
@@ -715,10 +758,19 @@ subroutine tracer_hordiff(h, dt, MEKE, VarMix, visc, G, GV, US, CS, Reg, tv, do_
       Kh_h(i,j,:) = normalize*G%mask2dT(i,j)*((Kh_u(I-1,j,1)+Kh_u(I,j,1)) + &
                                              (Kh_v(i,J-1,1)+Kh_v(i,J,1)))
       if (CS%KhTr_use_vert_struct) then
-        do K=2,nz+1
-          Kh_h(i,j,K) = normalize*G%mask2dT(i,j)*VarMix%khtr_struct(i,j,k-1)*((Kh_u(I-1,j,1)+Kh_u(I,j,1)) + &
-                                                                            (Kh_v(i,J-1,1)+Kh_v(i,J,1)))
-        enddo
+        if (CS%full_depth_khtr_min) then
+          do K=2,nz+1
+            Kh_h(i,j,K) = normalize*G%mask2dT(i,j)*VarMix%khtr_struct(i,j,k-1)*((Kh_u(I-1,j,1)+Kh_u(I,j,1)) + &
+                                                                              (Kh_v(i,J-1,1)+Kh_v(i,J,1)))
+            Kh_h(i,j,K) = max(Kh_h(i,j,K), CS%KhTr_min)
+          enddo
+
+        else
+          do K=2,nz+1
+            Kh_h(i,j,K) = normalize*G%mask2dT(i,j)*VarMix%khtr_struct(i,j,k-1)*((Kh_u(I-1,j,1)+Kh_u(I,j,1)) + &
+                                                                              (Kh_v(i,J-1,1)+Kh_v(i,J,1)))
+          enddo
+        endif
       endif
     enddo ; enddo
     call post_data(CS%id_KhTr_h, Kh_h, CS%diag)

@@ -700,8 +700,7 @@ subroutine increment_block_ints(array, is, ie, js, je, descale, ints_sum, &
   ! Abort if the number of blocks also exceeds the carry-bit summation limit.
   ! For default settings, this would be over 17 billion points per PE.
   if (nblocks > max_sum_count) call MOM_error(FATAL, &
-      "reproducing sum: Number of blocks exceeds summmation carry limit." &
-  )
+      "reproducing sum: Number of blocks exceeds summmation carry limit.")
 
   array_sum(:) = 0
 
@@ -739,7 +738,7 @@ subroutine increment_block_ints(array, is, ie, js, je, descale, ints_sum, &
 
       ! Add the EFP result (including potential carry bits)
       block_sum(:) = block_sum(:) + e(:)
-    enddo ; enddo
+    enddo
 
     array_sum(:) = array_sum(:) + block_sum(:)
 
@@ -751,7 +750,7 @@ subroutine increment_block_ints(array, is, ie, js, je, descale, ints_sum, &
     ! Update maximum magnitudes
     max_pos = max(max_pos, block_max_pos)
     max_neg = max(max_neg, block_max_neg)
-  enddo
+  enddo ; enddo
 
   ! Finally, apply the cumulant result
   ints_sum(:) = ints_sum(:) + array_sum(:)

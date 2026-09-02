@@ -52,7 +52,7 @@ program MOM6
   use MOM_ice_shelf,       only : shelf_calc_flux, add_shelf_forces, ice_shelf_save_restart
   use MOM_ice_shelf,       only : initialize_ice_shelf_fluxes, initialize_ice_shelf_forces
   use MOM_ice_shelf,       only : ice_shelf_query, adjust_ice_sheet_frazil
-  use MOM_ice_shelf_initialize, only : initialize_ice_SMB
+  use MOM_ice_shelf,       only : initialize_ice_SMB
   use MOM_interpolate,     only : time_interp_external_init
   use MOM_io,              only : file_exists, open_ASCII_file, close_file
   use MOM_io,              only : check_nml_error, io_infra_init, io_infra_end
@@ -309,13 +309,25 @@ program MOM6
     if (override_shelf_fluxes) call data_override_init(Ocean_Domain_in=grid%domain%mpp_domain)
     call get_param(param_file, mod_name, "INITIALIZE_ICE_SHEET_SMB", &
                    initialize_smb, "Read in a constant SMB for the ice sheet", default=.false.)
-    if (initialize_smb) call initialize_ice_SMB(fluxes%shelf_sfc_mass_flux, grid, US, param_file)
+    if (initialize_smb) call initialize_ice_SMB(ice_shelf_CSp, fluxes%shelf_sfc_mass_flux, grid, US, param_file)
   endif
 
 
   call callTree_waypoint("done initialize_MOM")
 
   call extract_surface_state(MOM_CSp, sfc_state)
+  ! needed to feed adjust_ice_sheet_frazil, set_forcing, shelf_calc_flux
+  !$omp target update if(allocated(sfc_state%Hml)) from(sfc_state%Hml)
+  !$omp target update if(allocated(sfc_state%u)) from(sfc_state%u)
+  !$omp target update if(allocated(sfc_state%v)) from(sfc_state%v)
+  !$omp target update if(allocated(sfc_state%SSS)) from(sfc_state%SSS)
+  !$omp target update if(allocated(sfc_state%SST)) from(sfc_state%SST)
+  !$omp target update if(allocated(sfc_state%sfc_density)) from(sfc_state%sfc_density)
+  !$omp target update if(allocated(sfc_state%frazil)) from(sfc_state%frazil)
+  !$omp target update if(allocated(sfc_state%ocean_mass)) from(sfc_state%ocean_mass)
+  !$omp target update if(allocated(sfc_state%taux_shelf)) from(sfc_state%taux_shelf)
+  !$omp target update if(allocated(sfc_state%tauy_shelf)) from(sfc_state%tauy_shelf)
+  !$omp target update if(allocated(sfc_state%fco2)) from(sfc_state%fco2)
 
   if (use_ice_shelf .and. allocated(sfc_state%frazil)) &
     call adjust_ice_sheet_frazil(sfc_state, fluxes, Ice_shelf_CSp)
