@@ -181,7 +181,8 @@ subroutine wave_speed(h, tv, G, GV, US, cg1, CS, halo_size, use_ebt_mode, mono_N
   integer, dimension(merge(G%ied-G%isd+1, CS%niblock, CS%niblock==0), &
                      merge(G%jed-G%jsd+1, CS%njblock, CS%njblock==0)) :: &
     kf            ! The number of active layers after filtering.
-  integer :: max_kf     ! maximum value of kf
+  integer :: max_kf     ! The largest number of filtered layers in any column of the current
+                        ! block, used to limit the vertical extent of the equation of state call.
   integer, parameter :: max_itt = 10
   logical :: use_EOS    ! If true, density or specific volume is calculated from T & S using an equation of state.
   logical :: nonBous    ! If true, do not make the Boussinesq approximation.
@@ -244,7 +245,6 @@ subroutine wave_speed(h, tv, G, GV, US, cg1, CS, halo_size, use_ebt_mode, mono_N
   endif
 
   nonBous = .not.(GV%Boussinesq .or. GV%semi_Boussinesq)
-  max_kf = 0
   H_to_pres = GV%H_to_RZ * GV%g_Earth
   ! Note that g_Rho0 = H_to_pres / GV%Rho0**2
   if (.not.nonBous) g_Rho0 = GV%g_Earth*GV%H_to_Z / GV%Rho0
@@ -275,6 +275,7 @@ subroutine wave_speed(h, tv, G, GV, US, cg1, CS, halo_size, use_ebt_mode, mono_N
   do jsb=js,je,njj ; do isb=is,ie,nii
     ieb = min(isb + nii - 1, ie) ; iie = ieb - isb + 1
     jeb = min(jsb + njj - 1, je) ; jje = jeb - jsb + 1
+    max_kf = 0
 
     !   First merge very thin layers with the one above (or below if they are
     ! at the top), and find the interface quantities that the equation of state
