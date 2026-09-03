@@ -277,22 +277,28 @@ subroutine wave_speed(h, tv, G, GV, US, cg1, CS, halo_size, use_ebt_mode, mono_N
     jeb = min(jsb + njj - 1, je) ; jje = jeb - jsb + 1
     max_kf = 0
 
+    !   The loop below is skipped over land, but the equation of state is evaluated over the
+    ! whole block, so seed its inputs there.  Everywhere else only the topmost filtered layer
+    ! needs to be seeded, because the padding loop below fills in whatever the merging leaves
+    ! short of the bottom of the array.
+    do concurrent (jj=1:jje, ii=1:iie)
+      Hf(ii,jj,1) = 0.0 ; Tf(ii,jj,1) = 0.0 ; Sf(ii,jj,1) = 0.0 ; Rf(ii,jj,1) = 0.0
+    enddo
+    do concurrent (K=1:nz+1, jj=1:jje, ii=1:iie, G%mask2dT(isb+ii-1,jsb+jj-1) <= 0.0)
+      pres(ii,jj,K) = 0.0 ; T_int(ii,jj,K) = 0.0 ; S_int(ii,jj,K) = 0.0
+    enddo
+
     !   First merge very thin layers with the one above (or below if they are
     ! at the top), and find the interface quantities that the equation of state
-    ! needs.  Each column can be worked upon one at a time.
-    do concurrent (jj=1:jje, ii=1:iie) &
+    ! needs.  Each column can be worked upon one at a time.  Land columns are skipped
+    ! because nothing that is calculated here is used over land.
+    do concurrent (jj=1:jje, ii=1:iie, G%mask2dT(isb+ii-1,jsb+jj-1) > 0.0) &
       DO_LOCALITY(local(i, j, k, hmin, H_here, HxT_here, HxS_here, HxR_here)) &
       DO_LOCALITY(reduce(max:max_kf))
       i = isb + ii - 1
       j = jsb + jj - 1
       htot(ii,jj) = 0.0
       do k=1,nz ; htot(ii,jj) = htot(ii,jj) + h(i,j,k) ; enddo
-
-      !   Seed the whole filtered column so that neither the padding below nor a column of land
-      ! points leaves the equation of state to be evaluated on uninitialized values.
-      do k=1,nz+1
-        Hf(ii,jj,k) = 0.0 ; Tf(ii,jj,k) = 0.0 ; Sf(ii,jj,k) = 0.0 ; Rf(ii,jj,k) = 0.0
-      enddo
 
       hmin = htot(ii,jj)*min_h_frac ; kf(ii,jj) = 1 ; H_here = 0.0
       HxT_here = 0.0 ; HxS_here = 0.0 ; HxR_here = 0.0
@@ -342,10 +348,16 @@ subroutine wave_speed(h, tv, G, GV, US, cg1, CS, halo_size, use_ebt_mode, mono_N
       ! range of interfaces, but the number of filtered layers varies between columns.  Extend
       ! each column with zero-thickness copies of its deepest filtered layer so that the extra
       ! interfaces hold valid temperatures and salinities.  These extra values are never used.
-      do k=kf(ii,jj)+1,nz+1
-        Tf(ii,jj,k) = Tf(ii,jj,kf(ii,jj)) ; Sf(ii,jj,k) = Sf(ii,jj,kf(ii,jj))
-        Rf(ii,jj,k) = Rf(ii,jj,kf(ii,jj))
-      enddo
+      if (use_EOS) then
+        do k=kf(ii,jj)+1,nz+1
+          Hf(ii,jj,k) = 0.0
+          Tf(ii,jj,k) = Tf(ii,jj,kf(ii,jj)) ; Sf(ii,jj,k) = Sf(ii,jj,kf(ii,jj))
+        enddo
+      else
+        do k=kf(ii,jj)+1,nz+1
+          Hf(ii,jj,k) = 0.0 ; Rf(ii,jj,k) = Rf(ii,jj,kf(ii,jj))
+        enddo
+      endif
       max_kf = max(max_kf, kf(ii,jj))
 
       if (use_EOS) then
