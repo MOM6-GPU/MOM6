@@ -1844,14 +1844,19 @@ subroutine wave_speed_init(CS, GV, param_file, use_ebt_mode, mono_N2_column_frac
   ! This include declares and sets the variable "version".
 # include "version_variable.h"
   character(len=40)  :: mdl = "MOM_wave_speed"  ! This module's name.
+  ! Doxygen reports unbalanced preprocessor directives when "!<" comments appear on
+  ! declarations inside a preprocessor branch in a procedure body, so plain comments are
+  ! used for these local parameters.
 #ifdef __NVCOMPILER_OPENMP_GPU
-  integer, parameter :: default_niblock = 0 !< Default i block size for the wave speed calculations [nondim].
-  integer, parameter :: default_njblock = 0 !< Default j block size for the wave speed calculations [nondim].
+  ! The whole computational domain is worked on at once so that the offloaded loops have as
+  ! much parallelism as possible.
+  integer, parameter :: default_niblock = 0 ! Default i block size for the wave speed calculations
+  integer, parameter :: default_njblock = 0 ! Default j block size for the wave speed calculations
 #else
   ! These are a starting point for tuning, chosen so that the columns of a block share the
   ! cache lines that each column's vertical sweep touches.
-  integer, parameter :: default_niblock = 0 !< Default i block size for the wave speed calculations [nondim].
-  integer, parameter :: default_njblock = 1 !< Default j block size for the wave speed calculations [nondim].
+  integer, parameter :: default_niblock = 0 ! Default i block size for the wave speed calculations
+  integer, parameter :: default_njblock = 1 ! Default j block size for the wave speed calculations
 #endif
 
   CS%initialized = .true.
