@@ -27,7 +27,7 @@ public :: callTree_showQuery, callTree_enter, callTree_leave, callTree_waypoint
 public :: is_root_pe, stdlog, stdout
 !> Integer parameters encoding the severity of an error message
 public :: NOTE, WARNING, FATAL
-public :: disable_fatal_errors, enable_fatal_errors, set_skip_mpi
+public :: disable_fatal_errors, enable_fatal_errors, set_skip_mpi, query_skip_mpi
 
 integer :: verbosity = 6
 !< Verbosity level:
@@ -49,6 +49,8 @@ integer :: verbosity = 6
 !   Also note that this is a module variable rather than contained in
 ! a type passed by argument (preferred for most data) for convenience
 ! and to reduce obfuscation of code
+logical :: verbosity_set = .false.
+!< True if the verbosity has already been set at run-time.
 
 integer :: callTreeIndentLevel = 0
 !< The level of calling within the call tree
@@ -145,6 +147,14 @@ subroutine set_skip_mpi(skip)
 
 end subroutine set_skip_mpi
 
+!> Query whether MPI-dependent behaviors should be skipped
+function query_skip_mpi() result(skip)
+  logical :: skip !< True if MPI should be skipped
+
+  skip = skip_mpi_dep
+
+end function query_skip_mpi
+
 !> This provides a convenient interface for writing an error message
 !! with run-time filter based on a verbosity and the severity of the error.
 subroutine MOM_error(level, message, all_print)
@@ -205,14 +215,20 @@ subroutine loc_MOM_err(level, message)
 end subroutine loc_MOM_err
 
 !> This subroutine sets the level of verbosity filtering MOM error messages
-subroutine MOM_set_verbosity(verb)
+subroutine MOM_set_verbosity(verb, may_reset)
   integer, intent(in) :: verb !< A level of verbosity to set
+  logical, optional, intent(in) :: may_reset !< If true, set the verbosity even if it has been set
+                              !! before, perhaps by another component like SIS2.
   character(len=80) :: msg
-  if (verb>0 .and. verb<10) then
-    verbosity=verb
+  if (verb>=0 .and. verb<10) then
+    if (.not.verbosity_set) verbosity = verb
+    if (present(may_reset)) then
+      if (may_reset) verbosity = verb
+    endif
+    verbosity_set = .true.
   else
-    write(msg(1:80),'("Attempt to set verbosity outside of range (0-9). verb=",I0)') verb
-    call MOM_error(FATAL,msg)
+    write(msg,'("Attempt to set verbosity outside of range (0-9). verb=",I0)') verb
+    call MOM_error(FATAL, msg)
   endif
 end subroutine MOM_set_verbosity
 

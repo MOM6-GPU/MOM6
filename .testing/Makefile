@@ -117,6 +117,7 @@ FCFLAGS_FMS ?= $(FCFLAGS)
 # - These flags can be configured outside of the Makefile, either with
 #   config.mk or as environment variables.
 
+LDFLAGS_OPT ?=
 LDFLAGS_COVERAGE ?= --coverage
 LDFLAGS_USER ?=
 
@@ -252,6 +253,7 @@ COV_FCFLAGS := FCFLAGS="$(FCFLAGS_COVERAGE) $(FCFLAGS_DEPS)"
 
 # Linker flags
 MOM_LDFLAGS := LDFLAGS="$(LDFLAGS_DEPS) $(LDFLAGS_USER)"
+OPT_LDFLAGS := LDFLAGS="$(LDFLAGS_OPT) $(LDFLAGS_DEPS) $(LDFLAGS_USER)"
 COV_LDFLAGS := LDFLAGS="$(LDFLAGS_COVERAGE) $(LDFLAGS_DEPS) $(LDFLAGS_USER)"
 
 # Environment variable configuration
@@ -262,13 +264,13 @@ $(BUILD)/asymmetric/Makefile: MOM_ENV += $(ASYMMETRIC_FCFLAGS) $(MOM_LDFLAGS) \
 $(BUILD)/repro/Makefile: MOM_ENV += $(REPRO_FCFLAGS) $(MOM_LDFLAGS)
 $(BUILD)/openmp/Makefile: MOM_ENV += $(OPENMP_FCFLAGS) $(MOM_LDFLAGS)
 $(BUILD)/target/Makefile: MOM_ENV += $(TARGET_FCFLAGS) $(MOM_LDFLAGS)
-$(BUILD)/opt/Makefile: MOM_ENV += $(OPT_FCFLAGS) $(MOM_LDFLAGS)
+$(BUILD)/opt/Makefile: MOM_ENV += $(OPT_FCFLAGS) $(OPT_LDFLAGS)
 $(BUILD)/opt_target/Makefile: MOM_ENV += $(OPT_FCFLAGS) $(MOM_LDFLAGS)
 $(BUILD)/coupled/Makefile: MOM_ENV += $(SYMMETRIC_FCFLAGS) $(MOM_LDFLAGS)
 $(BUILD)/nuopc/Makefile: MOM_ENV += $(SYMMETRIC_FCFLAGS) $(MOM_LDFLAGS)
 $(BUILD)/cov/Makefile: MOM_ENV += $(COV_FCFLAGS) $(COV_LDFLAGS)
 $(BUILD)/unit/Makefile: MOM_ENV += $(COV_FCFLAGS) $(COV_LDFLAGS)
-$(BUILD)/timing/Makefile: MOM_ENV += $(OPT_FCFLAGS) $(MOM_LDFLAGS)
+$(BUILD)/timing/Makefile: MOM_ENV += $(OPT_FCFLAGS) $(OPT_LDFLAGS)
 
 # Configure script flags
 MOM_ACFLAGS := --with-gsw --with-cvmix
@@ -313,33 +315,25 @@ $(BUILD)/opt_target: | $(TARGET_CODEBASE)
 .PHONY: FORCE
 
 
-## Use autoconf to construct the Makefile for each target
-# TODO: This could all be moved to a top-level MOM6 Makefile
-.PRECIOUS: $(BUILD)/%/Makefile
-.PRECIOUS: $(BUILD)/%/Makefile.in
-.PRECIOUS: $(BUILD)/%/configure
-.PRECIOUS: $(BUILD)/%/config.status
-.PRECIOUS: $(BUILD)/%/configure.ac
-.PRECIOUS: $(BUILD)/%/m4/
+# Use autoconf to construct the Makefile for each target
 
-$(BUILD)/%/Makefile: $(BUILD)/%/Makefile.in $(BUILD)/%/config.status
+.PRECIOUS: $(BUILD)/%/Makefile
+.PRECIOUS: $(BUILD)/%/config.status
+
+$(BUILD)/%/Makefile: $(BUILD)/%/config.status
 	cd $(@D) && ./config.status
 
-$(BUILD)/%/config.status: $(BUILD)/%/configure $(DEPS)/lib/libFMS.a $(DEPS)/lib/libgsw.a $(DEPS)/lib/libcvmix.a
-	cd $(@D) && $(MOM_ENV) ./configure -n --srcdir=$(CODEBASE) $(MOM_ACFLAGS) \
+# NOTE: This assumes % is a single directory
+$(BUILD)/%/config.status: \
+  $(DEPS)/lib/libFMS.a \
+  $(DEPS)/lib/libgsw.a \
+  $(DEPS)/lib/libcvmix.a \
+  ../configure | $(BUILD)/%/
+	cd $(@D) && $(MOM_ENV) ../../../configure -n $(MOM_ACFLAGS) \
 	 || (cat config.log && false)
 
-$(BUILD)/%/Makefile.in: ../ac/Makefile.in | $(BUILD)/%/
-	cp ../ac/Makefile.in $(@D)
-
-$(BUILD)/%/configure: $(BUILD)/%/configure.ac $(BUILD)/%/m4/
-	autoreconf -if $(@D)
-
-$(BUILD)/%/configure.ac: ../ac/configure.ac | $(BUILD)/%/
-	cp ../ac/configure.ac $(@D)
-
-$(BUILD)/%/m4/: ../ac/m4/ | $(BUILD)/%/
-	cp -r ../ac/m4 $(@D)
+../configure: FORCE
+	$(MAKE) -C ../ configure
 
 ALL_EXECS = symmetric asymmetric repro openmp opt opt_target coupled nuopc \
   cov unit timing
