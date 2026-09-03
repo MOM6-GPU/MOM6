@@ -30,6 +30,17 @@ use MOM_EOS,           only : calculate_density, calculate_spec_vol, EOS_domain
 implicit none ; private
 
 #include <MOM_memory.h>
+#include "do_concurrent_compat.h"
+
+#ifdef __NVCOMPILER_OPENMP_GPU
+integer, parameter :: default_nkblock = 0 !< Default k block size for the mixed layer density integral [nondim]
+integer, parameter :: default_njblock = 0 !< Default j block size for the mixed layer density integral [nondim]
+integer, parameter :: default_niblock = 0 !< Default i block size for the mixed layer density integral [nondim]
+#else
+integer, parameter :: default_nkblock = 1 !< Default k block size for the mixed layer density integral [nondim]
+integer, parameter :: default_njblock = 1 !< Default j block size for the mixed layer density integral [nondim]
+integer, parameter :: default_niblock = 0 !< Default i block size for the mixed layer density integral [nondim]
+#endif
 
 public mixedlayer_restrat
 public mixedlayer_restrat_init
@@ -115,6 +126,15 @@ type, public :: mixedlayer_restrat_CS ; private
                                    !! units [H2 T-1 ~> m2 s-1 or kg2 m-4 s-1]
   logical :: MLD_grid              !< If true, read a spacially varying field for MLD_decaying_Tfilt
   logical :: Cr_grid               !< If true, read a spacially varying field for Cr
+  integer :: nkblock = default_nkblock !< The number of layers whose density is evaluated in one call to the
+                                   !! equation of state in the Bodner mixed-layer buoyancy integral, or 0
+                                   !! to do the whole column in a single block [nondim].
+  integer :: njblock = default_njblock !< The number of rows whose density is evaluated in one call to the
+                                   !! equation of state in the Bodner mixed-layer buoyancy integral, or 0
+                                   !! to do the whole j compute domain in a single block [nondim].
+  integer :: niblock = default_niblock !< The number of columns whose density is evaluated in one call to the
+                                   !! equation of state in the Bodner mixed-layer buoyancy integral, or 0
+                                   !! to do the whole i compute domain in a single block [nondim].
 
   real, dimension(:,:), allocatable :: &
          MLD_filtered, &           !< Time-filtered MLD [H ~> m or kg m-2]
@@ -196,6 +216,9 @@ subroutine mixedlayer_restrat(h, uhtr, vhtr, tv, forces, dt, MLD, h_MLD, bflux, 
     else
       call mixedlayer_restrat_Bodner(CS, G, GV, US, h, uhtr, vhtr, tv, forces, dt, MLD, h_MLD, bflux)
     endif
+    ! The Bodner scheme updates h, uhtr and vhtr on the device.  Refresh the host copies here,
+    ! since the caller runs the halo update on them and then pushes them back to the device.
+    !$omp target update from(h, uhtr, vhtr)
   else
     ! Implementation of Fox-Kemper et al., 2008, to work in general coordinates
     call mixedlayer_restrat_OM4(h, uhtr, vhtr, tv, forces, dt, h_MLD, VarMix, G, GV, US, CS)
@@ -733,7 +756,7 @@ subroutine mixedlayer_restrat_OM4(h, uhtr, vhtr, tv, forces, dt, h_MLD, VarMix, 
 end subroutine mixedlayer_restrat_OM4
 
 !> Stream function shape as a function of non-dimensional position within mixed-layer [nondim]
-real function mu(sigma, dh)
+pure real function mu(sigma, dh)
   real, intent(in) :: sigma !< Fractional position within mixed layer [nondim]
                             !! z=0 is surface, z=-1 is the bottom of the mixed layer
   real, intent(in) :: dh    !< Non-dimensional distance over which to extend stream
@@ -816,11 +839,17 @@ subroutine mixedlayer_restrat_Bodner(CS, G, GV, US, h, uhtr, vhtr, tv, forces, d
                           ! mode [Z T-1 ~> m s-1]
   real :: covTS(SZI_(G))  ! SGS TS covariance in Stanley param; currently 0 [C S ~> degC ppt]
   real :: varS(SZI_(G))   ! SGS S variance in Stanley param; currently 0 [S2 ~> ppt2]
-  real :: dmu(SZK_(GV))   ! Change in mu(z) across layer k [nondim]
   real :: Rml_int(SZI_(G)) ! Potential density integrated through the mixed layer [R H ~> kg m-2 or kg2 m-5]
   real :: SpV_ml(SZI_(G)) ! Specific volume evaluated at the surface pressure [R-1 ~> m3 kg-1]
   real :: SpV_int(SZI_(G)) ! Specific volume integrated through the mixed layer [H R-1 ~> m4 kg-1 or m]
   real :: rho_ml(SZI_(G)) ! Potential density relative to the surface [R ~> kg m-3]
+  real :: rho_blk(SZI_(G), SZJ_(G), merge(GV%ke, CS%nkblock, CS%nkblock==0))
+                          ! Potential density relative to the surface for a tile [R ~> kg m-3]
+  real :: p_blk(SZI_(G), SZJ_(G), merge(GV%ke, CS%nkblock, CS%nkblock==0))
+                          ! A pressure of 0 for a tile [R L2 T-2 ~> Pa]
+  real :: Rml_blk(SZI_(G), SZJ_(G))
+                          ! Density integrated through the mixed layer, carried across the
+                          ! k blocks of a column [R H ~> kg m-2 or kg2 m-5]
   real :: p0(SZI_(G))     ! A pressure of 0 [R L2 T-2 ~> Pa]
   real :: g_Rho0          ! G_Earth/Rho0 times a thickness conversion factor
                           ! [L2 H-1 T-2 R-1 ~> m4 s-2 kg-1 or m7 s-2 kg-2]
@@ -852,8 +881,15 @@ subroutine mixedlayer_restrat_Bodner(CS, G, GV, US, h, uhtr, vhtr, tv, forces, d
                           ! fractional power [Z2 s2 T-2 m-2 ~> 1]
   real, parameter :: Lam2_eq = 11.       ! (Langmuir Number)^-2 assuming wind wave equilibrium [nondim]
   real, parameter :: two_thirds = 2./3.  ! [nondim]
+  real :: dmu(SZK_(GV))   ! Change in mu(z) across layer k [nondim]
   logical :: line_is_empty, keep_going
   integer, dimension(2) :: EOSdom ! The i-computational domain for the equation of state
+  integer :: EOSdom3(3,2) ! The (i,j,k) computational domain for the blocked equation of state calls
+  integer :: nkblock, njblock, niblock ! The number of layers, rows and columns in each tile of the
+                          ! density integral [nondim]
+  integer :: kstart, kend ! The first and last layer of the tile being worked on [nondim]
+  integer :: jstart, jend ! The first and last row of the tile being worked on [nondim]
+  integer :: istart, iend ! The first and last column of the tile being worked on [nondim]
   integer :: i, j, k, is, ie, js, je, Isq, Ieq, Jsq, Jeq, nz
   logical :: Lam2_available
 
@@ -889,13 +925,18 @@ subroutine mixedlayer_restrat_Bodner(CS, G, GV, US, h, uhtr, vhtr, tv, forces, d
   if (associated(bflux)) &
     call pass_var(bflux, G%domain, halo=1)
 
-  ! Extract the friction velocity from the forcing type.
+  ! Extract the friction velocity from the forcing type.  find_ustar computes on the device
+  ! when U_star_2d is already present there, so it only needs a device allocation, not a copy.
+  !$omp target enter data map(alloc: U_star_2d)
   call find_ustar(forces, tv, U_star_2d, G, GV, US, halo=1)
 
   Lam2_available = present(Lam2)
   if (Lam2_available) Lam2_available = associated(Lam2)
 
-  ! Wave Enhanced of ustar following Eq. 28 in Bodner23
+  ! Wave Enhanced of ustar following Eq. 28 in Bodner23.  Lam2 is a host-side pointer that is
+  ! not mapped, so this scaling stays on the host and U_star_2d is round-tripped around it.  The
+  ! transfers are guarded because WAVE_ENHANCED_USTAR is off by default.
+  !$omp target update from(U_star_2d) if(CS%wave_enhanced_ustar)
   if (CS%wave_enhanced_ustar) then
     if (Lam2_available) then
       call pass_var(Lam2, G%domain, halo=1)
@@ -911,8 +952,10 @@ subroutine mixedlayer_restrat_Bodner(CS, G, GV, US, h, uhtr, vhtr, tv, forces, d
       enddo ; enddo
     endif
   endif
+  !$omp target update to(U_star_2d) if(CS%wave_enhanced_ustar)
 
   if (CS%debug) then
+    !$omp target update from(U_star_2d)
     call hchksum(h,'mixed_Bodner: h', G%HI, haloshift=1, unscale=GV%H_to_mks)
     call hchksum(BLD, 'mle_Bodner: BLD', G%HI, haloshift=1, unscale=US%Z_to_m)
     call hchksum(h_MLD, 'mle_Bodner: h_MLD', G%HI, haloshift=1, unscale=GV%H_to_mks)
@@ -925,35 +968,45 @@ subroutine mixedlayer_restrat_Bodner(CS, G, GV, US, h, uhtr, vhtr, tv, forces, d
                  G%HI, haloshift=1, unscale=GV%H_to_mks)
   endif
 
+  !$omp target enter data map(to: h_MLD, BLD, bflux)
+  !$omp target enter data map(alloc: little_h, big_H, wpup, htot, buoy_av, uDml_diag, vDml_diag)
+  !$omp target enter data map(alloc: vol_dt_avail, uhml, vhml)
+
   ! Apply time filter to h_MLD (to remove diurnal cycle) to obtain "little h".
   ! "little h" is representative of the active mixing layer depth, used in B22 formula (eq 27).
-  do j=js-1,je+1 ; do i=is-1,ie+1
+  do concurrent (j=js-1:je+1, i=is-1:ie+1)
     little_h(i,j) = rmean2ts(h_MLD(i,j), CS%MLD_filtered(i,j), &
                              CS%BLD_growing_Tfilt, CS%BLD_decaying_Tfilt, dt)
     CS%MLD_filtered(i,j) = little_h(i,j)
-  enddo ; enddo
+  enddo
 
   ! Calculate "big H", representative of the mixed layer depth, used in B22 formula (eq 27).
+  ! The MLD_grid and Bodner_detect_MLD variants run on the host, so they fetch their inputs
+  ! from the device and push big_H back; the default variant stays on the device.
   if (CS%MLD_grid) then
+    !$omp target update from(little_h, CS%MLD_filtered_slow)
     do j=js-1,je+1 ; do i=is-1,ie+1
       big_H(i,j) = rmean2ts(little_h(i,j), CS%MLD_filtered_slow(i,j), &
                             CS%MLD_growing_Tfilt, CS%MLD_Tfilt_space(i,j), dt)
     enddo ; enddo
+    !$omp target update to(big_H)
   elseif (CS%Bodner_detect_MLD) then
+    !$omp target update from(CS%MLD_filtered_slow)
     call detect_mld(h, tv, MLD, G, GV, CS)
     do j=js-1,je+1 ; do i=is-1,ie+1
       big_H(i,j) = rmean2ts(MLD(i,j), CS%MLD_filtered_slow(i,j), &
                             CS%MLD_growing_Tfilt, CS%MLD_decaying_Tfilt, dt)
     enddo ; enddo
+    !$omp target update to(big_H)
   else
-    do j=js-1,je+1 ; do i=is-1,ie+1
+    do concurrent (j=js-1:je+1, i=is-1:ie+1)
       big_H(i,j) = rmean2ts(little_h(i,j), CS%MLD_filtered_slow(i,j), &
                             CS%MLD_growing_Tfilt, CS%MLD_decaying_Tfilt, dt)
-    enddo ; enddo
+    enddo
   endif
-  do j=js-1,je+1 ; do i=is-1,ie+1
+  do concurrent (j=js-1:je+1, i=is-1:ie+1)
     CS%MLD_filtered_slow(i,j) = big_H(i,j)
-  enddo ; enddo
+  enddo
 
   ! Estimate w'u' at h-points, with a floor to avoid division by zero later.
   if (allocated(tv%SpV_avg) .and. .not.(GV%Boussinesq .or. GV%semi_Boussinesq)) then
@@ -972,6 +1025,7 @@ subroutine mixedlayer_restrat_Bodner(CS, G, GV, US, h, uhtr, vhtr, tv, forces, d
                 ! bflux (such as SpV_avg**-2/3 combining with other terms in bflux to give the thermal
                 ! expansion coefficient) and because the specific volume does vary within the mixed layer.
     enddo ; enddo
+    !$omp target update to(wpup)
   elseif (CS%answer_date < 20240201) then
     Z3_T3_to_m3_s3 = (US%Z_to_m * US%s_to_T)**3
     m2_s2_to_Z2_T2 = (US%m_to_Z * US%T_to_s)**2
@@ -981,22 +1035,25 @@ subroutine mixedlayer_restrat_Bodner(CS, G, GV, US, h, uhtr, vhtr, tv, forces, d
       wpup(i,j) = max(m2_s2_to_Z2_T2 * (Z3_T3_to_m3_s3 * ( CS%mstar * u_star3 + CS%nstar * w_star3 ) )**two_thirds, &
           CS%min_wstar2) * US%Z_to_L * GV%Z_to_H ! In [L H T-2 ~> m2 s-2 or kg m-1 s-2]
     enddo ; enddo
+    !$omp target update to(wpup)
   else
-    do j=js-1,je+1 ; do i=is-1,ie+1
+    do concurrent (j=js-1:je+1, i=is-1:ie+1) DO_LOCALITY(local(w_star3))
       w_star3 = max(0., -bflux(i,j)) * BLD(i,j)    ! In [Z3 T-3 ~> m3 s-3]
       wpup(i,j) = max( (cuberoot(CS%mstar * U_star_2d(i,j)**3 + CS%nstar * w_star3))**2, CS%min_wstar2 ) &
           * US%Z_to_L * GV%Z_to_H ! In [L H T-2 ~> m2 s-2 or kg m-1 s-2]
-    enddo ; enddo
+    enddo
   endif
 
   ! We filter w'u' with the same time scales used for "little h"
-  do j=js-1,je+1 ; do i=is-1,ie+1
+  do concurrent (j=js-1:je+1, i=is-1:ie+1)
     wpup(i,j) = rmean2ts(wpup(i,j), CS%wpup_filtered(i,j), &
                          CS%BLD_growing_Tfilt, CS%BLD_decaying_Tfilt, dt)
     CS%wpup_filtered(i,j) = wpup(i,j)
-  enddo ; enddo
+  enddo
 
   if (CS%id_lfbod > 0) then
+    ! This diagnostic is evaluated on the host, so it needs the device's "little h".
+    !$omp target update from(little_h)
     do j=js-1,je+1 ; do i=is-1,ie+1
       ! Calculate front length used in B22 formula (eq 24).
       w_star3 = max(0., -bflux(i,j)) * BLD(i,j)
@@ -1026,6 +1083,7 @@ subroutine mixedlayer_restrat_Bodner(CS, G, GV, US, h, uhtr, vhtr, tv, forces, d
   endif
 
   if (CS%debug) then
+    !$omp target update from(little_h, big_H, wpup, CS%MLD_filtered, CS%MLD_filtered_slow)
     call hchksum(little_h,'mle_Bodner: little_h', G%HI, haloshift=1, unscale=GV%H_to_mks)
     call hchksum(big_H,'mle_Bodner: big_H', G%HI, haloshift=1, unscale=GV%H_to_mks)
     call hchksum(CS%MLD_filtered,'mle_Bodner: MLD_filtered 2', &
@@ -1040,62 +1098,145 @@ subroutine mixedlayer_restrat_Bodner(CS, G, GV, US, h, uhtr, vhtr, tv, forces, d
   ! in-situ density would contain the MLD gradient (through the pressure dependence).
   p0(:) = 0.0
   EOSdom(:) = EOS_domain(G%HI, halo=1)
-  !$OMP parallel &
-  !$OMP default(shared) &
-  !$OMP private(i, j, k, keep_going, line_is_empty, dh, &
-  !$OMP   grid_dsd, absf, h_sml, h_big, grd_b, r_wpup, psi_mag, IhTot, &
-  !$OMP   sigint, muzb, muza, hAtVel, Rml_int, SpV_int, rho_ml, SpV_ml, dmu )
 
-  !$OMP do
-  do j=js-1,je+1
-    rho_ml(:) = 0.0 ; SpV_ml(:) = 0.0
-    do i=is-1,ie+1
-      htot(i,j) = 0.0 ; Rml_int(i) = 0.0 ; SpV_int(i) = 0.0
+  if ((GV%Boussinesq .or. GV%semi_Boussinesq) .and. .not.CS%use_Stanley_ML) then
+    ! Walk the mixed layer in tiles of niblock columns by njblock rows by nkblock layers: evaluate
+    ! the density for a tile, then integrate it.  The columns are independent of one another, so
+    ! the integral runs as one concurrent loop over (i,j) with the sequential k-dependence kept
+    ! inside each column, and the running totals for the tile's columns carry across its k blocks.
+    nkblock = merge(nz, CS%nkblock, CS%nkblock==0)
+    njblock = merge((je+1) - (js-1) + 1, CS%njblock, CS%njblock==0)
+    niblock = merge((ie+1) - (is-1) + 1, CS%niblock, CS%niblock==0)
+
+    ! The tile scratch never leaves the device, and no other branch uses it.
+    !$omp target enter data map(alloc: rho_blk, p_blk, Rml_blk)
+
+    if (nkblock < nz) then
+      ! The early-exit test below compares htot against big_H on the host, and big_H has been
+      ! computed on the device, so fetch it once.  With a single k block that test never runs.
+      !$omp target update from(big_H)
+    endif
+
+    do concurrent (k=1:nkblock, j=js-1:je+1, i=is-1:ie+1)
+      p_blk(i,j,k) = 0.0
     enddo
-    keep_going = .true.
-    do k=1,nz
-      do i=is-1,ie+1
-        vol_dt_avail(i,j,k) = max(I4dt*G%areaT(i,j)*(h(i,j,k)-GV%Angstrom_H),0.0)
+
+    do jstart=js-1,je+1,njblock
+      jend = min(jstart+njblock-1, je+1)
+      EOSdom3(2,:) = [jstart-(G%jsd-1), jend-(G%jsd-1)]
+
+      do istart=is-1,ie+1,niblock
+        iend = min(istart+niblock-1, ie+1)
+        EOSdom3(1,:) = [istart-(G%isd-1), iend-(G%isd-1)]
+
+        do concurrent (j=jstart:jend, i=istart:iend)
+          htot(i,j) = 0.0 ; Rml_blk(i,j) = 0.0
+        enddo
+
+        keep_going = .true.
+        do kstart=1,nz,nkblock
+
+          ! The available volumes are needed for every layer, so they are evaluated for the
+          ! whole tile even after the mixed-layer integral below has been filled, as in the
+          ! original code.
+          do concurrent (k=kstart:min(kstart+nkblock-1,nz), j=jstart:jend, i=istart:iend)
+            vol_dt_avail(i,j,k) = max(I4dt*G%areaT(i,j)*(h(i,j,k)-GV%Angstrom_H), 0.0)
+          enddo
+
+          if (keep_going) then
+            kend = min(kstart+nkblock-1, nz)
+            EOSdom3(3,:) = [1, kend-kstart+1]
+            ! The tile is selected purely by the index ranges in EOSdom3, so the whole T and S
+            ! arrays are passed (the k range is a contiguous section) and no copies are made.
+            call calculate_density(tv%T(:,:,kstart:kend), tv%S(:,:,kstart:kend), &
+                                   p_blk, rho_blk, tv%eqn_of_state, EOSdom3)
+
+            do concurrent (j=jstart:jend, i=istart:iend) DO_LOCALITY(local(k, dh))
+              do k=kstart,kend
+                if (htot(i,j) < big_H(i,j)) then
+                  dh = min( h(i,j,k), big_H(i,j) - htot(i,j) )
+                  ! Rml_blk is in [R H ~> kg m-2]
+                  Rml_blk(i,j) = Rml_blk(i,j) + dh*rho_blk(i,j,k-kstart+1)
+                  htot(i,j) = htot(i,j) + dh
+                endif
+              enddo
+            enddo
+
+            if (nkblock < nz) then
+              ! Stop calling the equation of state once every column in the tile has been filled to
+              ! "big H".  With a single k block there is nothing left to skip, and this test would
+              ! drag htot back to the host for nothing.
+              !$omp target update from(htot)
+              keep_going = .false.
+              do j=jstart,jend ; do i=istart,iend
+                if (htot(i,j) < big_H(i,j)) keep_going = .true.
+              enddo ; enddo
+            endif
+          endif
+        enddo
+
+        do concurrent (j=jstart:jend, i=istart:iend)
+          ! Buoy_av has units (L2 H-1 T-2 R-1) * (R H) * H-1 = [L2 H-1 T-2 ~> m s-2 or m4 kg-1 s-2]
+          buoy_av(i,j) = -( g_Rho0 * Rml_blk(i,j) ) / (htot(i,j) + h_neglect)
+        enddo
+
       enddo
-      if (keep_going) then
-        if (GV%Boussinesq .or. GV%semi_Boussinesq) then
-          if (CS%use_Stanley_ML) then
+    enddo
+
+    !$omp target exit data map(release: rho_blk, p_blk, Rml_blk)
+  else
+    ! The Stanley and non-Boussinesq variants of the equation of state have no array-of-columns
+    ! interface to block over, so they retain the original row-at-a-time form on the host.
+    !$OMP parallel do default(shared) &
+    !$OMP   private(i, k, keep_going, line_is_empty, dh, rho_ml, SpV_ml, Rml_int, SpV_int)
+    do j=js-1,je+1
+      rho_ml(:) = 0.0 ; SpV_ml(:) = 0.0
+      do i=is-1,ie+1
+        htot(i,j) = 0.0 ; Rml_int(i) = 0.0 ; SpV_int(i) = 0.0
+      enddo
+      keep_going = .true.
+      do k=1,nz
+        do i=is-1,ie+1
+          vol_dt_avail(i,j,k) = max(I4dt*G%areaT(i,j)*(h(i,j,k)-GV%Angstrom_H), 0.0)
+        enddo
+        if (keep_going) then
+          if (GV%Boussinesq .or. GV%semi_Boussinesq) then
             call calculate_density(tv%T(:,j,k), tv%S(:,j,k), p0, tv%varT(:,j,k), covTS, varS, &
                                    rho_ml, tv%eqn_of_state, EOSdom)
           else
-            call calculate_density(tv%T(:,j,k), tv%S(:,j,k), p0, rho_ml, tv%eqn_of_state, EOSdom)
+            call calculate_spec_vol(tv%T(:,j,k), tv%S(:,j,k), p0, SpV_ml, tv%eqn_of_state, EOSdom)
           endif
-        else
-          call calculate_spec_vol(tv%T(:,j,k), tv%S(:,j,k), p0, SpV_ml, tv%eqn_of_state, EOSdom)
+          line_is_empty = .true.
+          do i=is-1,ie+1
+            if (htot(i,j) < big_H(i,j)) then
+              dh = min( h(i,j,k), big_H(i,j) - htot(i,j) )
+              Rml_int(i) = Rml_int(i) + dh*rho_ml(i) ! Rml_int has units of [R H ~> kg m-2]
+              SpV_int(i) = SpV_int(i) + dh*SpV_ml(i) ! SpV_int has units of [H R-1 ~> m4 kg-1 or m]
+              htot(i,j) = htot(i,j) + dh
+              line_is_empty = .false.
+            endif
+          enddo
+          if (line_is_empty) keep_going=.false.
         endif
-        line_is_empty = .true.
+      enddo
+
+      if (GV%Boussinesq .or. GV%semi_Boussinesq) then
         do i=is-1,ie+1
-          if (htot(i,j) < big_H(i,j)) then
-            dh = min( h(i,j,k), big_H(i,j) - htot(i,j) )
-            Rml_int(i) = Rml_int(i) + dh*rho_ml(i) ! Rml_int has units of [R H ~> kg m-2]
-            SpV_int(i) = SpV_int(i) + dh*SpV_ml(i) ! SpV_int has units of [H R-1 ~> m4 kg-1 or m]
-            htot(i,j) = htot(i,j) + dh
-            line_is_empty = .false.
-          endif
+          ! Buoy_av has units (L2 H-1 T-2 R-1) * (R H) * H-1 = [L2 H-1 T-2 ~> m s-2 or m4 kg-1 s-2]
+          buoy_av(i,j) = -( g_Rho0 * Rml_int(i) ) / (htot(i,j) + h_neglect)
         enddo
-        if (line_is_empty) keep_going=.false.
+      else
+        do i=is-1,ie+1
+          ! Buoy_av has units (R L2 H-1 T-2) * (R-1 H) * H-1 = [L2 H-1 T-2 ~> m s-2 or m4 kg-1 s-2]
+          buoy_av(i,j) = (GV%H_to_RZ*GV%g_Earth * SpV_int(i)) / (htot(i,j) + h_neglect)
+        enddo
       endif
     enddo
-
-    if (GV%Boussinesq .or. GV%semi_Boussinesq) then
-      do i=is-1,ie+1
-        ! Buoy_av has units (L2 H-1 T-2 R-1) * (R H) * H-1 = [L2 H-1 T-2 ~> m s-2 or m4 kg-1 s-2]
-        buoy_av(i,j) = -( g_Rho0 * Rml_int(i) ) / (htot(i,j) + h_neglect)
-      enddo
-    else
-      do i=is-1,ie+1
-        ! Buoy_av has units (R L2 H-1 T-2) * (R-1 H) * H-1 = [L2 H-1 T-2 ~> m s-2 or m4 kg-1 s-2]
-        buoy_av(i,j) = (GV%H_to_RZ*GV%g_Earth * SpV_int(i)) / (htot(i,j) + h_neglect)
-      enddo
-    endif
-  enddo
+    !$omp target update to(htot, buoy_av, vol_dt_avail)
+  endif
 
   if (CS%debug) then
+    !$omp target update from(htot, vol_dt_avail, buoy_av)
     call hchksum(htot,'mle_Bodner: htot', G%HI, haloshift=1, unscale=GV%H_to_mks)
     call hchksum(vol_dt_avail,'mle_Bodner: vol_dt_avail', G%HI, haloshift=1, &
                  unscale=US%L_to_m**2*GV%H_to_mks*US%s_to_T)
@@ -1103,7 +1244,12 @@ subroutine mixedlayer_restrat_Bodner(CS, G, GV, US, h, uhtr, vhtr, tv, forces, d
   endif
 
   ! U - Component
-  !$OMP do
+  ! These loops are OpenMP target constructs rather than do concurrent because they need the
+  ! per-column dmu profile as a private automatic array, which do concurrent local() cannot
+  ! yet express without crashing nvfortran (private() handles it correctly).
+  !$omp target teams loop collapse(2) &
+  !$omp   private(k, dmu, grid_dsd, absf, h_sml, h_big, grd_b, r_wpup, psi_mag, IhTot, &
+  !$omp           sigint, muzb, muza, hAtVel)
   do j=js,je ; do I=is-1,ie
     if (G%OBCmaskCu(I,j) > 0.) then
       grid_dsd = sqrt(0.5*( G%dxCu(I,j)**2 + G%dyCu(I,j)**2 )) * G%dyCu(I,j) ! [L2 ~> m2]
@@ -1144,7 +1290,9 @@ subroutine mixedlayer_restrat_Bodner(CS, G, GV, US, h, uhtr, vhtr, tv, forces, d
   enddo ; enddo
 
   ! V- component
-  !$OMP do
+  !$omp target teams loop collapse(2) &
+  !$omp   private(k, dmu, grid_dsd, absf, h_sml, h_big, grd_b, r_wpup, psi_mag, IhTot, &
+  !$omp           sigint, muzb, muza, hAtVel)
   do J=js-1,je ; do i=is,ie
     if (G%OBCmaskCv(i,J) > 0.) then
       grid_dsd = sqrt(0.5*( G%dxCv(i,J)**2 + G%dyCv(i,J)**2 )) * G%dxCv(i,J) ! [L2 ~> m2]
@@ -1184,12 +1332,26 @@ subroutine mixedlayer_restrat_Bodner(CS, G, GV, US, h, uhtr, vhtr, tv, forces, d
     vDml_diag(i,J) = psi_mag
   enddo ; enddo
 
-  !$OMP do
-  do j=js,je ; do k=1,nz ; do i=is,ie
+  do concurrent (j=js:je, k=1:nz, i=is:ie)
     h(i,j,k) = h(i,j,k) - dt*G%IareaT(i,j) * &
         ((uhml(I,j,k) - uhml(I-1,j,k)) + (vhml(i,J,k) - vhml(i,J-1,k)))
-  enddo ; enddo ; enddo
-  !$OMP end parallel
+  enddo
+
+  ! The remaining device arrays are subroutine scratch: read back only the ones that a
+  ! host-side diagnostic below actually consumes, then release everything.
+  !$omp target update from(uhml) if(CS%id_uhml > 0)
+  !$omp target update from(vhml) if(CS%id_vhml > 0)
+  !$omp target update from(U_star_2d) if(CS%id_ustar > 0)
+  !$omp target update from(wpup) if(CS%id_wpup > 0)
+  !$omp target update from(buoy_av) if(CS%id_Rml > 0)
+  !$omp target update from(little_h) if(CS%id_BLD > 0)
+  !$omp target update from(big_H) if(CS%id_MLD > 0)
+  !$omp target update from(uDml_diag) if(CS%id_uDml > 0 .or. CS%id_uml > 0)
+  !$omp target update from(vDml_diag) if(CS%id_vDml > 0 .or. CS%id_vml > 0)
+  !$omp target update from(htot) if(CS%id_uml > 0 .or. CS%id_vml > 0)
+
+  !$omp target exit data map(release: little_h, big_H, wpup, htot, buoy_av, uDml_diag, vDml_diag)
+  !$omp target exit data map(release: vol_dt_avail, uhml, vhml, U_star_2d, h_MLD, BLD, bflux)
 
   if (CS%id_uhml > 0 .or. CS%id_vhml > 0) &
     ! Remapped uhml and vhml require east/north halo updates of h
@@ -1789,6 +1951,18 @@ logical function mixedlayer_restrat_init(Time, G, GV, US, param_file, diag, CS, 
              "Fraction by which to extend the mixed-layer restratification "//&
              "depth used for a smoother stream function at the base of "//&
              "the mixed-layer.", units="nondim", default=0.0)
+    call get_param(param_file, mdl, "MLE_NKBLOCK", CS%nkblock, &
+             "Vertical block size for the mixed layer density integral. "//&
+             "0 processes all layers in a single block.", &
+             default=default_nkblock)
+    call get_param(param_file, mdl, "MLE_NJBLOCK", CS%njblock, &
+             "j-tile size for the mixed layer density integral. "//&
+             "0 uses the full j compute domain.", &
+             default=default_njblock)
+    call get_param(param_file, mdl, "MLE_NIBLOCK", CS%niblock, &
+             "i-tile size for the mixed layer density integral. "//&
+             "0 uses the full i compute domain.", &
+             default=default_niblock)
     call get_param(param_file, mdl, "USE_CR_GRID", CS%Cr_grid, &
              "If true, read in a spatially varying Cr field. "//&
              "If CR = 0 (default), this field is scaled by 1.0. "//&
@@ -2005,6 +2179,13 @@ logical function mixedlayer_restrat_init(Time, G, GV, US, param_file, diag, CS, 
   if (allocated(CS%MLD_filtered)) call pass_var(CS%MLD_filtered, G%domain)
   if (allocated(CS%MLD_filtered_slow)) call pass_var(CS%MLD_filtered_slow, G%domain)
   if (allocated(CS%wpup_filtered)) call pass_var(CS%wpup_filtered, G%domain)
+
+  ! The driver maps the whole control structure without copying its contents, so the scalar
+  ! components must be pushed to the device before the array components are attached to it.
+  !$omp target update to(CS) if(CS%use_Bodner)
+  !$omp target enter data map(to: CS%Cr_space) if(CS%use_Bodner)
+  !$omp target enter data map(to: CS%MLD_filtered, CS%MLD_filtered_slow, CS%wpup_filtered) &
+  !$omp   if(CS%use_Bodner)
 
 end function mixedlayer_restrat_init
 
