@@ -131,7 +131,7 @@ subroutine wave_speed(h, tv, G, GV, US, cg1, CS, halo_size, use_ebt_mode, mono_N
   real, dimension(merge(G%ied-G%isd+1, CS%niblock, CS%niblock==0), &
                   merge(G%jed-G%jsd+1, CS%njblock, CS%njblock==0), SZK_(GV)) :: &
     mode_struct   ! The mode structure [nondim], but it is also temporarily
-                  ! in units of [L2 T-2 ~> m2 s-2] after it is modified inside of tdma6_col.
+                  ! in units of [L2 T-2 ~> m2 s-2] after it is modified inside of tdma6_block.
   real, dimension(SZK_(GV)) :: &
     I_beta, &     ! A column-local temporary variable in the tridiagonal solve [L2 T-2 ~> m2 s-2]
     yy            ! A column-local temporary variable in the tridiagonal solve with the same
@@ -191,7 +191,7 @@ subroutine wave_speed(h, tv, G, GV, US, cg1, CS, halo_size, use_ebt_mode, mono_N
   integer :: kc         ! The number of layers in the column after merging
   integer :: i, j, k, k2, itt, is, ie, js, je, nz, halo
   integer :: nii, njj ! The declared horizontal extents of the blocked working arrays, which
-                      ! tdma6_col needs in order to index mode_struct the same way that it is indexed
+                      ! tdma6_block needs in order to index mode_struct the same way that it is indexed
                       ! here.  These are also the strides of the block loops.
   integer :: isb, ieb ! The first and last i-indices of the current block.
   integer :: jsb, jeb ! The first and last j-indices of the current block.
@@ -762,8 +762,8 @@ subroutine wave_speed(h, tv, G, GV, US, cg1, CS, halo_size, use_ebt_mode, mono_N
               endif
 
               if (calc_modal_structure) then
-                call tdma6_col(kc, Igu, Igl, 1, nii, 1, njj, nz, ii, jj, lam, mode_struct, I_beta, yy)
-                ! Note that tdma6_col changes the units of mode_struct to [L2 T-2 ~> m2 s-2]
+                call tdma6_block(kc, Igu, Igl, nii, njj, nz, ii, jj, lam, mode_struct, I_beta, yy)
+                ! Note that tdma6_block changes the units of mode_struct to [L2 T-2 ~> m2 s-2]
                 ms_min = mode_struct(ii,jj,1)
                 ms_max = mode_struct(ii,jj,1)
                 ms_sq = mode_struct(ii,jj,1)**2
@@ -895,19 +895,17 @@ end subroutine tdma6
 !! 3-dimensional array of right hand sides, addressing that column by its i- and j-indices.
 !! The matrix diagonals and the elimination workspace are column-local arrays.
 !!
-pure subroutine tdma6_col(n, a, c, isl, iel, jsl, jel, nk, i, j, lam, y, I_beta, yy)
+pure subroutine tdma6_block(n, a, c, nii, njj, nk, i, j, lam, y, I_beta, yy)
   integer, intent(in)    :: n   !< Number of rows of matrix
-  integer, intent(in)    :: isl !< Lower i-bound of the 3-d right hand side array
-  integer, intent(in)    :: iel !< Upper i-bound of the 3-d right hand side array
-  integer, intent(in)    :: jsl !< Lower j-bound of the 3-d right hand side array
-  integer, intent(in)    :: jel !< Upper j-bound of the 3-d right hand side array
+  integer, intent(in)    :: nii !< Upper i-bound of the 3-d right hand side array
+  integer, intent(in)    :: njj !< Upper j-bound of the 3-d right hand side array
   integer, intent(in)    :: nk  !< Vertical extent of the arrays
   real, dimension(nk), intent(in) :: a !< Lower diagonal   [T2 L-2 ~> s2 m-2]
   real, dimension(nk), intent(in) :: c !< Upper diagonal   [T2 L-2 ~> s2 m-2]
   integer, intent(in)    :: i   !< The i-index of the column to work on
   integer, intent(in)    :: j   !< The j-index of the column to work on
   real,    intent(in)    :: lam !< Scalar subtracted from leading diagonal [T2 L-2 ~> s2 m-2]
-  real, dimension(isl:iel,jsl:jel,nk), intent(inout) :: y !< RHS on entry [A ~> a], result on exit
+  real, dimension(1:nii,1:njj,nk), intent(inout) :: y !< RHS on entry [A ~> a], result on exit
                                                      !! [A L2 T-2 ~> a m2 s-2]
   real, dimension(nk), intent(inout) :: I_beta !< Workspace holding the inverse of the leading
                                                !! diagonal after elimination [L2 T-2 ~> m2 s-2]
@@ -953,7 +951,7 @@ pure subroutine tdma6_col(n, a, c, isl, iel, jsl, jel, nk, i, j, lam, y, I_beta,
     y(i,j,k) = ( yy(k) + c(k) * y(i,j,k+1) ) * I_beta(k)
   enddo
 
-end subroutine tdma6_col
+end subroutine tdma6_block
 
 !> Calculates the wave speeds for the first few barolinic modes.
 subroutine wave_speeds(h, tv, G, GV, US, nmodes, cn, CS, w_struct, u_struct, u_struct_max, u_struct_bot, Nb, int_w2, &
