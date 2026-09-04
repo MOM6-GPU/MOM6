@@ -191,12 +191,12 @@ subroutine wave_speed(h, tv, G, GV, US, cg1, CS, halo_size, use_ebt_mode, mono_N
   integer :: kc         ! The number of layers in the column after merging
   integer :: i, j, k, k2, itt, is, ie, js, je, nz, halo
   integer :: nii, njj ! The declared horizontal extents of the blocked working arrays, which
-                  ! tdma6_col needs in order to index mode_struct the same way that it is indexed
-                  ! here.  These are also the strides of the block loops.
+                      ! tdma6_col needs in order to index mode_struct the same way that it is indexed
+                      ! here.  These are also the strides of the block loops.
   integer :: isb, ieb ! The first and last i-indices of the current block.
   integer :: jsb, jeb ! The first and last j-indices of the current block.
   integer :: iie, jje ! The number of columns actually in the current block, which is smaller
-                  ! than nii or njj for the last block of a row or column.
+                      ! than nii or njj for the last block of a row or column.
   integer :: ii, jj ! Block-local 1-based i- and j-indices.
   real :: hw      ! The mean of the adjacent layer thicknesses [H ~> m or kg m-2]
   real :: sum_hc  ! The sum of the layer thicknesses [H ~> m or kg m-2]
@@ -223,8 +223,6 @@ subroutine wave_speed(h, tv, G, GV, US, cg1, CS, halo_size, use_ebt_mode, mono_N
     is = G%isc - halo ; ie = G%iec + halo ; js = G%jsc - halo ; je = G%jec + halo
   endif
 
-  ! Arrays that only inactive branches reference are mapped here too, because nvfortran would
-  ! otherwise manage their transfers implicitly.
   !$omp target enter data map(alloc: Hf, Tf, Sf, Rf, pres, T_int, S_int, dRho_dT, dRho_dS)
   !$omp target enter data map(alloc: dSpV_dT, dSpV_dS, H_top, H_bot, gprime, Igl, Igu)
   !$omp target enter data map(alloc: Hc, Tc, Sc, Rc, mode_struct)
@@ -290,8 +288,7 @@ subroutine wave_speed(h, tv, G, GV, US, cg1, CS, halo_size, use_ebt_mode, mono_N
 
     !   First merge very thin layers with the one above (or below if they are
     ! at the top), and find the interface quantities that the equation of state
-    ! needs.  Each column can be worked upon one at a time.  Land columns are skipped
-    ! because nothing that is calculated here is used over land.
+    ! needs.
     do concurrent (jj=1:jje, ii=1:iie, G%mask2dT(isb+ii-1,jsb+jj-1) > 0.0) &
       DO_LOCALITY(local(i, j, k, hmin, H_here, HxT_here, HxS_here, HxR_here)) &
       DO_LOCALITY(reduce(max:max_kf))
@@ -347,7 +344,7 @@ subroutine wave_speed(h, tv, G, GV, US, cg1, CS, halo_size, use_ebt_mode, mono_N
       !   The equation of state is evaluated below with a single call spanning a rectangular
       ! range of interfaces, but the number of filtered layers varies between columns.  Extend
       ! each column with zero-thickness copies of its deepest filtered layer so that the extra
-      ! interfaces hold valid temperatures and salinities.  These extra values are never used.
+      ! interfaces hold valid temperatures and salinities. These extra values are never used.
       if (use_EOS) then
         do k=kf(ii,jj)+1,nz+1
           Hf(ii,jj,k) = 0.0
@@ -381,8 +378,6 @@ subroutine wave_speed(h, tv, G, GV, US, cg1, CS, halo_size, use_ebt_mode, mono_N
         enddo ; enddo
         !$omp target update to(dSpV_dT, dSpV_dS)
       else
-        !   The indices in EOSdom are relative to the lower bounds of the arrays, which for these
-        ! blocked arrays are 1, so they span the columns that are actually in this block.
         EOSdom(1,1) = 1 ; EOSdom(1,2) = iie
         EOSdom(2,1) = 1 ; EOSdom(2,2) = jje
         EOSdom(3,1) = 2 ; EOSdom(3,2) = max_kf+1
@@ -391,7 +386,6 @@ subroutine wave_speed(h, tv, G, GV, US, cg1, CS, halo_size, use_ebt_mode, mono_N
       endif
     endif
 
-    ! From this point, we can work on individual columns without causing memory to have page faults.
     !$omp target teams loop collapse(2) private( i, j, k, k2, itt, kc, do_merge, I_Htot, I_Hnew, &
     !$omp &                                      det, ddet, lam, dlam, lam0, cg1_est, speed2_tot, &
     !$omp &                                      drxh_sum, dSpVxh_sum, hw, sum_hc, gp, N2min, &
@@ -896,6 +890,7 @@ pure subroutine tdma6(n, a, c, lam, y)
 
 end subroutine tdma6
 
+! TODO: This routine can probably be merged with tdma6 once wave_speeds is also blocked
 !> Solve the same non-symmetric tridiagonal problem as tdma6 for a single column of a
 !! 3-dimensional array of right hand sides, addressing that column by its i- and j-indices.
 !! The matrix diagonals and the elimination workspace are column-local arrays.
@@ -1857,9 +1852,10 @@ subroutine wave_speed_init(CS, GV, param_file, use_ebt_mode, mono_N2_column_frac
   ! This include declares and sets the variable "version".
 # include "version_variable.h"
   character(len=40)  :: mdl = "MOM_wave_speed"  ! This module's name.
-  ! Doxygen reports unbalanced preprocessor directives when "!<" comments appear on
-  ! declarations inside a preprocessor branch in a procedure body, so plain comments are
-  ! used for these local parameters.
+  !   Do not use an apostrophe in the comments in the block below.  The doxygen preprocessor
+  ! treats one in a Fortran comment as the start of a character literal that spans lines, and
+  ! if that literal closes between the #ifdef and the #endif, doxygen reports the #endif as
+  ! having no matching #if.
 #ifdef __NVCOMPILER_OPENMP_GPU
   ! The whole computational domain is worked on at once so that the offloaded loops have as
   ! much parallelism as possible.
@@ -1867,7 +1863,7 @@ subroutine wave_speed_init(CS, GV, param_file, use_ebt_mode, mono_N2_column_frac
   integer, parameter :: default_njblock = 0 ! Default j block size for the wave speed calculations
 #else
   ! These are a starting point for tuning, chosen so that the columns of a block share the
-  ! cache lines that each column's vertical sweep touches.
+  ! cache lines that the vertical sweep of each column touches.
   integer, parameter :: default_niblock = 0 ! Default i block size for the wave speed calculations
   integer, parameter :: default_njblock = 1 ! Default j block size for the wave speed calculations
 #endif
