@@ -659,13 +659,11 @@ subroutine calc_sqg_struct(h, tv, G, GV, US, CS, dt, MEKE, OBC)
   integer, dimension(2) :: EOSdom ! The i-computational domain for the equation of state
   integer :: i, j, k, is, ie, js, je, nz
   integer :: niblock, njblock, nkblock
-  integer :: isoneutral_halo
+  integer, parameter :: isoneutral_halo = 1
 
   niblock = CS%niblock
   njblock = CS%njblock
   nkblock = CS%nkblock
-
-  isoneutral_halo = 1
 
   is = G%isc ; ie = G%iec ; js = G%jsc ; je = G%jec ; nz = GV%ke
   f_subround = 1.0e-40 * US%s_to_T
@@ -807,7 +805,7 @@ subroutine calc_slope_functions(h, tv, dt, G, GV, US, CS, OBC)
   real, dimension(SZIB_(G),SZJ_(G),SZK_(GV)+1) :: dzSxN ! |Sx| N times dz at u-points [Z T-1 ~> m s-1]
   real, dimension(SZI_(G),SZJB_(G),SZK_(GV)+1) :: dzSyN ! |Sy| N times dz at v-points [Z T-1 ~> m s-1]
   integer :: niblock, njblock, nkblock
-  integer :: isoneutral_halo
+  integer, parameter :: isoneutral_halo = 1
 
   if (.not. CS%initialized) call MOM_error(FATAL, "MOM_lateral_mixing_coeffs.F90, calc_slope_functions: "//&
          "Module must be initialized before it is used.")
@@ -817,8 +815,6 @@ subroutine calc_slope_functions(h, tv, dt, G, GV, US, CS, OBC)
   niblock = CS%niblock
   njblock = CS%njblock
   nkblock = CS%nkblock
-
-  isoneutral_halo = 1
 
   ! +2 needed because loops in calc_isoneutral slopes run from is-1 to ie and js-1 to je
   if (niblock == 0) niblock = G%iec - G%isc + 2 + 2*isoneutral_halo
@@ -1494,7 +1490,7 @@ subroutine calc_QG_slopes(h, tv, dt, G, GV, US, slope_x, slope_y, CS, OBC)
   ! Local variables
   real, dimension(SZI_(G),SZJ_(G),SZK_(GV)+1)  :: e    ! The interface heights relative to mean sea level [Z ~> m]
   integer :: niblock, njblock, nkblock
-  integer :: isoneutral_halo
+  integer, parameter :: isoneutral_halo = 2
 
   if (.not. CS%initialized) call MOM_error(FATAL, "MOM_lateral_mixing_coeffs.F90, calc_QG_slopes: "//&
          "Module must be initialized before it is used.")
@@ -1502,7 +1498,6 @@ subroutine calc_QG_slopes(h, tv, dt, G, GV, US, slope_x, slope_y, CS, OBC)
   niblock = CS%niblock
   njblock = CS%njblock
   nkblock = CS%nkblock
-  isoneutral_halo = 2
 
   ! +2 needed because loops in calc_isoneutral slopes run from is-1 to ie and js-1 to je
   if (niblock == 0) niblock = G%iec - G%isc + 2 + 2*isoneutral_halo
