@@ -39,7 +39,7 @@ public diagnose_mass_weight_Z, diagnose_mass_weight_p
 
 real, parameter :: wt_t(5) = [1.0, 0.75, 0.5, 0.25, 0.0] !< Top weights [nondim]
 real, parameter :: wt_b(5) = [0.0, 0.25, 0.5, 0.75, 1.0] !< Bottom weights [nondim]
-!$omp declare target to(wt_t, wt_b)
+!$omp declare target(wt_t, wt_b)
 
 contains
 
