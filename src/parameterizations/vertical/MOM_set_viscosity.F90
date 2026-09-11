@@ -2235,7 +2235,7 @@ subroutine set_viscous_ML(u, v, h, tv, forces, visc, dt, G, GV, US, CS, nIIB, nJ
 
   call cpu_clock_begin(CS%id_clock_ML)
 
-  ! NOTE: Requried since this is called by the GPU-enabled dycore, but it could
+  ! NOTE: Required since this is called by the GPU-enabled dycore, but it could
   !   also be implicitly fixing other functions.
 
   Rho0x400_G = 400.0*(GV%H_to_RZ / GV%g_Earth_Z_T2)
@@ -2569,7 +2569,7 @@ subroutine set_viscous_ML(u, v, h, tv, forces, visc, dt, G, GV, US, CS, nIIB, nJ
               Shtot(II,jj) = Shtot(II,jj) + hweight * 0.5 * (tv%S(i,j,k) + tv%S(i+1,j,k))
             endif
             if (allocated(tv%SpV_avg)) then
-              Shtot(II,jj) = Shtot(II,jj) + &
+              SpV_htot(II,jj) = SpV_htot(II,jj) + &
                 hweight * 0.5 * (tv%SpV_avg(i,j,k) + tv%SpV_avg(i+1,j,k))
             endif
           enddo ; endif
@@ -2577,9 +2577,9 @@ subroutine set_viscous_ML(u, v, h, tv, forces, visc, dt, G, GV, US, CS, nIIB, nJ
           if ((hwtot <= 0.0) .or. (CS%linear_drag .and. .not.allocated(tv%SpV_avg))) then
             ustar(II,jj) = cdrag_sqrt_H * CS%drag_bg_vel
           elseif (CS%linear_drag .and. allocated(tv%SpV_avg)) then
-            ustar(II,jj) = cdrag_sqrt_H_RL * CS%drag_bg_vel * (hwtot / Shtot(II,jj))
+            ustar(II,jj) = cdrag_sqrt_H_RL * CS%drag_bg_vel * (hwtot / SpV_htot(II,jj))
           elseif (allocated(tv%SpV_avg)) then ! (.not.CS%linear_drag)
-            ustar(II,jj) = cdrag_sqrt_H_RL * hutot / Shtot(II,jj)
+            ustar(II,jj) = cdrag_sqrt_H_RL * hutot / SpV_htot(II,jj)
           else ! (.not.CS%linear_drag .and. .not.allocated(tv%SpV_avg))
             ustar(II,jj) = cdrag_sqrt_H * hutot / hwtot
           endif
@@ -2946,7 +2946,7 @@ subroutine set_viscous_ML(u, v, h, tv, forces, visc, dt, G, GV, US, CS, nIIB, nJ
               Shtot(ii,JJ) = Shtot(ii,JJ) + hweight * 0.5 * (tv%S(i,j,k) + tv%S(i,j+1,k))
             endif
             if (allocated(tv%SpV_avg)) then
-              Shtot(ii,JJ) = Shtot(ii,JJ) + &
+              SpV_htot(ii,JJ) = SpV_htot(ii,JJ) + &
                 hweight * 0.5 * (tv%SpV_avg(i,j,k) + tv%SpV_avg(i,j+1,k))
             endif
           enddo ; endif
@@ -2954,9 +2954,9 @@ subroutine set_viscous_ML(u, v, h, tv, forces, visc, dt, G, GV, US, CS, nIIB, nJ
           if ((hwtot <= 0.0) .or. (CS%linear_drag .and. .not.allocated(tv%SpV_avg))) then
             ustar(ii,JJ) = cdrag_sqrt_H * CS%drag_bg_vel
           elseif (CS%linear_drag .and. allocated(tv%SpV_avg)) then
-            ustar(ii,JJ) = cdrag_sqrt_H_RL * CS%drag_bg_vel * (hwtot / Shtot(ii,JJ))
+            ustar(ii,JJ) = cdrag_sqrt_H_RL * CS%drag_bg_vel * (hwtot / SpV_htot(ii,JJ))
           elseif (allocated(tv%SpV_avg)) then ! (.not.CS%linear_drag)
-            ustar(ii,JJ) = cdrag_sqrt_H_RL * hutot / Shtot(ii,JJ)
+            ustar(ii,JJ) = cdrag_sqrt_H_RL * hutot / SpV_htot(ii,JJ)
           else ! (.not.CS%linear_drag .and. .not.allocated(tv%SpV_avg))
             ustar(ii,JJ) = cdrag_sqrt_H * hutot / hwtot
           endif
