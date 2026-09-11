@@ -732,10 +732,10 @@ subroutine calculate_tidal_mixing(dz, isb, ieb, jsb, jeb, nii, njj, N2_bot, Rho_
   real, dimension(:,:,:),           pointer       :: Kv     !< The "slow" vertical viscosity at each interface
                                                             !! (not layer!) [H Z T-1 ~> m2 s-1 or Pa s]
   real, dimension(nii,njj,SZK_(GV)), &
-                                    intent(inout) :: Kd_lay !< The diapycnal diffusivity in layers
+                          optional, intent(inout) :: Kd_lay !< The diapycnal diffusivity in layers
                                                             !! [H Z T-1 ~> m2 s-1 or kg m-1 s-1]
   real, dimension(nii,njj,SZK_(GV)+1), &
-                                    intent(inout) :: Kd_int !< The diapycnal diffusivity at interfaces
+                          optional, intent(inout) :: Kd_int !< The diapycnal diffusivity at interfaces
                                                             !! [H Z T-1 ~> m2 s-1 or kg m-1 s-1]
   type(vbf_CS), pointer                           :: VBF    !< A diagnostic structure for vertical buoyancy fluxes
 
