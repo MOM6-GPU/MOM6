@@ -689,8 +689,11 @@ subroutine set_pen_shortwave(optics, fluxes, G, GV, US, CS, opacity, tracer_flow
                        fluxes%sw_nir_dir, fluxes%sw_nir_dif, G, GV, US, opacity, chl_3d=chl_3d)
     endif
   else
+    ! TODO: Where should the fluxes pointer be pushed to the device?
+    !$omp target enter data map(to: fluxes, fluxes%sw )
     call set_opacity(optics, fluxes%sw, fluxes%sw_vis_dir, fluxes%sw_vis_dif, &
                      fluxes%sw_nir_dir, fluxes%sw_nir_dif, G, GV, US, opacity)
+    !$omp target exit data map(release: fluxes%sw, fluxes)
   endif
 
 end subroutine set_pen_shortwave
