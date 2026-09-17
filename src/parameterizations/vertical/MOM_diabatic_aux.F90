@@ -2,6 +2,9 @@
 ! See the LICENSE file for licensing information.
 ! SPDX-License-Identifier: Apache-2.0
 
+#include <MOM_memory.h>
+#include "do_concurrent_compat.h"
+
 !> Provides functions for some diabatic processes such as frazil, brine rejection,
 !! tendency due to surface flux divergence.
 module MOM_diabatic_aux
@@ -29,8 +32,6 @@ use MOM_variables,     only : thermo_var_ptrs
 use MOM_verticalGrid,  only : verticalGrid_type
 
 implicit none ; private
-
-#include <MOM_memory.h>
 
 public diabatic_aux_init, diabatic_aux_end
 public make_frazil, adjust_salt, differential_diffuse_T_S, triDiagTS, triDiagTS_Eulerian
@@ -418,35 +419,38 @@ subroutine triDiagTS(G, GV, is, ie, js, je, hold, ea, eb, T, S)
   real, dimension(SZI_(G),SZJ_(G),SZK_(GV)), intent(inout) :: S  !< Layer salinities [S ~> ppt].
 
   ! Local variables
-  real :: b1(SZIB_(G))          ! A variable used by the tridiagonal solver [H-1 ~> m-1 or m2 kg-1].
-  real :: d1(SZIB_(G))          ! A variable used by the tridiagonal solver [nondim].
-  real :: c1(SZIB_(G),SZK_(GV)) ! A variable used by the tridiagonal solver [nondim].
+  real :: b1(SZIB_(G), SZJB_(G))          ! A variable used by the tridiagonal solver [H-1 ~> m-1 or m2 kg-1].
+  real :: d1(SZIB_(G), SZJB_(G))          ! A variable used by the tridiagonal solver [nondim].
+  real :: c1(SZIB_(G), SZJB_(G), SZK_(GV))! A variable used by the tridiagonal solver [nondim].
   real :: h_tr, b_denom_1       ! Two temporary thicknesses [H ~> m or kg m-2].
   integer :: i, j, k
 
-  !$OMP parallel do default(shared) private(h_tr,b1,d1,c1,b_denom_1)
-  do j=js,je
-    do i=is,ie
+  !$omp target enter data map(alloc: b1, d1, c1)
+
+  do concurrent(j=js:je )
+    do concurrent( i=is:ie ) DO_LOCALITY(local(h_tr))
       h_tr = hold(i,j,1) + GV%H_subroundoff
-      b1(i) = 1.0 / (h_tr + eb(i,j,1))
-      d1(i) = h_tr * b1(i)
-      T(i,j,1) = (b1(i)*h_tr)*T(i,j,1)
-      S(i,j,1) = (b1(i)*h_tr)*S(i,j,1)
+      b1(i,j) = 1.0 / (h_tr + eb(i,j,1))
+      d1(i,j) = h_tr * b1(i,j)
+      T(i,j,1) = (b1(i,j)*h_tr)*T(i,j,1)
+      S(i,j,1) = (b1(i,j)*h_tr)*S(i,j,1)
     enddo
-    do k=2,GV%ke ; do i=is,ie
-      c1(i,k) = eb(i,j,k-1) * b1(i)
+    do k=2,GV%ke ; do concurrent( i=is:ie ) DO_LOCALITY(local(h_tr,b_denom_1))
+      c1(i,j,k) = eb(i,j,k-1) * b1(i,j)
       h_tr = hold(i,j,k) + GV%H_subroundoff
-      b_denom_1 = h_tr + d1(i)*ea(i,j,k)
-      b1(i) = 1.0 / (b_denom_1 + eb(i,j,k))
-      d1(i) = b_denom_1 * b1(i)
-      T(i,j,k) = b1(i) * (h_tr*T(i,j,k) + ea(i,j,k)*T(i,j,k-1))
-      S(i,j,k) = b1(i) * (h_tr*S(i,j,k) + ea(i,j,k)*S(i,j,k-1))
+      b_denom_1 = h_tr + d1(i,j)*ea(i,j,k)
+      b1(i,j) = 1.0 / (b_denom_1 + eb(i,j,k))
+      d1(i,j) = b_denom_1 * b1(i,j)
+      T(i,j,k) = b1(i,j) * (h_tr*T(i,j,k) + ea(i,j,k)*T(i,j,k-1))
+      S(i,j,k) = b1(i,j) * (h_tr*S(i,j,k) + ea(i,j,k)*S(i,j,k-1))
     enddo ; enddo
-    do k=GV%ke-1,1,-1 ; do i=is,ie
-      T(i,j,k) = T(i,j,k) + c1(i,k+1)*T(i,j,k+1)
-      S(i,j,k) = S(i,j,k) + c1(i,k+1)*S(i,j,k+1)
+    do k=GV%ke-1,1,-1 ; do concurrent( i=is:ie )
+      T(i,j,k) = T(i,j,k) + c1(i,j,k+1)*T(i,j,k+1)
+      S(i,j,k) = S(i,j,k) + c1(i,j,k+1)*S(i,j,k+1)
     enddo ; enddo
   enddo
+
+  !$omp target exit data map(delete: b1, d1, c1)
 end subroutine triDiagTS
 
 !> This is a simple tri-diagonal solver for T and S, with mixing across interfaces but no net
@@ -466,35 +470,39 @@ subroutine triDiagTS_Eulerian(G, GV, is, ie, js, je, hold, ent, T, S)
   real, dimension(SZI_(G),SZJ_(G),SZK_(GV)), intent(inout) :: S    !< Layer salinities [S ~> ppt].
 
   ! Local variables
-  real :: b1(SZIB_(G))          ! A variable used by the tridiagonal solver [H-1 ~> m-1 or m2 kg-1].
-  real :: d1(SZIB_(G))          ! A variable used by the tridiagonal solver [nondim].
-  real :: c1(SZIB_(G),SZK_(GV)) ! A variable used by the tridiagonal solver [nondim].
+  real :: b1(SZIB_(G), SZJB_(G))          ! A variable used by the tridiagonal solver [H-1 ~> m-1 or m2 kg-1].
+  real :: d1(SZIB_(G), SZJB_(G))          ! A variable used by the tridiagonal solver [nondim].
+  real :: c1(SZIB_(G), SZJB_(G), SZK_(GV))! A variable used by the tridiagonal solver [nondim].
   real :: h_tr, b_denom_1       ! Two temporary thicknesses [H ~> m or kg m-2].
   integer :: i, j, k
 
-  !$OMP parallel do default(shared) private(h_tr,b1,d1,c1,b_denom_1)
-  do j=js,je
-    do i=is,ie
+  !$omp target enter data map(alloc: b1, d1, c1)
+
+  do concurrent( j=js:je )
+    do concurrent( i=is:ie ) DO_LOCALITY(local(h_tr))
       h_tr = hold(i,j,1) + GV%H_subroundoff
-      b1(i) = 1.0 / (h_tr + ent(i,j,2))
-      d1(i) = h_tr * b1(i)
-      T(i,j,1) = (b1(i)*h_tr)*T(i,j,1)
-      S(i,j,1) = (b1(i)*h_tr)*S(i,j,1)
+      b1(i,j) = 1.0 / (h_tr + ent(i,j,2))
+      d1(i,j) = h_tr * b1(i,j)
+      T(i,j,1) = (b1(i,j)*h_tr)*T(i,j,1)
+      S(i,j,1) = (b1(i,j)*h_tr)*S(i,j,1)
     enddo
-    do k=2,GV%ke ; do i=is,ie
-      c1(i,k) = ent(i,j,K) * b1(i)
+    do k=2,GV%ke ; do concurrent( i=is:ie ) DO_LOCALITY(local(h_tr,b_denom_1))
+      c1(i,j,k) = ent(i,j,K) * b1(i,j)
       h_tr = hold(i,j,k) + GV%H_subroundoff
-      b_denom_1 = h_tr + d1(i)*ent(i,j,K)
-      b1(i) = 1.0 / (b_denom_1 + ent(i,j,K+1))
-      d1(i) = b_denom_1 * b1(i)
-      T(i,j,k) = b1(i) * (h_tr*T(i,j,k) + ent(i,j,K)*T(i,j,k-1))
-      S(i,j,k) = b1(i) * (h_tr*S(i,j,k) + ent(i,j,K)*S(i,j,k-1))
+      b_denom_1 = h_tr + d1(i,j)*ent(i,j,K)
+      b1(i,j) = 1.0 / (b_denom_1 + ent(i,j,K+1))
+      d1(i,j) = b_denom_1 * b1(i,j)
+      T(i,j,k) = b1(i,j) * (h_tr*T(i,j,k) + ent(i,j,K)*T(i,j,k-1))
+      S(i,j,k) = b1(i,j) * (h_tr*S(i,j,k) + ent(i,j,K)*S(i,j,k-1))
     enddo ; enddo
-    do k=GV%ke-1,1,-1 ; do i=is,ie
-      T(i,j,k) = T(i,j,k) + c1(i,k+1)*T(i,j,k+1)
-      S(i,j,k) = S(i,j,k) + c1(i,k+1)*S(i,j,k+1)
+    do k=GV%ke-1,1,-1 ; do concurrent( i=is:ie )
+      T(i,j,k) = T(i,j,k) + c1(i,j,k+1)*T(i,j,k+1)
+      S(i,j,k) = S(i,j,k) + c1(i,j,k+1)*S(i,j,k+1)
     enddo ; enddo
   enddo
+
+  !$omp target exit data map(delete: b1, d1, c1)
+
 end subroutine triDiagTS_Eulerian
 
 
