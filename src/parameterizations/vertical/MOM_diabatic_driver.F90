@@ -1059,7 +1059,11 @@ subroutine diabatic_ALE_legacy(u, v, h, tv, BLD, fluxes, visc, ADp, CDp, dt, Tim
       call tracer_vertdiff_Eulerian(h, ent_t, dt, tv%T, G, GV)
       call tracer_vertdiff_Eulerian(h, ent_s, dt, tv%S, G, GV)
     else
+      !$omp target update to( h )
+      !$omp target enter data map(to: ent_s, tv, tv%T, tv%S)
       call triDiagTS_Eulerian(G, GV, is, ie, js, je, h, ent_s, tv%T, tv%S)
+      !$omp target update from( tv%T, tv%S )
+      !$omp target exit data map(release: ent_s, tv, tv%T, tv%S)
     endif
 
     ! diagnose temperature, salinity, heat, and salt tendencies
@@ -2487,7 +2491,12 @@ subroutine layered_diabatic(u, v, h, tv, BLD, fluxes, visc, ADp, CDp, dt, Time_e
           call tracer_vertdiff(hold, ea, eb, dt, tv%T, G, GV)
           call tracer_vertdiff(hold, ea, eb, dt, tv%S, G, GV)
         else
+          !$omp target enter data map(to: hold, ea, eb)
+          !$omp target enter data map(to: tv, tv%T, tv%S)
           call triDiagTS(G, GV, is, ie, js, je, hold, ea, eb, tv%T, tv%S)
+          !$omp target exit data map(delete: hold, ea, eb)
+          !$omp target update from(tv%T, tv%S)
+          !$omp target exit data map(release: tv%T, tv%S, tv)
         endif
       endif ! massless_match_targets
       call cpu_clock_end(id_clock_tridiag)
@@ -2577,7 +2586,12 @@ subroutine layered_diabatic(u, v, h, tv, BLD, fluxes, visc, ADp, CDp, dt, Time_e
         call tracer_vertdiff(hold, ea, eb, dt, tv%T, G, GV)
         call tracer_vertdiff(hold, ea, eb, dt, tv%S, G, GV)
       else
+        !$omp target enter data map(to: hold, ea, eb)
+        !$omp target enter data map(to: tv, tv%T, tv%S)
         call triDiagTS(G, GV, is, ie, js, je, hold, ea, eb, tv%T, tv%S)
+        !$omp target exit data map(delete: hold, ea, eb)
+        !$omp target update from(tv%T, tv%S)
+        !$omp target exit data map(release: tv%T, tv%S, tv)
       endif
 
       ! diagnose temperature, salinity, heat, and salt tendencies
