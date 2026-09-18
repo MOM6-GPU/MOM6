@@ -1073,7 +1073,7 @@ subroutine diabatic_ALE_legacy(u, v, h, tv, BLD, fluxes, visc, ADp, CDp, dt, Tim
     else
       !$omp target update to( h )
       !$omp target enter data map(to: ent_s, tv, tv%T, tv%S)
-      call triDiagTS_Eulerian(G, GV, is, ie, js, je, h, ent_s, tv%T, tv%S)
+      call triDiagTS_Eulerian(G, GV, CS%diabatic_aux_CSp, is, ie, js, je, h, ent_s, tv%T, tv%S)
       !$omp target update from( tv%T, tv%S )
       !$omp target exit data map(release: ent_s, tv, tv%T, tv%S)
     endif
@@ -2505,7 +2505,7 @@ subroutine layered_diabatic(u, v, h, tv, BLD, fluxes, visc, ADp, CDp, dt, Time_e
         else
           !$omp target enter data map(to: hold, ea, eb)
           !$omp target enter data map(to: tv, tv%T, tv%S)
-          call triDiagTS(G, GV, is, ie, js, je, hold, ea, eb, tv%T, tv%S)
+          call triDiagTS(G, GV, CS%diabatic_aux_CSp, is, ie, js, je, hold, ea, eb, tv%T, tv%S)
           !$omp target exit data map(delete: hold, ea, eb)
           !$omp target update from(tv%T, tv%S)
           !$omp target exit data map(release: tv%T, tv%S, tv)
@@ -2600,7 +2600,7 @@ subroutine layered_diabatic(u, v, h, tv, BLD, fluxes, visc, ADp, CDp, dt, Time_e
       else
         !$omp target enter data map(to: hold, ea, eb)
         !$omp target enter data map(to: tv, tv%T, tv%S)
-        call triDiagTS(G, GV, is, ie, js, je, hold, ea, eb, tv%T, tv%S)
+        call triDiagTS(G, GV, CS%diabatic_aux_CSp, is, ie, js, je, hold, ea, eb, tv%T, tv%S)
         !$omp target exit data map(delete: hold, ea, eb)
         !$omp target update from(tv%T, tv%S)
         !$omp target exit data map(release: tv%T, tv%S, tv)
