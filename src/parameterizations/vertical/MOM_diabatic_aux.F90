@@ -134,10 +134,47 @@ subroutine make_frazil(h, tv, G, GV, US, CS, p_surf, halo)
   real, dimension(SZI_(G),SZJ_(G)), &
                  optional, intent(in)    :: p_surf !< The pressure at the ocean surface [R L2 T-2 ~> Pa].
   integer,       optional, intent(in)    :: halo !< Halo width over which to calculate frazil
+
   ! Local variables
-  real, dimension(SZI_(G), SZJ_(G)) :: &
+  integer :: is, ie, js, je  ! The index bounds of the points to work on.
+  integer :: nii, njj        ! The resolved i- and j-direction block sizes [nondim].
+
+  is = G%isc ; ie = G%iec ; js = G%jsc ; je = G%jec
+  if (present(halo)) then
+    is = G%isc-halo ; ie = G%iec+halo ; js = G%jsc-halo ; je = G%jec+halo
+  endif
+
+  nii = CS%niblock ; if (nii == 0) nii = ie - is + 1
+  njj = CS%njblock ; if (njj == 0) njj = je - js + 1
+
+  call make_frazil_block(h, tv, G, GV, US, CS, is, ie, js, je, nii, njj, p_surf)
+
+end subroutine make_frazil
+
+!> Form frazil over a range of points, working on one i-j block of columns at a time.
+subroutine make_frazil_block(h, tv, G, GV, US, CS, is, ie, js, je, nii, njj, p_surf)
+  type(ocean_grid_type),   intent(in)    :: G  !< The ocean's grid structure
+  type(verticalGrid_type), intent(in)    :: GV !< The ocean's vertical grid structure
+  real, dimension(SZI_(G),SZJ_(G),SZK_(GV)), &
+                           intent(in)    :: h  !< Layer thicknesses [H ~> m or kg m-2]
+  type(thermo_var_ptrs),   intent(inout) :: tv !< Structure containing pointers to any available
+                                               !! thermodynamic fields.
+  type(unit_scale_type),   intent(in)    :: US !< A dimensional unit scaling type
+  type(diabatic_aux_CS),   intent(in)    :: CS !< The control structure returned by a previous
+                                               !! call to diabatic_aux_init.
+  integer,                 intent(in)    :: is !< The start i-index to work on.
+  integer,                 intent(in)    :: ie !< The end i-index to work on.
+  integer,                 intent(in)    :: js !< The start j-index to work on.
+  integer,                 intent(in)    :: je !< The end j-index to work on.
+  integer,                 intent(in)    :: nii !< Size of the i-block [nondim].
+  integer,                 intent(in)    :: njj !< Size of the j-block [nondim].
+  real, dimension(SZI_(G),SZJ_(G)), &
+                 optional, intent(in)    :: p_surf !< The pressure at the ocean surface [R L2 T-2 ~> Pa].
+
+  ! Local variables
+  real, dimension(nii,njj) :: &
     fraz_col    ! The accumulated heat requirement due to frazil [Q R Z ~> J m-2].
-  real, dimension(SZI_(G), SZJ_(G), SZK_(GV)) :: &
+  real, dimension(nii,njj,SZK_(GV)) :: &
     pressure, & ! The pressure at the middle of each layer [R L2 T-2 ~> Pa].
     T_freeze    ! The freezing potential temperature at the current salinity [C ~> degC].
 
@@ -145,93 +182,111 @@ subroutine make_frazil(h, tv, G, GV, US, CS, p_surf, halo)
   real :: hc    ! A layer's heat capacity [Q R Z C-1 ~> J m-2 degC-1].
   logical :: p_surf_is_present  ! True if p_surf is present. Used to determine if p_surf is used
                                 ! when calculating pressure for pressure dependent frazil.
-  integer :: EOSdom(3,2) ! The computational domain for the equation of state, taking into
-                         ! account that the arrays inside the EOS routines start at 1.
-  integer :: i, j, k, is, ie, js, je, nz
+  logical :: pressure_dependent_frazil ! A local copy of CS%pressure_dependent_frazil, so that no
+                                ! control structure element is read from within a device region.
+  logical :: reclaim_frazil     ! A local copy of CS%reclaim_frazil, for the same reason.
+  integer :: EOSdom(3,2) ! The computational domain for the equation of state within the blocked
+                         ! pressure and T_freeze arrays, taking into account that the arrays inside
+                         ! the EOS routines start at 1.
+  integer :: EOSdom_S(3,2) ! The corresponding domain within the unblocked tv%S and G%mask2dT.
+  integer :: i, j, k, nz
+  integer :: isb, ieb    ! The i-index bounds of the current block.
+  integer :: jsb, jeb    ! The j-index bounds of the current block.
+  integer :: ii, jj      ! Block-local i- and j-index loop variables.
 
-  is = G%isc ; ie = G%iec ; js = G%jsc ; je = G%jec ; nz = GV%ke
-  if (present(halo)) then
-    is = G%isc-halo ; ie = G%iec+halo ; js = G%jsc-halo ; je = G%jec+halo
-  endif
-
-  EOSdom(1,1) = is - (G%isd-1) ; EOSdom(1,2) = ie - (G%isd-1)
-  EOSdom(2,1) = js - (G%jsd-1) ; EOSdom(2,2) = je - (G%jsd-1)
-  EOSdom(3,1) = 1 ; EOSdom(3,2) = nz
+  nz = GV%ke
+  p_surf_is_present = present(p_surf)
+  H_to_RL2_T2 = GV%H_to_RZ * GV%g_Earth
+  pressure_dependent_frazil = CS%pressure_dependent_frazil
+  reclaim_frazil = CS%reclaim_frazil
 
   call cpu_clock_begin(id_clock_frazil)
 
   !$omp target enter data map(alloc: pressure, T_freeze, fraz_col)
 
-  if (.not.CS%pressure_dependent_frazil) then
-    do concurrent( k=1:nz, j=js:je, i=is:ie, G%mask2dT(i,j) > 0.0 )
-      pressure(i,j,k) = 0.0
-    enddo
-  else
-    p_surf_is_present = present(p_surf)
-    H_to_RL2_T2 = GV%H_to_RZ * GV%g_Earth
-  endif
+  do jsb=js,je,njj ; do isb=is,ie,nii
+    jeb = min(je, jsb+njj-1) ; ieb = min(ie, isb+nii-1)
 
-  do concurrent( j=js:je, i=is:ie, G%mask2dT(i,j) > 0.0 )
+    EOSdom(1,1) = 1 ; EOSdom(1,2) = ieb - isb + 1
+    EOSdom(2,1) = 1 ; EOSdom(2,2) = jeb - jsb + 1
+    EOSdom(3,1) = 1 ; EOSdom(3,2) = nz
+    EOSdom_S(1,1) = isb - (G%isd-1) ; EOSdom_S(1,2) = ieb - (G%isd-1)
+    EOSdom_S(2,1) = jsb - (G%jsd-1) ; EOSdom_S(2,2) = jeb - (G%jsd-1)
+    EOSdom_S(3,1) = 1 ; EOSdom_S(3,2) = nz
 
-    fraz_col(i,j) = 0.0
-
-    if (CS%pressure_dependent_frazil) then
-      if (p_surf_is_present) then
-        pressure(i,j,1) = p_surf(i,j) + (0.5*H_to_RL2_T2)*h(i,j,1)
-      else
-        pressure(i,j,1) = (0.5*H_to_RL2_T2)*h(i,j,1)
-      endif
-      do k=2,nz
-        pressure(i,j,k) = pressure(i,j,k-1) + (0.5*H_to_RL2_T2) * (h(i,j,k) + h(i,j,k-1))
+    if (.not.pressure_dependent_frazil) then
+      do concurrent( k=1:nz, j=jsb:jeb, i=isb:ieb, G%mask2dT(i,j) > 0.0 ) DO_LOCALITY(local(ii,jj))
+        ii = i - isb + 1 ; jj = j - jsb + 1
+        pressure(ii,jj,k) = 0.0
       enddo
     endif
-  enddo
 
-  ! Calculate freezing point temperature for each grid cell.
-  call calculate_TFreeze(tv%S, pressure, T_freeze, tv%eqn_of_state, &
-                         EOSdom, G%mask2dT)
+    do concurrent( j=jsb:jeb, i=isb:ieb, G%mask2dT(i,j) > 0.0 ) DO_LOCALITY(local(ii,jj))
+      ii = i - isb + 1 ; jj = j - jsb + 1
 
-  do concurrent( j=js:je, i=is:ie, G%mask2dT(i,j) > 0.0 ) DO_LOCALITY(local(hc))
-    if (CS%reclaim_frazil) then
-      if (tv%frazil(i,j) > 0.0) then
-        if (tv%T(i,j,1) > T_freeze(i,j,1)) then
-          ! If frazil had previously been formed, but the surface temperature is now
-          ! above freezing, cool the surface layer with the frazil heat deficit.
-          hc = (tv%C_p*GV%H_to_RZ) * h(i,j,1)
-          if (tv%frazil(i,j) - hc * (tv%T(i,j,1) - T_freeze(i,j,1)) <= 0.0) then
-            tv%T(i,j,1) = tv%T(i,j,1) - tv%frazil(i,j) / hc
-            tv%frazil(i,j) = 0.0
-          else
-            tv%frazil(i,j) = tv%frazil(i,j) - hc * (tv%T(i,j,1) - T_freeze(i,j,1))
-            tv%T(i,j,1) = T_freeze(i,j,1)
-          endif
+      fraz_col(ii,jj) = 0.0
+
+      if (pressure_dependent_frazil) then
+        if (p_surf_is_present) then
+          pressure(ii,jj,1) = p_surf(i,j) + (0.5*H_to_RL2_T2)*h(i,j,1)
+        else
+          pressure(ii,jj,1) = (0.5*H_to_RL2_T2)*h(i,j,1)
         endif
-      endif
-    endif
-
-    do k=nz,1,-1
-      if ((tv%T(i,j,k) < 0.0) .or. (fraz_col(i,j) > 0.0)) then
-        hc = (tv%C_p*GV%H_to_RZ) * h(i,j,k)
-        if (h(i,j,k) <= 10.0*(GV%Angstrom_H + GV%H_subroundoff)) then
-          ! Very thin layers should not be cooled by the frazil flux.
-          if (tv%T(i,j,k) < T_freeze(i,j,k)) then
-            fraz_col(i,j) = fraz_col(i,j) + hc * (T_freeze(i,j,k) - tv%T(i,j,k))
-            tv%T(i,j,k) = T_freeze(i,j,k)
-          endif
-        elseif ((fraz_col(i,j) > 0.0) .or. (tv%T(i,j,k) < T_freeze(i,j,k))) then
-          if (fraz_col(i,j) + hc * (T_freeze(i,j,k) - tv%T(i,j,k)) < 0.0) then
-            tv%T(i,j,k) = tv%T(i,j,k) - fraz_col(i,j) / hc
-            fraz_col(i,j) = 0.0
-          else
-            fraz_col(i,j) = fraz_col(i,j) + hc * (T_freeze(i,j,k) - tv%T(i,j,k))
-            tv%T(i,j,k) = T_freeze(i,j,k)
-          endif
-        endif
+        do k=2,nz
+          pressure(ii,jj,k) = pressure(ii,jj,k-1) + (0.5*H_to_RL2_T2) * (h(i,j,k) + h(i,j,k-1))
+        enddo
       endif
     enddo
 
-    tv%frazil(i,j) = tv%frazil(i,j) + fraz_col(i,j)
-  enddo
+    ! Calculate freezing point temperature for each grid cell.
+    call calculate_TFreeze(tv%S, pressure, T_freeze, tv%eqn_of_state, &
+                           EOSdom, G%mask2dT, dom_S=EOSdom_S)
+
+    do concurrent( j=jsb:jeb, i=isb:ieb, G%mask2dT(i,j) > 0.0 ) DO_LOCALITY(local(hc,ii,jj))
+      ii = i - isb + 1 ; jj = j - jsb + 1
+
+      if (reclaim_frazil) then
+        if (tv%frazil(i,j) > 0.0) then
+          if (tv%T(i,j,1) > T_freeze(ii,jj,1)) then
+            ! If frazil had previously been formed, but the surface temperature is now
+            ! above freezing, cool the surface layer with the frazil heat deficit.
+            hc = (tv%C_p*GV%H_to_RZ) * h(i,j,1)
+            if (tv%frazil(i,j) - hc * (tv%T(i,j,1) - T_freeze(ii,jj,1)) <= 0.0) then
+              tv%T(i,j,1) = tv%T(i,j,1) - tv%frazil(i,j) / hc
+              tv%frazil(i,j) = 0.0
+            else
+              tv%frazil(i,j) = tv%frazil(i,j) - hc * (tv%T(i,j,1) - T_freeze(ii,jj,1))
+              tv%T(i,j,1) = T_freeze(ii,jj,1)
+            endif
+          endif
+        endif
+      endif
+
+      do k=nz,1,-1
+        if ((tv%T(i,j,k) < 0.0) .or. (fraz_col(ii,jj) > 0.0)) then
+          hc = (tv%C_p*GV%H_to_RZ) * h(i,j,k)
+          if (h(i,j,k) <= 10.0*(GV%Angstrom_H + GV%H_subroundoff)) then
+            ! Very thin layers should not be cooled by the frazil flux.
+            if (tv%T(i,j,k) < T_freeze(ii,jj,k)) then
+              fraz_col(ii,jj) = fraz_col(ii,jj) + hc * (T_freeze(ii,jj,k) - tv%T(i,j,k))
+              tv%T(i,j,k) = T_freeze(ii,jj,k)
+            endif
+          elseif ((fraz_col(ii,jj) > 0.0) .or. (tv%T(i,j,k) < T_freeze(ii,jj,k))) then
+            if (fraz_col(ii,jj) + hc * (T_freeze(ii,jj,k) - tv%T(i,j,k)) < 0.0) then
+              tv%T(i,j,k) = tv%T(i,j,k) - fraz_col(ii,jj) / hc
+              fraz_col(ii,jj) = 0.0
+            else
+              fraz_col(ii,jj) = fraz_col(ii,jj) + hc * (T_freeze(ii,jj,k) - tv%T(i,j,k))
+              tv%T(i,j,k) = T_freeze(ii,jj,k)
+            endif
+          endif
+        endif
+      enddo
+
+      tv%frazil(i,j) = tv%frazil(i,j) + fraz_col(ii,jj)
+    enddo
+
+  enddo ; enddo ! ij block loop
 
   tv%frazil_was_reset = .false.
 
@@ -239,7 +294,7 @@ subroutine make_frazil(h, tv, G, GV, US, CS, p_surf, halo)
 
   call cpu_clock_end(id_clock_frazil)
 
-end subroutine make_frazil
+end subroutine make_frazil_block
 
 !> This subroutine applies double diffusion to T & S, assuming no diapycnal mass
 !! fluxes, using a simple tridiagonal solver.
