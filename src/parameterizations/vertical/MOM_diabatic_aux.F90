@@ -83,6 +83,9 @@ type, public :: diabatic_aux_CS ; private
                              !! vertical scale used for the brine plume parameterization [nondim].
   real :: check_salt_threshold!< The maximum relative salt change acceptable in a time step [nondim]
 
+  integer :: niblock = 0     !< The i block size used in array calculations [nondim].
+  integer :: njblock = 0     !< The j block size used in array calculations [nondim].
+
   type(time_type), pointer :: Time => NULL() !< A pointer to the ocean model's clock.
   type(diag_ctrl), pointer :: diag !< Structure used to regulate timing of diagnostic output
 
@@ -400,9 +403,11 @@ end subroutine adjust_salt
 
 !> This is a simple tri-diagonal solver for T and S.
 !! "Simple" means it only uses arrays hold, ea and eb.
-subroutine triDiagTS(G, GV, is, ie, js, je, hold, ea, eb, T, S)
+subroutine triDiagTS(G, GV, CS, is, ie, js, je, hold, ea, eb, T, S)
   type(ocean_grid_type),                     intent(in)    :: G  !< The ocean's grid structure
   type(verticalGrid_type),                   intent(in)    :: GV !< The ocean's vertical grid structure
+  type(diabatic_aux_CS),                     intent(in)    :: CS !< The control structure returned by a
+                                                                 !! previous call to diabatic_aux_init.
   integer,                                   intent(in)    :: is !< The start i-index to work on.
   integer,                                   intent(in)    :: ie !< The end i-index to work on.
   integer,                                   intent(in)    :: js !< The start j-index to work on.
@@ -417,45 +422,88 @@ subroutine triDiagTS(G, GV, is, ie, js, je, hold, ea, eb, T, S)
   real, dimension(SZI_(G),SZJ_(G),SZK_(GV)), intent(inout) :: S  !< Layer salinities [S ~> ppt].
 
   ! Local variables
-  real :: b1(SZIB_(G), SZJB_(G))          ! A variable used by the tridiagonal solver [H-1 ~> m-1 or m2 kg-1].
-  real :: d1(SZIB_(G), SZJB_(G))          ! A variable used by the tridiagonal solver [nondim].
-  real :: c1(SZIB_(G), SZJB_(G), SZK_(GV))! A variable used by the tridiagonal solver [nondim].
+  integer :: nii, njj  ! The resolved i- and j-direction block sizes [nondim].
+
+  nii = CS%niblock ; if (nii == 0) nii = ie - is + 1
+  njj = CS%njblock ; if (njj == 0) njj = je - js + 1
+
+  call triDiagTS_block(G, GV, is, ie, js, je, nii, njj, hold, ea, eb, T, S)
+
+end subroutine triDiagTS
+
+!> Solve the simple tri-diagonal system for T and S, working on one i-j block of columns at a time.
+subroutine triDiagTS_block(G, GV, is, ie, js, je, nii, njj, hold, ea, eb, T, S)
+  type(ocean_grid_type),                     intent(in)    :: G  !< The ocean's grid structure
+  type(verticalGrid_type),                   intent(in)    :: GV !< The ocean's vertical grid structure
+  integer,                                   intent(in)    :: is !< The start i-index to work on.
+  integer,                                   intent(in)    :: ie !< The end i-index to work on.
+  integer,                                   intent(in)    :: js !< The start j-index to work on.
+  integer,                                   intent(in)    :: je !< The end j-index to work on.
+  integer,                                   intent(in)    :: nii !< Size of the i-block [nondim].
+  integer,                                   intent(in)    :: njj !< Size of the j-block [nondim].
+  real, dimension(SZI_(G),SZJ_(G),SZK_(GV)), intent(in)    :: hold !< The layer thicknesses before entrainment,
+                                                                 !! [H ~> m or kg m-2].
+  real, dimension(SZI_(G),SZJ_(G),SZK_(GV)), intent(in)    :: ea !< The amount of fluid entrained from the layer
+                                                                 !! above within this time step [H ~> m or kg m-2]
+  real, dimension(SZI_(G),SZJ_(G),SZK_(GV)), intent(in)    :: eb !< The amount of fluid entrained from the layer
+                                                                 !! below within this time step [H ~> m or kg m-2]
+  real, dimension(SZI_(G),SZJ_(G),SZK_(GV)), intent(inout) :: T  !< Layer potential temperatures [C ~> degC].
+  real, dimension(SZI_(G),SZJ_(G),SZK_(GV)), intent(inout) :: S  !< Layer salinities [S ~> ppt].
+
+  ! Local variables
+  real :: b1(nii,njj)           ! A variable used by the tridiagonal solver [H-1 ~> m-1 or m2 kg-1].
+  real :: d1(nii,njj)           ! A variable used by the tridiagonal solver [nondim].
+  real :: c1(nii,njj,SZK_(GV))  ! A variable used by the tridiagonal solver [nondim].
   real :: h_tr, b_denom_1       ! Two temporary thicknesses [H ~> m or kg m-2].
   integer :: i, j, k
+  integer :: isb, ieb           ! The i-index bounds of the current block.
+  integer :: jsb, jeb           ! The j-index bounds of the current block.
+  integer :: ii, jj             ! Block-local i- and j-index loop variables.
 
   !$omp target enter data map(alloc: b1, d1, c1)
 
-  do concurrent(j=js:je )
-    do concurrent( i=is:ie ) DO_LOCALITY(local(h_tr))
-      h_tr = hold(i,j,1) + GV%H_subroundoff
-      b1(i,j) = 1.0 / (h_tr + eb(i,j,1))
-      d1(i,j) = h_tr * b1(i,j)
-      T(i,j,1) = (b1(i,j)*h_tr)*T(i,j,1)
-      S(i,j,1) = (b1(i,j)*h_tr)*S(i,j,1)
+  do jsb=js,je,njj ; do isb=is,ie,nii
+    jeb = min(je, jsb+njj-1) ; ieb = min(ie, isb+nii-1)
+
+    do concurrent( j=jsb:jeb ) DO_LOCALITY(local(jj))
+      jj = j - jsb + 1
+      do concurrent( i=isb:ieb ) DO_LOCALITY(local(h_tr,ii))
+        ii = i - isb + 1
+        h_tr = hold(i,j,1) + GV%H_subroundoff
+        b1(ii,jj) = 1.0 / (h_tr + eb(i,j,1))
+        d1(ii,jj) = h_tr * b1(ii,jj)
+        T(i,j,1) = (b1(ii,jj)*h_tr)*T(i,j,1)
+        S(i,j,1) = (b1(ii,jj)*h_tr)*S(i,j,1)
+      enddo
+      do k=2,GV%ke ; do concurrent( i=isb:ieb ) DO_LOCALITY(local(h_tr,b_denom_1,ii))
+        ii = i - isb + 1
+        c1(ii,jj,k) = eb(i,j,k-1) * b1(ii,jj)
+        h_tr = hold(i,j,k) + GV%H_subroundoff
+        b_denom_1 = h_tr + d1(ii,jj)*ea(i,j,k)
+        b1(ii,jj) = 1.0 / (b_denom_1 + eb(i,j,k))
+        d1(ii,jj) = b_denom_1 * b1(ii,jj)
+        T(i,j,k) = b1(ii,jj) * (h_tr*T(i,j,k) + ea(i,j,k)*T(i,j,k-1))
+        S(i,j,k) = b1(ii,jj) * (h_tr*S(i,j,k) + ea(i,j,k)*S(i,j,k-1))
+      enddo ; enddo
+      do k=GV%ke-1,1,-1 ; do concurrent( i=isb:ieb ) DO_LOCALITY(local(ii))
+        ii = i - isb + 1
+        T(i,j,k) = T(i,j,k) + c1(ii,jj,k+1)*T(i,j,k+1)
+        S(i,j,k) = S(i,j,k) + c1(ii,jj,k+1)*S(i,j,k+1)
+      enddo ; enddo
     enddo
-    do k=2,GV%ke ; do concurrent( i=is:ie ) DO_LOCALITY(local(h_tr,b_denom_1))
-      c1(i,j,k) = eb(i,j,k-1) * b1(i,j)
-      h_tr = hold(i,j,k) + GV%H_subroundoff
-      b_denom_1 = h_tr + d1(i,j)*ea(i,j,k)
-      b1(i,j) = 1.0 / (b_denom_1 + eb(i,j,k))
-      d1(i,j) = b_denom_1 * b1(i,j)
-      T(i,j,k) = b1(i,j) * (h_tr*T(i,j,k) + ea(i,j,k)*T(i,j,k-1))
-      S(i,j,k) = b1(i,j) * (h_tr*S(i,j,k) + ea(i,j,k)*S(i,j,k-1))
-    enddo ; enddo
-    do k=GV%ke-1,1,-1 ; do concurrent( i=is:ie )
-      T(i,j,k) = T(i,j,k) + c1(i,j,k+1)*T(i,j,k+1)
-      S(i,j,k) = S(i,j,k) + c1(i,j,k+1)*S(i,j,k+1)
-    enddo ; enddo
-  enddo
+  enddo ; enddo ! ij block loop
 
   !$omp target exit data map(delete: b1, d1, c1)
-end subroutine triDiagTS
+
+end subroutine triDiagTS_block
 
 !> This is a simple tri-diagonal solver for T and S, with mixing across interfaces but no net
 !! transfer of mass.
-subroutine triDiagTS_Eulerian(G, GV, is, ie, js, je, hold, ent, T, S)
+subroutine triDiagTS_Eulerian(G, GV, CS, is, ie, js, je, hold, ent, T, S)
   type(ocean_grid_type),                     intent(in)    :: G    !< The ocean's grid structure
   type(verticalGrid_type),                   intent(in)    :: GV   !< The ocean's vertical grid structure
+  type(diabatic_aux_CS),                     intent(in)    :: CS   !< The control structure returned by a
+                                                                   !! previous call to diabatic_aux_init.
   integer,                                   intent(in)    :: is   !< The start i-index to work on.
   integer,                                   intent(in)    :: ie   !< The end i-index to work on.
   integer,                                   intent(in)    :: js   !< The start j-index to work on.
@@ -468,40 +516,78 @@ subroutine triDiagTS_Eulerian(G, GV, is, ie, js, je, hold, ent, T, S)
   real, dimension(SZI_(G),SZJ_(G),SZK_(GV)), intent(inout) :: S    !< Layer salinities [S ~> ppt].
 
   ! Local variables
-  real :: b1(SZIB_(G), SZJB_(G))          ! A variable used by the tridiagonal solver [H-1 ~> m-1 or m2 kg-1].
-  real :: d1(SZIB_(G), SZJB_(G))          ! A variable used by the tridiagonal solver [nondim].
-  real :: c1(SZIB_(G), SZJB_(G), SZK_(GV))! A variable used by the tridiagonal solver [nondim].
+  integer :: nii, njj  ! The resolved i- and j-direction block sizes [nondim].
+
+  nii = CS%niblock ; if (nii == 0) nii = ie - is + 1
+  njj = CS%njblock ; if (njj == 0) njj = je - js + 1
+
+  call triDiagTS_Eulerian_block(G, GV, is, ie, js, je, nii, njj, hold, ent, T, S)
+
+end subroutine triDiagTS_Eulerian
+
+!> Solve the Eulerian tri-diagonal system for T and S, working on one i-j block of columns at a time.
+subroutine triDiagTS_Eulerian_block(G, GV, is, ie, js, je, nii, njj, hold, ent, T, S)
+  type(ocean_grid_type),                     intent(in)    :: G    !< The ocean's grid structure
+  type(verticalGrid_type),                   intent(in)    :: GV   !< The ocean's vertical grid structure
+  integer,                                   intent(in)    :: is   !< The start i-index to work on.
+  integer,                                   intent(in)    :: ie   !< The end i-index to work on.
+  integer,                                   intent(in)    :: js   !< The start j-index to work on.
+  integer,                                   intent(in)    :: je   !< The end j-index to work on.
+  integer,                                   intent(in)    :: nii  !< Size of the i-block [nondim].
+  integer,                                   intent(in)    :: njj  !< Size of the j-block [nondim].
+  real, dimension(SZI_(G),SZJ_(G),SZK_(GV)), intent(in)    :: hold !< The layer thicknesses before entrainment,
+                                                                   !! [H ~> m or kg m-2].
+  real, dimension(SZI_(G),SZJ_(G),SZK_(GV)+1), intent(in)  :: ent  !< The amount of fluid mixed across an interface
+                                                                   !! within this time step [H ~> m or kg m-2]
+  real, dimension(SZI_(G),SZJ_(G),SZK_(GV)), intent(inout) :: T    !< Layer potential temperatures [C ~> degC].
+  real, dimension(SZI_(G),SZJ_(G),SZK_(GV)), intent(inout) :: S    !< Layer salinities [S ~> ppt].
+
+  ! Local variables
+  real :: b1(nii,njj)           ! A variable used by the tridiagonal solver [H-1 ~> m-1 or m2 kg-1].
+  real :: d1(nii,njj)           ! A variable used by the tridiagonal solver [nondim].
+  real :: c1(nii,njj,SZK_(GV))  ! A variable used by the tridiagonal solver [nondim].
   real :: h_tr, b_denom_1       ! Two temporary thicknesses [H ~> m or kg m-2].
   integer :: i, j, k
+  integer :: isb, ieb           ! The i-index bounds of the current block.
+  integer :: jsb, jeb           ! The j-index bounds of the current block.
+  integer :: ii, jj             ! Block-local i- and j-index loop variables.
 
   !$omp target enter data map(alloc: b1, d1, c1)
 
-  do concurrent( j=js:je )
-    do concurrent( i=is:ie ) DO_LOCALITY(local(h_tr))
-      h_tr = hold(i,j,1) + GV%H_subroundoff
-      b1(i,j) = 1.0 / (h_tr + ent(i,j,2))
-      d1(i,j) = h_tr * b1(i,j)
-      T(i,j,1) = (b1(i,j)*h_tr)*T(i,j,1)
-      S(i,j,1) = (b1(i,j)*h_tr)*S(i,j,1)
+  do jsb=js,je,njj ; do isb=is,ie,nii
+    jeb = min(je, jsb+njj-1) ; ieb = min(ie, isb+nii-1)
+
+    do concurrent( j=jsb:jeb ) DO_LOCALITY(local(jj))
+      jj = j - jsb + 1
+      do concurrent( i=isb:ieb ) DO_LOCALITY(local(h_tr,ii))
+        ii = i - isb + 1
+        h_tr = hold(i,j,1) + GV%H_subroundoff
+        b1(ii,jj) = 1.0 / (h_tr + ent(i,j,2))
+        d1(ii,jj) = h_tr * b1(ii,jj)
+        T(i,j,1) = (b1(ii,jj)*h_tr)*T(i,j,1)
+        S(i,j,1) = (b1(ii,jj)*h_tr)*S(i,j,1)
+      enddo
+      do k=2,GV%ke ; do concurrent( i=isb:ieb ) DO_LOCALITY(local(h_tr,b_denom_1,ii))
+        ii = i - isb + 1
+        c1(ii,jj,k) = ent(i,j,K) * b1(ii,jj)
+        h_tr = hold(i,j,k) + GV%H_subroundoff
+        b_denom_1 = h_tr + d1(ii,jj)*ent(i,j,K)
+        b1(ii,jj) = 1.0 / (b_denom_1 + ent(i,j,K+1))
+        d1(ii,jj) = b_denom_1 * b1(ii,jj)
+        T(i,j,k) = b1(ii,jj) * (h_tr*T(i,j,k) + ent(i,j,K)*T(i,j,k-1))
+        S(i,j,k) = b1(ii,jj) * (h_tr*S(i,j,k) + ent(i,j,K)*S(i,j,k-1))
+      enddo ; enddo
+      do k=GV%ke-1,1,-1 ; do concurrent( i=isb:ieb ) DO_LOCALITY(local(ii))
+        ii = i - isb + 1
+        T(i,j,k) = T(i,j,k) + c1(ii,jj,k+1)*T(i,j,k+1)
+        S(i,j,k) = S(i,j,k) + c1(ii,jj,k+1)*S(i,j,k+1)
+      enddo ; enddo
     enddo
-    do k=2,GV%ke ; do concurrent( i=is:ie ) DO_LOCALITY(local(h_tr,b_denom_1))
-      c1(i,j,k) = ent(i,j,K) * b1(i,j)
-      h_tr = hold(i,j,k) + GV%H_subroundoff
-      b_denom_1 = h_tr + d1(i,j)*ent(i,j,K)
-      b1(i,j) = 1.0 / (b_denom_1 + ent(i,j,K+1))
-      d1(i,j) = b_denom_1 * b1(i,j)
-      T(i,j,k) = b1(i,j) * (h_tr*T(i,j,k) + ent(i,j,K)*T(i,j,k-1))
-      S(i,j,k) = b1(i,j) * (h_tr*S(i,j,k) + ent(i,j,K)*S(i,j,k-1))
-    enddo ; enddo
-    do k=GV%ke-1,1,-1 ; do concurrent( i=is:ie )
-      T(i,j,k) = T(i,j,k) + c1(i,j,k+1)*T(i,j,k+1)
-      S(i,j,k) = S(i,j,k) + c1(i,j,k+1)*S(i,j,k+1)
-    enddo ; enddo
-  enddo
+  enddo ; enddo ! ij block loop
 
   !$omp target exit data map(delete: b1, d1, c1)
 
-end subroutine triDiagTS_Eulerian
+end subroutine triDiagTS_Eulerian_block
 
 
 !>   This subroutine calculates u_h and v_h (velocities at thickness
@@ -1494,6 +1580,14 @@ subroutine diabatic_aux_init(Time, G, GV, US, param_file, diag, CS, useALEalgori
   character(len=32)  :: chl_varname ! Name of chl_a variable in chl_file.
   logical :: use_temperature     ! True if thermodynamics are enabled.
   integer :: isd, ied, jsd, jed, IsdB, IedB, JsdB, JedB, nz
+  integer, parameter :: default_niblock = 0 ! Default i block size for array calculations [nondim].
+#ifdef __NVCOMPILER_OPENMP_GPU
+  integer, parameter :: default_njblock = 0 ! Default j block size for array calculations [nondim].
+#else
+  ! A single row at a time recovers the loop structure and work array sizes that predate the
+  ! promotion of the row-sized work arrays in this module to whole-domain arrays.
+  integer, parameter :: default_njblock = 1 ! Default j block size for array calculations [nondim].
+#endif
   isd  = G%isd  ; ied  = G%ied  ; jsd  = G%jsd  ; jed  = G%jed ; nz = GV%ke
   IsdB = G%IsdB ; IedB = G%IedB ; JsdB = G%JsdB ; JedB = G%JedB
 
@@ -1514,6 +1608,21 @@ subroutine diabatic_aux_init(Time, G, GV, US, param_file, diag, CS, useALEalgori
 
   call get_param(param_file, mdl, "ENABLE_THERMODYNAMICS", use_temperature, &
                  "If true, temperature and salinity are used as state variables.", default=.true.)
+
+  call get_param(param_file, mdl, "DIABATIC_AUX_NIBLOCK", CS%niblock, &
+                 "The i-direction block size used in the auxiliary diabatic calculations. "//&
+                 "The default 0 setting is dynamic and fits the "//&
+                 "full computational i-domain length.", default=default_niblock, layoutParam=.true.)
+  call get_param(param_file, mdl, "DIABATIC_AUX_NJBLOCK", CS%njblock, &
+                 "The j-direction block size used in the auxiliary diabatic calculations. "//&
+                 "The default 0 setting is dynamic and fits the "//&
+                 "full computational j-domain length.", default=default_njblock, layoutParam=.true.)
+  if (CS%niblock < 0) &
+    call MOM_error(FATAL, "DIABATIC_AUX_NIBLOCK must be nonnegative; "//&
+                          "use 0 to select the default block size.")
+  if (CS%njblock < 0) &
+    call MOM_error(FATAL, "DIABATIC_AUX_NJBLOCK must be nonnegative; "//&
+                          "use 0 to select the default block size.")
 
   call get_param(param_file, mdl, "RECLAIM_FRAZIL", CS%reclaim_frazil, &
                  "If true, try to use any frazil heat deficit to cool any "//&
