@@ -714,6 +714,7 @@ subroutine diabatic_ALE_legacy(u, v, h, tv, BLD, fluxes, visc, ADp, CDp, dt, Tim
 
   if (CS%debug) call MOM_state_chksum("before find_uv_at_h", u, v, h, G, GV, US, haloshift=0)
 
+  !$omp target enter data map(alloc: u_h, v_h) if (CS%use_kappa_shear .or. CS%use_CVMix_shear)
   if (CS%use_kappa_shear .or. CS%use_CVMix_shear) then
     if (CS%use_geothermal) then
       call find_uv_at_h(u, v, h, u_h, v_h, G, GV, US, zero_mix=.true.)
@@ -728,6 +729,11 @@ subroutine diabatic_ALE_legacy(u, v, h, tv, BLD, fluxes, visc, ADp, CDp, dt, Tim
   ! Also changes: visc%Kd_shear, visc%Kv_shear and visc%Kv_slow
   if (CS%debug) &
     call MOM_state_chksum("before set_diffusivity", u, v, h, G, GV, US, haloshift=CS%halo_TS_diff)
+  !$omp target enter data map(to: tv)
+  !$omp target enter data map(to: tv%T, tv%S) if (associated(tv%T))
+  !$omp target enter data map(to: tv%eqn_of_state) if (associated(tv%eqn_of_state))
+  !$omp target enter data map(to: tv%p_surf) if (associated(tv%p_surf))
+  !$omp target enter data map(to: tv%SpV_avg) if (allocated(tv%SpV_avg))
   if (CS%double_diffuse) then
     call set_diffusivity(u, v, h, u_h, v_h, tv, fluxes, CS%optics, visc, dt, Kd_int, G, GV, US, &
                          CS%set_diff_CSp, CS%VBF, Kd_extra_T=Kd_extra_T, Kd_extra_S=Kd_extra_S)
@@ -735,6 +741,12 @@ subroutine diabatic_ALE_legacy(u, v, h, tv, BLD, fluxes, visc, ADp, CDp, dt, Tim
     call set_diffusivity(u, v, h, u_h, v_h, tv, fluxes, CS%optics, visc, dt, Kd_int, G, GV, US, &
                          CS%set_diff_CSp, CS%VBF)
   endif
+  !$omp target exit data map(release: tv%SpV_avg) if (allocated(tv%SpV_avg))
+  !$omp target exit data map(release: tv%p_surf) if (associated(tv%p_surf))
+  !$omp target exit data map(release: tv%eqn_of_state) if (associated(tv%eqn_of_state))
+  !$omp target exit data map(release: tv%T, tv%S) if (associated(tv%T))
+  !$omp target exit data map(release: tv)
+  !$omp target exit data map(delete: u_h, v_h) if (CS%use_kappa_shear .or. CS%use_CVMix_shear)
   call cpu_clock_end(id_clock_set_diffusivity)
   if (showCallTree) call callTree_waypoint("done with set_diffusivity (diabatic)")
 
@@ -1452,6 +1464,7 @@ subroutine diabatic_ALE(u, v, h, tv, BLD, fluxes, visc, ADp, CDp, dt, Time_end, 
 
   if (CS%debug) call MOM_state_chksum("before find_uv_at_h", u, v, h, G, GV, US, haloshift=0)
 
+  !$omp target enter data map(alloc: u_h, v_h) if (CS%use_kappa_shear .or. CS%use_CVMix_shear)
   if (CS%use_kappa_shear .or. CS%use_CVMix_shear) then
     if (CS%use_geothermal) then
       call find_uv_at_h(u, v, h, u_h, v_h, G, GV, US, zero_mix=.true.)
@@ -1466,6 +1479,11 @@ subroutine diabatic_ALE(u, v, h, tv, BLD, fluxes, visc, ADp, CDp, dt, Time_end, 
   ! Also changes: visc%Kd_shear, visc%Kv_shear and visc%Kv_slow
   if (CS%debug) &
     call MOM_state_chksum("before set_diffusivity", u, v, h, G, GV, US, haloshift=CS%halo_TS_diff)
+  !$omp target enter data map(to: tv)
+  !$omp target enter data map(to: tv%T, tv%S) if (associated(tv%T))
+  !$omp target enter data map(to: tv%eqn_of_state) if (associated(tv%eqn_of_state))
+  !$omp target enter data map(to: tv%p_surf) if (associated(tv%p_surf))
+  !$omp target enter data map(to: tv%SpV_avg) if (allocated(tv%SpV_avg))
   if (CS%double_diffuse) then
     call set_diffusivity(u, v, h, u_h, v_h, tv, fluxes, CS%optics, visc, dt, Kd_heat, G, GV, US, &
                          CS%set_diff_CSp, CS%VBF, Kd_extra_T=Kd_extra_T, Kd_extra_S=Kd_extra_S)
@@ -1473,6 +1491,12 @@ subroutine diabatic_ALE(u, v, h, tv, BLD, fluxes, visc, ADp, CDp, dt, Time_end, 
     call set_diffusivity(u, v, h, u_h, v_h, tv, fluxes, CS%optics, visc, dt, Kd_heat, G, GV, US, &
                          CS%set_diff_CSp, CS%VBF)
   endif
+  !$omp target exit data map(release: tv%SpV_avg) if (allocated(tv%SpV_avg))
+  !$omp target exit data map(release: tv%p_surf) if (associated(tv%p_surf))
+  !$omp target exit data map(release: tv%eqn_of_state) if (associated(tv%eqn_of_state))
+  !$omp target exit data map(release: tv%T, tv%S) if (associated(tv%T))
+  !$omp target exit data map(release: tv)
+  !$omp target exit data map(delete: u_h, v_h) if (CS%use_kappa_shear .or. CS%use_CVMix_shear)
   call cpu_clock_end(id_clock_set_diffusivity)
   if (showCallTree) call callTree_waypoint("done with set_diffusivity (diabatic)")
 
@@ -2065,6 +2089,8 @@ subroutine layered_diabatic(u, v, h, tv, BLD, fluxes, visc, ADp, CDp, dt, Time_e
   dz_neglect = GV%dZ_subroundoff ; dz_neglect2 = dz_neglect*dz_neglect
   Kd_heat(:,:,:) = 0.0 ; Kd_salt(:,:,:) = 0.0
 
+  !$omp target enter data map(alloc: Kd_lay)
+
   showCallTree = callTree_showQuery()
   if (showCallTree) call callTree_enter("layered_diabatic(), MOM_diabatic_driver.F90")
 
@@ -2148,6 +2174,7 @@ subroutine layered_diabatic(u, v, h, tv, BLD, fluxes, visc, ADp, CDp, dt, Time_e
 
   if (CS%debug) &
     call MOM_state_chksum("before find_uv_at_h", u, v, h, G, GV, US, haloshift=0)
+  !$omp target enter data map(alloc: u_h, v_h) if (CS%use_kappa_shear .or. CS%use_CVMix_shear)
   if (CS%use_kappa_shear .or. CS%use_CVMix_shear) then
     if ((CS%ML_mix_first > 0.0) .or. CS%use_geothermal) then
       call find_uv_at_h(u, v, h_orig, u_h, v_h, G, GV, US, eaml, ebml)
@@ -2177,6 +2204,11 @@ subroutine layered_diabatic(u, v, h, tv, BLD, fluxes, visc, ADp, CDp, dt, Time_e
 
   if (CS%debug) &
     call MOM_state_chksum("before set_diffusivity", u, v, h, G, GV, US, haloshift=CS%halo_TS_diff)
+  !$omp target enter data map(to: tv)
+  !$omp target enter data map(to: tv%T, tv%S) if (associated(tv%T))
+  !$omp target enter data map(to: tv%eqn_of_state) if (associated(tv%eqn_of_state))
+  !$omp target enter data map(to: tv%p_surf) if (associated(tv%p_surf))
+  !$omp target enter data map(to: tv%SpV_avg) if (allocated(tv%SpV_avg))
   if (CS%double_diffuse) then
     call set_diffusivity(u, v, h, u_h, v_h, tv, fluxes, CS%optics, visc, dt, Kd_int, G, GV, US, &
                          CS%set_diff_CSp, CS%VBF, Kd_lay=Kd_lay, Kd_extra_T=Kd_extra_T, Kd_extra_S=Kd_extra_S)
@@ -2184,6 +2216,14 @@ subroutine layered_diabatic(u, v, h, tv, BLD, fluxes, visc, ADp, CDp, dt, Time_e
     call set_diffusivity(u, v, h, u_h, v_h, tv, fluxes, CS%optics, visc, dt, Kd_int, G, GV, US, &
                          CS%set_diff_CSp, CS%VBF, Kd_lay=Kd_lay)
   endif
+  !$omp target exit data map(release: tv%SpV_avg) if (allocated(tv%SpV_avg))
+  !$omp target exit data map(release: tv%p_surf) if (associated(tv%p_surf))
+  !$omp target exit data map(release: tv%eqn_of_state) if (associated(tv%eqn_of_state))
+  !$omp target exit data map(release: tv%T, tv%S) if (associated(tv%T))
+  !$omp target exit data map(release: tv)
+  !$omp target exit data map(delete: u_h, v_h) if (CS%use_kappa_shear .or. CS%use_CVMix_shear)
+  !$omp target update from(Kd_lay)
+
   call cpu_clock_end(id_clock_set_diffusivity)
   if (showCallTree) call callTree_waypoint("done with set_diffusivity (diabatic)")
 
@@ -2932,6 +2972,8 @@ subroutine layered_diabatic(u, v, h, tv, BLD, fluxes, visc, ADp, CDp, dt, Time_e
   call disable_averaging(CS%diag)
 
   if (showCallTree) call callTree_leave("layered_diabatic()")
+
+  !$omp target exit data map(delete: Kd_lay)
 
 end subroutine layered_diabatic
 
