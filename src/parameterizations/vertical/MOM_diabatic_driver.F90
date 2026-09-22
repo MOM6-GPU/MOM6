@@ -950,13 +950,40 @@ subroutine diabatic_ALE_legacy(u, v, h, tv, BLD, fluxes, visc, ADp, CDp, dt, Tim
   ! Changes made to following fields:  h, tv%T and tv%S.
   call cpu_clock_begin(id_clock_remap)
 
+  !   The state and the forcing fields that applyBoundaryFluxesInOut works with are moved onto
+  ! the device here, rather than inside that routine, so that the transfers that remain are
+  ! visible at the call site.  Each pointer or allocatable component is mapped under the same
+  ! test that gates its use, because an unassociated pointer component can not be mapped.
+  !$omp target update to(h)
+  !$omp target enter data map(to: tv, tv%T, tv%S)
+  !$omp target enter data if(associated(tv%p_surf)) map(to: tv%p_surf)
+  !$omp target enter data if(allocated(tv%SpV_avg)) map(to: tv%SpV_avg)
+  !$omp target enter data if(associated(tv%TempxPmE)) map(to: tv%TempxPmE)
+  !$omp target enter data map(to: fluxes, fluxes%netMassOut, fluxes%netMassIn)
+  !$omp target enter data if(associated(fluxes%salt_left_behind)) map(to: fluxes%salt_left_behind)
+  !$omp target enter data if(associated(fluxes%lrunoff)) map(to: fluxes%lrunoff)
+  !$omp target enter data if(associated(fluxes%frunoff)) map(to: fluxes%frunoff)
+  !$omp target enter data if(associated(fluxes%lrunoff_glc)) map(to: fluxes%lrunoff_glc)
+  !$omp target enter data if(associated(fluxes%frunoff_glc)) map(to: fluxes%frunoff_glc)
+  !$omp target enter data if(associated(fluxes%heat_content_massout)) map(to: fluxes%heat_content_massout)
+  !$omp target enter data if(associated(fluxes%heat_content_massin)) map(to: fluxes%heat_content_massin)
+  !$omp target enter data if(associated(visc%h_ML_param)) map(to: visc%h_ML_param)
   if (CS%use_energetic_PBL) then
 
     skinbuoyflux(:,:) = 0.0
+    !   cTKE, dSV_dT, dSV_dS and SkinBuoyFlux are outputs of applyBoundaryFluxesInOut, which
+    ! sets them all on the device, so they only need device storage here.
+    !$omp target enter data map(alloc: SkinBuoyFlux, cTKE, dSV_dT, dSV_dS)
     call applyBoundaryFluxesInOut(CS%diabatic_aux_CSp, G, GV, US, dt, fluxes, CS%optics, &
             optics_nbands(CS%optics), h, tv, CS%aggregate_FW_forcing, CS%evap_CFL_limit, &
             CS%minimum_forcing_depth, cTKE, dSV_dT, dSV_dS, SkinBuoyFlux=SkinBuoyFlux, MLD_h=visc%h_ML_param)
-
+    !$omp target update from(SkinBuoyFlux, cTKE, dSV_dT, dSV_dS)
+    !$omp target update from(tv%T, tv%S, h)
+    !$omp target update from(fluxes%netMassIn, fluxes%netMassOut)
+    !$omp target update if(associated(tv%TempxPmE)) from(tv%TempxPmE)
+    !$omp target update if(associated(fluxes%heat_content_massin)) from(fluxes%heat_content_massin)
+    !$omp target update if(associated(fluxes%heat_content_massout)) from(fluxes%heat_content_massout)
+    !$omp target exit data map(delete: SkinBuoyFlux, cTKE, dSV_dT, dSV_dS)
     if (CS%debug) then
       call hchksum(ent_t, "after applyBoundaryFluxes ent_t", G%HI, haloshift=0, unscale=GV%H_to_mks)
       call hchksum(ent_s, "after applyBoundaryFluxes ent_s", G%HI, haloshift=0, unscale=GV%H_to_mks)
@@ -1017,11 +1044,32 @@ subroutine diabatic_ALE_legacy(u, v, h, tv, BLD, fluxes, visc, ADp, CDp, dt, Tim
     call applyBoundaryFluxesInOut(CS%diabatic_aux_CSp, G, GV, US, dt, fluxes, CS%optics, &
                                   optics_nbands(CS%optics), h, tv, CS%aggregate_FW_forcing, &
                                   CS%evap_CFL_limit, CS%minimum_forcing_depth, MLD_h=visc%h_ML_param)
+    !$omp target update from(tv%T, tv%S, h)
+    !$omp target update from(fluxes%netMassIn, fluxes%netMassOut)
+    !$omp target update if(associated(tv%TempxPmE)) from(tv%TempxPmE)
+    !$omp target update if(associated(fluxes%heat_content_massin)) from(fluxes%heat_content_massin)
+    !$omp target update if(associated(fluxes%heat_content_massout)) from(fluxes%heat_content_massout)
 
     ! Find the vertical distances across layers, which may have been modified by the net surface flux
     call thickness_to_dz(h, tv, dz, G, GV, US)
 
   endif   ! endif for CS%use_energetic_PBL
+  !   Release the state and the forcing, in the reverse of the order in which they were mapped.
+  ! Nothing is copied back here, because everything that the device wrote has already been
+  ! brought back with a target update above.
+  !$omp target exit data if(associated(visc%h_ML_param)) map(release: visc%h_ML_param)
+  !$omp target exit data if(associated(fluxes%heat_content_massin)) map(release: fluxes%heat_content_massin)
+  !$omp target exit data if(associated(fluxes%heat_content_massout)) map(release: fluxes%heat_content_massout)
+  !$omp target exit data if(associated(fluxes%frunoff_glc)) map(release: fluxes%frunoff_glc)
+  !$omp target exit data if(associated(fluxes%lrunoff_glc)) map(release: fluxes%lrunoff_glc)
+  !$omp target exit data if(associated(fluxes%frunoff)) map(release: fluxes%frunoff)
+  !$omp target exit data if(associated(fluxes%lrunoff)) map(release: fluxes%lrunoff)
+  !$omp target exit data if(associated(fluxes%salt_left_behind)) map(release: fluxes%salt_left_behind)
+  !$omp target exit data map(release: fluxes%netMassOut, fluxes%netMassIn, fluxes)
+  !$omp target exit data if(associated(tv%TempxPmE)) map(release: tv%TempxPmE)
+  !$omp target exit data if(allocated(tv%SpV_avg)) map(release: tv%SpV_avg)
+  !$omp target exit data if(associated(tv%p_surf)) map(release: tv%p_surf)
+  !$omp target exit data map(release: tv%S, tv%T, tv)
 
   ! diagnose the tendencies due to boundary forcing
   ! At this point, the diagnostic grids have not been updated since the call to the boundary layer scheme
@@ -1645,12 +1693,40 @@ subroutine diabatic_ALE(u, v, h, tv, BLD, fluxes, visc, ADp, CDp, dt, Time_end, 
   ! Changes made to following fields:  h, tv%T and tv%S.
   call cpu_clock_begin(id_clock_remap)
 
+  !   The state and the forcing fields that applyBoundaryFluxesInOut works with are moved onto
+  ! the device here, rather than inside that routine, so that the transfers that remain are
+  ! visible at the call site.  Each pointer or allocatable component is mapped under the same
+  ! test that gates its use, because an unassociated pointer component can not be mapped.
+  !$omp target update to(h)
+  !$omp target enter data map(to: tv, tv%T, tv%S)
+  !$omp target enter data if(associated(tv%p_surf)) map(to: tv%p_surf)
+  !$omp target enter data if(allocated(tv%SpV_avg)) map(to: tv%SpV_avg)
+  !$omp target enter data if(associated(tv%TempxPmE)) map(to: tv%TempxPmE)
+  !$omp target enter data map(to: fluxes, fluxes%netMassOut, fluxes%netMassIn)
+  !$omp target enter data if(associated(fluxes%salt_left_behind)) map(to: fluxes%salt_left_behind)
+  !$omp target enter data if(associated(fluxes%lrunoff)) map(to: fluxes%lrunoff)
+  !$omp target enter data if(associated(fluxes%frunoff)) map(to: fluxes%frunoff)
+  !$omp target enter data if(associated(fluxes%lrunoff_glc)) map(to: fluxes%lrunoff_glc)
+  !$omp target enter data if(associated(fluxes%frunoff_glc)) map(to: fluxes%frunoff_glc)
+  !$omp target enter data if(associated(fluxes%heat_content_massout)) map(to: fluxes%heat_content_massout)
+  !$omp target enter data if(associated(fluxes%heat_content_massin)) map(to: fluxes%heat_content_massin)
+  !$omp target enter data if(associated(visc%h_ML_param)) map(to: visc%h_ML_param)
   if (CS%use_energetic_PBL) then
 
     skinbuoyflux(:,:) = 0.0
+    !   cTKE, dSV_dT, dSV_dS and SkinBuoyFlux are outputs of applyBoundaryFluxesInOut, which
+    ! sets them all on the device, so they only need device storage here.
+    !$omp target enter data map(alloc: SkinBuoyFlux, cTKE, dSV_dT, dSV_dS)
     call applyBoundaryFluxesInOut(CS%diabatic_aux_CSp, G, GV, US, dt, fluxes, CS%optics, &
             optics_nbands(CS%optics), h, tv, CS%aggregate_FW_forcing, CS%evap_CFL_limit, &
             CS%minimum_forcing_depth, cTKE, dSV_dT, dSV_dS, SkinBuoyFlux=SkinBuoyFlux, MLD_h=visc%h_ML_param)
+    !$omp target update from(SkinBuoyFlux, cTKE, dSV_dT, dSV_dS)
+    !$omp target update from(tv%T, tv%S, h)
+    !$omp target update from(fluxes%netMassIn, fluxes%netMassOut)
+    !$omp target update if(associated(tv%TempxPmE)) from(tv%TempxPmE)
+    !$omp target update if(associated(fluxes%heat_content_massin)) from(fluxes%heat_content_massin)
+    !$omp target update if(associated(fluxes%heat_content_massout)) from(fluxes%heat_content_massout)
+    !$omp target exit data map(delete: SkinBuoyFlux, cTKE, dSV_dT, dSV_dS)
 
     if (CS%debug) then
       call hchksum(ent_t, "after applyBoundaryFluxes ent_t", G%HI, haloshift=0, unscale=GV%H_to_MKS)
@@ -1698,8 +1774,29 @@ subroutine diabatic_ALE(u, v, h, tv, BLD, fluxes, visc, ADp, CDp, dt, Time_end, 
     call applyBoundaryFluxesInOut(CS%diabatic_aux_CSp, G, GV, US, dt, fluxes, CS%optics, &
                                   optics_nbands(CS%optics), h, tv, CS%aggregate_FW_forcing, &
                                   CS%evap_CFL_limit, CS%minimum_forcing_depth, MLD_h=visc%h_ML_param)
+    !$omp target update from(tv%T, tv%S, h)
+    !$omp target update from(fluxes%netMassIn, fluxes%netMassOut)
+    !$omp target update if(associated(tv%TempxPmE)) from(tv%TempxPmE)
+    !$omp target update if(associated(fluxes%heat_content_massin)) from(fluxes%heat_content_massin)
+    !$omp target update if(associated(fluxes%heat_content_massout)) from(fluxes%heat_content_massout)
 
   endif   ! endif for CS%use_energetic_PBL
+  !   Release the state and the forcing, in the reverse of the order in which they were mapped.
+  ! Nothing is copied back here, because everything that the device wrote has already been
+  ! brought back with a target update above.
+  !$omp target exit data if(associated(visc%h_ML_param)) map(release: visc%h_ML_param)
+  !$omp target exit data if(associated(fluxes%heat_content_massin)) map(release: fluxes%heat_content_massin)
+  !$omp target exit data if(associated(fluxes%heat_content_massout)) map(release: fluxes%heat_content_massout)
+  !$omp target exit data if(associated(fluxes%frunoff_glc)) map(release: fluxes%frunoff_glc)
+  !$omp target exit data if(associated(fluxes%lrunoff_glc)) map(release: fluxes%lrunoff_glc)
+  !$omp target exit data if(associated(fluxes%frunoff)) map(release: fluxes%frunoff)
+  !$omp target exit data if(associated(fluxes%lrunoff)) map(release: fluxes%lrunoff)
+  !$omp target exit data if(associated(fluxes%salt_left_behind)) map(release: fluxes%salt_left_behind)
+  !$omp target exit data map(release: fluxes%netMassOut, fluxes%netMassIn, fluxes)
+  !$omp target exit data if(associated(tv%TempxPmE)) map(release: tv%TempxPmE)
+  !$omp target exit data if(allocated(tv%SpV_avg)) map(release: tv%SpV_avg)
+  !$omp target exit data if(associated(tv%p_surf)) map(release: tv%p_surf)
+  !$omp target exit data map(release: tv%S, tv%T, tv)
 
   ! diagnose the tendencies due to boundary forcing
   ! At this point, the diagnostic grids have not been updated since the call to the boundary layer scheme

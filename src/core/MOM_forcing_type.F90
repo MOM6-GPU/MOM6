@@ -759,9 +759,40 @@ subroutine extractFluxes_3d(G, GV, US, fluxes, optics, nsw, jsa, jea, dt, &
 
   !$omp target enter data map(alloc: Pen_SW_tot, rescale)
 
+  !   The forcing fields that the kernel below uses are mapped to the device here, each under
+  ! the same test that gates its use, because an unassociated pointer component can not be
+  ! mapped.  This is also why that kernel is written with an explicit OpenMP target construct
+  ! rather than as a do concurrent loop: nvfortran deep-copies every derived type component
+  ! that a do concurrent mentions, including ones in branches that are never taken, and
+  ! mapping a null pointer aborts the run.
+  !$omp target enter data map(to: fluxes, fluxes%sw, fluxes%lw, fluxes%latent, fluxes%sens, &
+  !$omp                           fluxes%evap, fluxes%lprec, fluxes%fprec, fluxes%vprec)
+  !$omp target enter data if(associated(fluxes%lrunoff)) map(to: fluxes%lrunoff)
+  !$omp target enter data if(associated(fluxes%frunoff)) map(to: fluxes%frunoff)
+  !$omp target enter data if(associated(fluxes%lrunoff_glc)) map(to: fluxes%lrunoff_glc)
+  !$omp target enter data if(associated(fluxes%frunoff_glc)) map(to: fluxes%frunoff_glc)
+  !$omp target enter data if(associated(fluxes%seaice_melt)) map(to: fluxes%seaice_melt)
+  !$omp target enter data if(use_melt_heat) map(to: fluxes%seaice_melt_heat)
+  !$omp target enter data if(use_salt_flux) map(to: fluxes%salt_flux)
+  !$omp target enter data if(use_heat_added) map(to: fluxes%heat_added)
+  !$omp target enter data if(.not.do_enthalpy) map(to: fluxes%heat_content_evap)
+  !$omp target enter data if(use_hc_massin) map(to: fluxes%heat_content_massin)
+  !$omp target enter data if(use_hc_massout) map(to: fluxes%heat_content_massout)
+  !$omp target enter data if(use_hc_lprec) map(to: fluxes%heat_content_lprec)
+  !$omp target enter data if(use_hc_fprec) map(to: fluxes%heat_content_fprec)
+  !$omp target enter data if(use_hc_vprec) map(to: fluxes%heat_content_vprec)
+  !$omp target enter data if(use_hc_cond) map(to: fluxes%heat_content_cond)
+  !$omp target enter data if(use_hc_lrunoff) map(to: fluxes%heat_content_lrunoff)
+  !$omp target enter data if(use_hc_lrunoff_glc) map(to: fluxes%heat_content_lrunoff_glc)
+  !$omp target enter data if(use_hc_frunoff) map(to: fluxes%heat_content_frunoff)
+  !$omp target enter data if(use_hc_frunoff_glc) map(to: fluxes%heat_content_frunoff_glc)
+  !$omp target enter data if(use_TempxPmE) map(to: tv, tv%TempxPmE)
+
   ! The penetrating shortwave radiation is taken directly from the optics type here, rather
   ! than via extract_optics_slice, because that routine works on a j-row of slice workspace.
-  do concurrent (j=js:je, i=is:ie) local(k, n, htot, scale, Pen_SW_tot_rate)
+  !$omp target teams distribute parallel do collapse(2) &
+  !$omp                              private(i, j, k, n, htot, scale, Pen_SW_tot_rate)
+  do j=js,je ; do i=is,ie
 
     htot = h(i,j,1)
     do k=2,nz ; htot = htot + h(i,j,k) ; enddo
@@ -1097,7 +1128,20 @@ subroutine extractFluxes_3d(G, GV, US, fluxes, optics, nsw, jsa, jea, dt, &
 
     endif ! calculate_diags and do_enthalpy
 
-  enddo ! i- and j-loop
+  enddo ; enddo ! i- and j-loop
+
+  ! Copy back the fields that the kernel wrote, before the host reads any of them.
+  !$omp target update if(use_hc_massin) from(fluxes%heat_content_massin)
+  !$omp target update if(use_hc_massout) from(fluxes%heat_content_massout)
+  !$omp target update if(use_hc_lprec) from(fluxes%heat_content_lprec)
+  !$omp target update if(use_hc_fprec) from(fluxes%heat_content_fprec)
+  !$omp target update if(use_hc_vprec) from(fluxes%heat_content_vprec)
+  !$omp target update if(use_hc_cond) from(fluxes%heat_content_cond)
+  !$omp target update if(use_hc_lrunoff) from(fluxes%heat_content_lrunoff)
+  !$omp target update if(use_hc_lrunoff_glc) from(fluxes%heat_content_lrunoff_glc)
+  !$omp target update if(use_hc_frunoff) from(fluxes%heat_content_frunoff)
+  !$omp target update if(use_hc_frunoff_glc) from(fluxes%heat_content_frunoff_glc)
+  !$omp target update if(use_TempxPmE) from(tv%TempxPmE)
 
   ! The check that the penetrating shortwave radiation does not exceed the total shortwave
   ! radiation is done here on the host rather than inside of the kernel above, because it
@@ -1121,6 +1165,29 @@ subroutine extractFluxes_3d(G, GV, US, fluxes, optics, nsw, jsa, jea, dt, &
       endif
     enddo ; enddo ! i- and j-loop for the shortwave consistency check
   endif
+
+  !$omp target exit data if(use_TempxPmE) map(release: tv%TempxPmE, tv)
+  !$omp target exit data if(use_hc_frunoff_glc) map(release: fluxes%heat_content_frunoff_glc)
+  !$omp target exit data if(use_hc_frunoff) map(release: fluxes%heat_content_frunoff)
+  !$omp target exit data if(use_hc_lrunoff_glc) map(release: fluxes%heat_content_lrunoff_glc)
+  !$omp target exit data if(use_hc_lrunoff) map(release: fluxes%heat_content_lrunoff)
+  !$omp target exit data if(use_hc_cond) map(release: fluxes%heat_content_cond)
+  !$omp target exit data if(use_hc_vprec) map(release: fluxes%heat_content_vprec)
+  !$omp target exit data if(use_hc_fprec) map(release: fluxes%heat_content_fprec)
+  !$omp target exit data if(use_hc_lprec) map(release: fluxes%heat_content_lprec)
+  !$omp target exit data if(use_hc_massout) map(release: fluxes%heat_content_massout)
+  !$omp target exit data if(use_hc_massin) map(release: fluxes%heat_content_massin)
+  !$omp target exit data if(.not.do_enthalpy) map(release: fluxes%heat_content_evap)
+  !$omp target exit data if(use_heat_added) map(release: fluxes%heat_added)
+  !$omp target exit data if(use_salt_flux) map(release: fluxes%salt_flux)
+  !$omp target exit data if(use_melt_heat) map(release: fluxes%seaice_melt_heat)
+  !$omp target exit data if(associated(fluxes%seaice_melt)) map(release: fluxes%seaice_melt)
+  !$omp target exit data if(associated(fluxes%frunoff_glc)) map(release: fluxes%frunoff_glc)
+  !$omp target exit data if(associated(fluxes%lrunoff_glc)) map(release: fluxes%lrunoff_glc)
+  !$omp target exit data if(associated(fluxes%frunoff)) map(release: fluxes%frunoff)
+  !$omp target exit data if(associated(fluxes%lrunoff)) map(release: fluxes%lrunoff)
+  !$omp target exit data map(release: fluxes%vprec, fluxes%fprec, fluxes%lprec, fluxes%evap, &
+  !$omp                               fluxes%sens, fluxes%latent, fluxes%lw, fluxes%sw, fluxes)
 
   !$omp target exit data map(delete: Pen_SW_tot, rescale)
 

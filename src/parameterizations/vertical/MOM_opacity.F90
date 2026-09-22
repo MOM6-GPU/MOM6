@@ -979,7 +979,6 @@ subroutine absorbRemainingSW_3d(G, GV, US, h, opacity_band, nsw, optics, dt, H_l
                             ! the water column [C H ~> degC m or degC kg m-2]
   logical :: TKE_calc       ! If true, calculate the implications to the
                             ! TKE budget of the shortwave heating.
-  logical :: old_answers    ! If true, use the order of arithmetic from before 2019.
   real :: C1_6, C1_60       ! Rational fractions [nondim]
   integer :: is, ie, js, je, ks, ke, i, j, k, n
 
@@ -991,7 +990,6 @@ subroutine absorbRemainingSW_3d(G, GV, US, h, opacity_band, nsw, optics, dt, H_l
 
   min_SW_heat = optics%PenSW_flux_absorb * dt
   I_Habs = optics%PenSW_absorb_Invlen
-  old_answers = (optics%answer_date < 20190101)
 
   h_min_heat = 2.0*GV%Angstrom_H + GV%H_subroundoff
   C1_6 = 1.0 / 6.0 ; C1_60 = 1.0 / 60.0
@@ -1002,7 +1000,7 @@ subroutine absorbRemainingSW_3d(G, GV, US, h, opacity_band, nsw, optics, dt, H_l
 
   TKE_calc = (present(TKE) .and. present(dSV_dT))
 
-  if (old_answers) then
+  if (optics%answer_date < 20190101) then
     g_Hconv2 = (GV%g_Earth_Z_T2 * GV%H_to_RZ) * GV%H_to_RZ
   else
     g_Hconv2 = GV%g_Earth_Z_T2 * GV%H_to_RZ**2
@@ -1031,7 +1029,7 @@ subroutine absorbRemainingSW_3d(G, GV, US, h, opacity_band, nsw, optics, dt, H_l
 
           ! Heating at a very small rate can be absorbed by a sufficiently thick layer or several
           ! thin layers without further penetration.
-          if (old_answers) then
+          if (optics%answer_date < 20190101) then
             if (nsw*Pen_SW_bnd(n,i,j)*SW_trans < min_SW_heat*min(1.0, I_Habs*h(i,j,k)) ) SW_trans = 0.0
           elseif ((nsw*Pen_SW_bnd(n,i,j)*SW_trans < min_SW_heat) .and. (h(i,j,k) > h_min_heat)) then
             if (nsw*Pen_SW_bnd(n,i,j) <= min_SW_heat * (I_Habs*(h(i,j,k) - h_min_heat))) then

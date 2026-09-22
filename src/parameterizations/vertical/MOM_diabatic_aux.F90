@@ -13,19 +13,19 @@ use MOM_cpu_clock,     only : cpu_clock_id, cpu_clock_begin, cpu_clock_end
 use MOM_cpu_clock,     only : CLOCK_MODULE_DRIVER, CLOCK_MODULE, CLOCK_ROUTINE
 use MOM_diag_mediator, only : post_data, register_diag_field, safe_alloc_ptr
 use MOM_diag_mediator, only : diag_ctrl, time_type
-use MOM_EOS,           only : calculate_density, calculate_TFreeze, EOS_domain
+use MOM_EOS,           only : calculate_density, calculate_TFreeze
 use MOM_EOS,           only : calculate_specific_vol_derivs, calculate_density_derivs
 use MOM_error_handler, only : MOM_error, FATAL, WARNING, NOTE, callTree_showQuery
 use MOM_error_handler, only : callTree_enter, callTree_leave, callTree_waypoint
 use MOM_file_parser,   only : get_param, log_param, log_version, param_file_type
-use MOM_forcing_type,  only : forcing, extractFluxes1d, forcing_SinglePointPrint
+use MOM_forcing_type,  only : forcing, extractFluxes_3d, forcing_SinglePointPrint
 use MOM_grid,          only : ocean_grid_type
 use MOM_interface_heights, only : thickness_to_dz
 use MOM_interpolate,   only : init_external_field, time_interp_external, time_interp_external_init
 use MOM_interpolate,   only : external_field
 use MOM_io,            only : slasher
-use MOM_opacity,       only : set_opacity, opacity_CS, extract_optics_slice, extract_optics_fields
-use MOM_opacity,       only : optics_type, optics_nbands, absorbRemainingSW, sumSWoverBands
+use MOM_opacity,       only : set_opacity, opacity_CS, extract_optics_fields
+use MOM_opacity,       only : optics_type, optics_nbands, absorbRemainingSW_3d, sumSWoverBands
 use MOM_tracer_flow_control, only : get_chl_from_model, tracer_flow_control_CS
 use MOM_unit_scaling,  only : unit_scale_type
 use MOM_variables,     only : thermo_var_ptrs
@@ -943,10 +943,9 @@ subroutine applyBoundaryFluxesInOut(CS, G, GV, US, dt, fluxes, optics, nsw, h, t
   real :: EnthalpyConst  ! A constant used to control the enthalpy calculation [nondim]
                          ! By default EnthalpyConst = 1.0. If fluxes%heat_content_evap
                          ! is associated enthalpy is provided via coupler and EnthalpyConst = 0.0.
-  real, dimension(SZI_(G)) :: &
-    d_pres,       &  ! pressure change across a layer [R L2 T-2 ~> Pa]
-    p_lay,        &  ! average pressure in a layer [R L2 T-2 ~> Pa]
-    pres,         &  ! pressure at an interface [R L2 T-2 ~> Pa]
+  real :: d_pres     ! The pressure change across a layer [R L2 T-2 ~> Pa]
+  real :: pres       ! The pressure at an interface [R L2 T-2 ~> Pa]
+  real, dimension(SZI_(G),SZJ_(G)) :: &
     netMassInOut, &  ! surface water fluxes [H ~> m or kg m-2] over time step
     netMassIn,    &  ! mass entering ocean surface [H ~> m or kg m-2] over a time step
     netMassOut,   &  ! mass leaving ocean surface [H ~> m or kg m-2] over a time step
@@ -956,33 +955,57 @@ subroutine applyBoundaryFluxesInOut(CS, G, GV, US, dt, fluxes, optics, nsw, h, t
                      ! [S H ~> ppt m or ppt kg m-2]
     nonpenSW,     &  ! non-downwelling SW, which is absorbed at ocean surface
                      ! [C H ~> degC m or degC kg m-2]
+    netheat_rate, &  ! netheat but for dt=1 [C H T-1 ~> degC m s-1 or degC kg m-2 s-1]
+    netsalt_rate, &  ! netsalt but for dt=1 (e.g. returns a rate)
+                     ! [S H T-1 ~> ppt m s-1 or ppt kg m-2 s-1]
+    netMassInOut_rate, & ! netmassinout but for dt=1 [H T-1 ~> m s-1 or kg m-2 s-1]
+    netPen_rate      ! The surface penetrative shortwave heating rate summed over all bands
+                     ! [C H T-1 ~> degC m s-1 or degC kg m-2 s-1]
+  real, dimension(SZI_(G),SZJ_(G),1) :: &
     SurfPressure, &  ! Surface pressure (approximated as 0.0) [R L2 T-2 ~> Pa]
     dRhodT,       &  ! change in density per change in temperature [R C-1 ~> kg m-3 degC-1]
     dRhodS,       &  ! change in density per change in salinity [R S-1 ~> kg m-3 ppt-1]
     dSpV_dT,      &  ! Partial derivative of specific volume with temperature [R-1 C-1 ~> m3 kg-1 degC-1]
-    dSpV_dS,      &  ! Partial derivative of specific volume with to salinity [R-1 S-1 ~> m3 kg-1 ppt-1]
-    netheat_rate, &  ! netheat but for dt=1 [C H T-1 ~> degC m s-1 or degC kg m-2 s-1]
-    netsalt_rate, &  ! netsalt but for dt=1 (e.g. returns a rate)
-                     ! [S H T-1 ~> ppt m s-1 or ppt kg m-2 s-1]
-    netMassInOut_rate! netmassinout but for dt=1 [H T-1 ~> m s-1 or kg m-2 s-1]
-  real, dimension(SZI_(G), SZK_(GV)) :: &
-    h2d, &           ! A 2-d copy of the thicknesses [H ~> m or kg m-2]
-    ! dz, &            ! Layer thicknesses in depth units [Z ~> m]
-    T2d, &           ! A 2-d copy of the layer temperatures [C ~> degC]
-    pen_TKE_2d, &    ! The TKE required to homogenize the heating by shortwave radiation within
+    dSpV_dS          ! Partial derivative of specific volume with to salinity [R-1 S-1 ~> m3 kg-1 ppt-1]
+                     ! These five arrays only describe the surface layer, but they are given a third
+                     ! dimension of extent one so that they can be passed to the three-dimensional
+                     ! equation of state entry points, which work on data that is on the device.
+  real, dimension(SZI_(G),SZJ_(G),SZK_(GV)) :: &
+    p_lay, &         ! The pressure at the middle of each layer [R L2 T-2 ~> Pa]
+    pen_TKE_3d, &    ! The TKE required to homogenize the heating by shortwave radiation within
                      ! a layer [R Z3 T-2 ~> J m-2]
-    dSV_dT_2d        ! The partial derivative of specific volume with temperature [R-1 C-1 ~> m3 kg-1 degC-1]
-  real, dimension(SZI_(G)) :: &
-    netPen_rate      ! The surface penetrative shortwave heating rate summed over all bands
-                     ! [C H T-1 ~> degC m s-1 or degC kg m-2 s-1]
-  real, dimension(max(nsw,1),SZI_(G)) :: &
+    T_chg_above      ! Workspace for absorbRemainingSW_3d, holding a temperature change that is
+                     ! applied to the thick layers above a given layer [C ~> degC]
+  real, dimension(max(nsw,1),SZI_(G),SZJ_(G)) :: &
     Pen_SW_bnd, &    ! The penetrative shortwave heating integrated over a timestep by band
                      ! [C H ~> degC m or degC kg m-2]
     Pen_SW_bnd_rate  ! The penetrative shortwave heating rate by band
                      ! [C H T-1 ~> degC m s-1 or degC kg m-2 s-1]
-  real, dimension(max(nsw,1),SZI_(G),SZK_(GV)) :: &
+  real, dimension(max(nsw,1),SZI_(G),SZJ_(G),SZK_(GV)) :: &
     opacityBand      ! The opacity (inverse of the exponential absorption length) of each frequency
                      ! band of shortwave radiation in each layer [H-1 ~> m-1 or m2 kg-1]
+  !   The next eight arrays record the state at a column that has lost all of its mass, so that the
+  ! error message describing it can be written on the host after the kernel that detected it has
+  ! finished.  ml_k is 0 at every column where this has not happened.
+  integer, dimension(SZI_(G),SZJ_(G)) :: ml_k ! The layer at which the mass loss occurred [nondim]
+  real, dimension(SZI_(G),SZJ_(G)) :: &
+    ml_dTemp, &      ! The temperature increment there [C H ~> degC m or degC kg m-2]
+    ml_dSalt, &      ! The salinity increment there [S H ~> ppt m or ppt kg m-2]
+    ml_dThick, &     ! The thickness increment there [H ~> m or kg m-2]
+    ml_hOld, &       ! The layer thickness before the increment [H ~> m or kg m-2]
+    ml_hNew, &       ! The layer thickness after the increment [H ~> m or kg m-2]
+    ml_netHeat, &    ! The remaining net heat there [C H ~> degC m or degC kg m-2]
+    ml_netSalt       ! The remaining net salt there [S H ~> ppt m or ppt kg m-2]
+  !   The next seven arrays play the same role for the salt conservation check in the brine plume
+  ! scheme, which is only done when CS%check_salt_bp is true.
+  logical, dimension(SZI_(G),SZJ_(G)) :: bp_error ! True where the check has failed [nondim]
+  real, dimension(SZI_(G),SZJ_(G)) :: &
+    bp_total_h, &        ! The total thickness of the column [H ~> m or kg m-2]
+    bp_mixing_depth, &   ! The plume mixing depth [H ~> m or kg m-2]
+    bp_salt_before, &    ! The column salt before the scheme [S H ~> ppt m or ppt kg m-2]
+    bp_salt_after, &     ! The column salt after the scheme [S H ~> ppt m or ppt kg m-2]
+    bp_salt_removed, &   ! The salt removed by the scheme [S H ~> ppt m or ppt kg m-2]
+    bp_salt_added        ! The salt added back by the scheme [S H ~> ppt m or ppt kg m-2]
   real, dimension(maxGroundings) :: hGrounding ! Thickness added by each grounding event [H ~> m or kg m-2]
   real    :: Temp_in  ! The initial temperature of a layer [C ~> degC]
   real    :: Salin_in ! The initial salinity of a layer [S ~> ppt]
@@ -997,6 +1020,17 @@ subroutine applyBoundaryFluxesInOut(CS, G, GV, US, dt, fluxes, optics, nsw, h, t
                       ! and rejected brine are initially applied in vanishingly thin layers at the
                       ! top of the layer before being mixed throughout the layer.
   logical :: calculate_buoyancy ! If true, calculate the surface buoyancy flux.
+  !   The following record whether optional fields are in use.  They are set once here so that
+  ! there is no need to repeat an associated() or allocated() test inside of a loop, and so that
+  ! no such test occurs inside of a device region.
+  logical :: use_hc_evap      ! True if fluxes%heat_content_evap is associated
+  logical :: use_hc_massin    ! True if fluxes%heat_content_massin is associated
+  logical :: use_hc_massout   ! True if fluxes%heat_content_massout is associated
+  logical :: use_lrunoff      ! True if fluxes%lrunoff is associated
+  logical :: use_salt_left_behind ! True if fluxes%salt_left_behind is associated
+  logical :: use_TempxPmE     ! True if tv%TempxPmE is associated
+  logical :: use_p_surf       ! True if tv%p_surf is associated
+  logical :: use_SpV_avg      ! True if tv%SpV_avg is allocated
   real :: A_brine     ! Constant [H-(n+1) ~> m-(n+1) or m(2n+2) kg-(n+1)].
   real :: plume_flux  ! Brine flux to move downwards  [S H T-1 ~> ppt m s-1 or ppt kg m-2 s-1]
   real :: mixing_depth! The mixing depth for brine plumes [H ~> m or kg m-2]
@@ -1011,8 +1045,12 @@ subroutine applyBoundaryFluxesInOut(CS, G, GV, US, dt, fluxes, optics, nsw, h, t
   real :: np1, inp1   ! Brine plume exponent plus 1 and its inverse for integrals [nondim]
   real :: top_np1, bottom_np1 ! top/bottom raised to power np1 [H^(n+1) ~> m^(n+1) or (kg m-2)^(n+1)]
   integer :: nz_finite! the index of the last (deepest) finite thickness layer
-  integer, dimension(2) :: EOSdom ! The i-computational domain for the equation of state
-  integer :: i, j, is, ie, js, je, k, nz, nb, ne
+  integer :: EOSdom(3,2) ! The i-, j- and k-computational domain for the equation of state, taking
+                         ! into account that the arrays inside of the EOS routines start at 1.
+  integer :: EOSdom_sfc(3,2) ! The corresponding domain for the surface-only calls.
+  integer :: dom(2,2) ! The i- and j-index ranges that extractFluxes_3d works on.
+  integer :: dom3(3,2) ! The i-, j- and k-index ranges that absorbRemainingSW_3d works on.
+  integer :: i, j, is, ie, js, je, k, nz, nb, n, ne
   character(len=45) :: mesg
   character(len=80), dimension(10) :: salt_error_mesg
 
@@ -1024,10 +1062,20 @@ subroutine applyBoundaryFluxesInOut(CS, G, GV, US, dt, fluxes, optics, nsw, h, t
 
   calculate_energetics = (present(cTKE) .and. present(dSV_dT) .and. present(dSV_dS))
   calculate_buoyancy = present(SkinBuoyFlux)
-  if (calculate_buoyancy) SkinBuoyFlux(:,:) = 0.0
-  if (present(cTKE)) cTKE(:,:,:) = 0.0
+  !   These two arrays are zeroed out on the device, where the caller has mapped them, and not
+  ! on the host, because the kernels below accumulate into cTKE and both are returned to the
+  ! host from the device after this routine has finished with them.
+  if (calculate_buoyancy) then
+    do concurrent (j=G%jsd:G%jed, i=G%isd:G%ied)
+      SkinBuoyFlux(i,j) = 0.0
+    enddo
+  endif
+  if (present(cTKE)) then
+    do concurrent (k=1:nz, j=G%jsd:G%jed, i=G%isd:G%ied)
+      cTKE(i,j,k) = 0.0
+    enddo
+  endif
   g_Hconv2 = (GV%g_Earth_Z_T2 * GV%H_to_RZ) * GV%H_to_RZ
-  EOSdom(:) = EOS_domain(G%HI)
 
   ! Only apply forcing if fluxes%sw is associated.
   if (.not.associated(fluxes%sw) .and. .not.calculate_energetics) return
@@ -1035,10 +1083,7 @@ subroutine applyBoundaryFluxesInOut(CS, G, GV, US, dt, fluxes, optics, nsw, h, t
   EnthalpyConst = 1.0
   if (associated(fluxes%heat_content_evap)) EnthalpyConst = 0.0
 
-  if (calculate_buoyancy) then
-    SurfPressure(:) = 0.0
-    GoRho = GV%g_Earth_Z_T2 / GV%Rho0
-  endif
+  if (calculate_buoyancy) GoRho = GV%g_Earth_Z_T2 / GV%Rho0
 
   if (CS%do_brine_plume .and. .not.present(MLD_h)) then
     call MOM_error(FATAL, "MOM_diabatic_aux.F90, applyBoundaryFluxesInOut(): "//&
@@ -1055,6 +1100,15 @@ subroutine applyBoundaryFluxesInOut(CS, G, GV, US, dt, fluxes, optics, nsw, h, t
                    "to be turned on in SIS2 as well as MOM6.")
   endif
 
+  use_hc_evap = associated(fluxes%heat_content_evap)
+  use_hc_massin = associated(fluxes%heat_content_massin)
+  use_hc_massout = associated(fluxes%heat_content_massout)
+  use_lrunoff = associated(fluxes%lrunoff)
+  use_salt_left_behind = associated(fluxes%salt_left_behind)
+  use_TempxPmE = associated(tv%TempxPmE)
+  use_p_surf = associated(tv%p_surf)
+  use_SpV_avg = allocated(tv%SpV_avg)
+
   ! H_limit_fluxes is used by extractFluxes1d to scale down fluxes if the total
   ! depth of the ocean is vanishing. It does not (yet) handle a value of zero.
   ! To accommodate vanishing upper layers, we need to allow for an instantaneous
@@ -1066,66 +1120,61 @@ subroutine applyBoundaryFluxesInOut(CS, G, GV, US, dt, fluxes, optics, nsw, h, t
   if (CS%id_createdH>0) CS%createdH(:,:) = 0.
   numberOfGroundings = 0
 
-  !$OMP parallel do default(none) shared(is,ie,js,je,nz,h,tv,nsw,G,GV,US,optics,fluxes,    &
-  !$OMP                                  H_limit_fluxes,numberOfGroundings,iGround,jGround,&
-  !$OMP                                  nonPenSW,hGrounding,CS,Idt,aggregate_FW_forcing,  &
-  !$OMP                                  minimum_forcing_depth,evap_CFL_limit,dt,EOSdom,   &
-  !$OMP                                  calculate_buoyancy,netPen_rate,SkinBuoyFlux,GoRho,&
-  !$OMP                                  calculate_energetics,dSV_dT,dSV_dS,cTKE,g_Hconv2, &
-  !$OMP                                  EnthalpyConst,MLD_h,np1,inp1)                     &
-  !$OMP                          private(opacityBand,h2d,T2d,netMassInOut,netMassOut,      &
-  !$OMP                                  netHeat,netSalt,Pen_SW_bnd,fractionOfForcing,     &
-  !$OMP                                  IforcingDepthScale,g_conv,dSpV_dT,dSpV_dS,        &
-  !$OMP                                  dThickness,dTemp,dSalt,hOld,Ithickness,           &
-  !$OMP                                  netMassIn,pres,d_pres,p_lay,dSV_dT_2d,            &
-  !$OMP                                  netmassinout_rate,netheat_rate,netsalt_rate,      &
-  !$OMP                                  drhodt,drhods,pen_sw_bnd_rate,                    &
-  !$OMP                                  pen_TKE_2d,Temp_in,Salin_in,RivermixConst,        &
-  !$OMP                                  A_brine,plume_flux,mixing_depth,total_h,          &
-  !$OMP                                  plume_source,salt_added, salt_removed,salt_before,&
-  !$OMP                                  salt_after,top,bottom,nz_finite,bottom_np1,       &
-  !$OMP                                  top_np1,salt_error_mesg,ne)                       &
-  !$OMP                     firstprivate(SurfPressure)
-  do j=js,je
-  ! Work in vertical slices for efficiency
+  EOSdom(1,1) = is - (G%isd-1) ; EOSdom(1,2) = ie - (G%isd-1)
+  EOSdom(2,1) = js - (G%jsd-1) ; EOSdom(2,2) = je - (G%jsd-1)
+  EOSdom(3,1) = 1 ; EOSdom(3,2) = nz
+  EOSdom_sfc(:,:) = EOSdom(:,:) ; EOSdom_sfc(3,2) = 1
+  dom(1,1) = is ; dom(1,2) = ie
+  dom(2,1) = js ; dom(2,2) = je
+  dom3(1,1) = is ; dom3(1,2) = ie
+  dom3(2,1) = js ; dom3(2,2) = je
+  dom3(3,1) = 1 ; dom3(3,2) = nz
 
-    ! Copy state into 2D-slice arrays
-    do k=1,nz ; do i=is,ie
-      h2d(i,k) = h(i,j,k)
-      T2d(i,k) = tv%T(i,j,k)
-    enddo ; enddo
+  !$omp target enter data map(alloc: netMassInOut, netMassIn, netMassOut, netHeat, netSalt, &
+  !$omp                              nonpenSW, netheat_rate, netsalt_rate, netMassInOut_rate, &
+  !$omp                              netPen_rate, SurfPressure, dRhodT, dRhodS, dSpV_dT, dSpV_dS, &
+  !$omp                              p_lay, pen_TKE_3d, T_chg_above, Pen_SW_bnd, Pen_SW_bnd_rate, &
+  !$omp                              opacityBand, ml_k, ml_dTemp, ml_dSalt, ml_dThick, ml_hOld, &
+  !$omp                              ml_hNew, ml_netHeat, ml_netSalt, bp_error, bp_total_h, &
+  !$omp                              bp_mixing_depth, bp_salt_before, bp_salt_after, &
+  !$omp                              bp_salt_removed, bp_salt_added)
 
-    if (calculate_energetics) then
-      ! The partial derivatives of specific volume with temperature and
-      ! salinity need to be precalculated to avoid having heating of
-      ! tiny layers give nonsensical values.
-      if (associated(tv%p_surf)) then
-        do i=is,ie ; pres(i) = tv%p_surf(i,j) ; enddo
-      else
-        do i=is,ie ; pres(i) = 0.0 ; enddo
-      endif
+  ! The control structure and the diagnostic arrays that it owns are persistently resident on
+  ! the device, having been mapped there by diabatic_aux_init, so they are not mapped here.
+
+  if (calculate_energetics) then
+    !   The partial derivatives of specific volume with temperature and salinity need to be
+    ! precalculated to avoid having heating of tiny layers give nonsensical values.
+    do concurrent( j=js:je, i=is:ie) DO_LOCALITY(local(d_pres, pres, k))
+      pres = 0.0 ; if (use_p_surf) pres = tv%p_surf(i,j)
       do k=1,nz
-        do i=is,ie
-          d_pres(i) = (GV%g_Earth * GV%H_to_RZ) * h2d(i,k)
-          p_lay(i) = pres(i) + 0.5*d_pres(i)
-          pres(i) = pres(i) + d_pres(i)
-        enddo
-        call calculate_specific_vol_derivs(T2d(:,k), tv%S(:,j,k), p_lay(:), &
-                 dSV_dT(:,j,k), dSV_dS(:,j,k), tv%eqn_of_state, EOSdom)
-        do i=is,ie ; dSV_dT_2d(i,k) = dSV_dT(i,j,k) ; enddo
+        d_pres = (GV%g_Earth * GV%H_to_RZ) * h(i,j,k)
+        p_lay(i,j,k) = pres + 0.5*d_pres
+        pres = pres + d_pres
       enddo
-      pen_TKE_2d(:,:) = 0.0
-    endif
+    enddo
 
-    ! Nothing more is done on this j-slice if there is no buoyancy forcing.
-    if (.not.associated(fluxes%sw)) cycle
+    call calculate_specific_vol_derivs(tv%T, tv%S, p_lay, dSV_dT, dSV_dS, tv%eqn_of_state, EOSdom)
+
+    do concurrent (k=1:nz, j=js:je, i=is:ie)
+      pen_TKE_3d(i,j,k) = 0.0
+    enddo
+  endif
+
+  !   Nothing more is done unless there is shortwave forcing.
+  if (associated(fluxes%sw)) then
 
     if (nsw>0) then
-      if (GV%Boussinesq .or. (.not.allocated(tv%SpV_avg))) then
-        call extract_optics_slice(optics, j, G, GV, opacity=opacityBand, opacity_scale=GV%H_to_Z)
+      !   The opacity is taken directly from the optics type here, rather than via
+      ! extract_optics_slice, becaucause that routine works on a j-row of slice workspace.
+      if (GV%Boussinesq .or. (.not.use_SpV_avg)) then
+        do concurrent (k=1:nz, j=js:je, i=is:ie, n=1:nsw)
+          opacityBand(n,i,j,k) = GV%H_to_Z * optics%opacity_band(n,i,j,k)
+        enddo
       else
-        call extract_optics_slice(optics, j, G, GV, opacity=opacityBand, opacity_scale=GV%H_to_RZ, &
-                                  SpV_avg=tv%SpV_avg)
+        do concurrent (k=1:nz, j=js:je, i=is:ie, n=1:nsw)
+          opacityBand(n,i,j,k) = (GV%H_to_RZ * tv%SpV_avg(i,j,k)) * optics%opacity_band(n,i,j,k)
+        enddo
       endif
     endif
 
@@ -1173,38 +1222,39 @@ subroutine applyBoundaryFluxesInOut(CS, G, GV, US, dt, fluxes, optics, nsw, h, t
     !   but do change answers.
     !-----------------------------------------------------------------------------------------
     if (calculate_buoyancy) then
-      call extractFluxes1d(G, GV, US, fluxes, optics, nsw, j, dt,          &
+      call extractFluxes_3d(G, GV, US, fluxes, optics, nsw, G%jsd, G%jed, dt,            &
                   H_limit_fluxes, CS%use_river_heat_content, CS%use_calving_heat_content, &
-                  h2d, T2d, netMassInOut, netMassOut, netHeat, netSalt,                   &
-                  Pen_SW_bnd, tv, aggregate_FW_forcing, nonpenSW=nonpenSW,                &
-                  net_Heat_rate=netheat_rate, net_salt_rate=netsalt_rate,                 &
+                  h, tv%T, netMassInOut, netMassOut, netHeat, netSalt,                   &
+                  Pen_SW_bnd, tv, aggregate_FW_forcing, dom, nonpenSW=nonpenSW,          &
+                  net_Heat_rate=netheat_rate, net_salt_rate=netsalt_rate,                &
                   netmassinout_rate=netmassinout_rate, pen_sw_bnd_rate=pen_sw_bnd_rate)
     else
-      call extractFluxes1d(G, GV, US, fluxes, optics, nsw, j, dt,          &
+      call extractFluxes_3d(G, GV, US, fluxes, optics, nsw, G%jsd, G%jed, dt,            &
                   H_limit_fluxes, CS%use_river_heat_content, CS%use_calving_heat_content, &
-                  h2d, T2d, netMassInOut, netMassOut, netHeat, netSalt,                   &
-                  Pen_SW_bnd, tv, aggregate_FW_forcing, nonpenSW=nonpenSW)
+                  h, tv%T, netMassInOut, netMassOut, netHeat, netSalt,                   &
+                  Pen_SW_bnd, tv, aggregate_FW_forcing, dom, nonpenSW=nonpenSW)
     endif
+
     ! ea is for passive tracers
-    do i=is,ie
-    !  ea(i,j,1) = netMassInOut(i)
+    do concurrent( j=js:je, i=is:ie )
+    !  ea(i,j,1) = netMassInOut(i,j)
       if (aggregate_FW_forcing) then
-        netMassOut(i) = netMassInOut(i)
-        netMassIn(i) = 0.
+        netMassOut(i,j) = netMassInOut(i,j)
+        netMassIn(i,j) = 0.
       else
-        netMassIn(i) = netMassInOut(i) - netMassOut(i)
+        netMassIn(i,j) = netMassInOut(i,j) - netMassOut(i,j)
       endif
       if (G%mask2dT(i,j) > 0.0) then
-        fluxes%netMassOut(i,j) = netMassOut(i)
-        fluxes%netMassIn(i,j) = netMassIn(i)
+        fluxes%netMassOut(i,j) = netMassOut(i,j)
+        fluxes%netMassIn(i,j) = netMassIn(i,j)
       else
         fluxes%netMassOut(i,j) = 0.0
         fluxes%netMassIn(i,j) = 0.0
       endif
-      if (CS%do_brine_plume .and. associated(fluxes%salt_left_behind)) then
+      if (CS%do_brine_plume .and. use_salt_left_behind) then
         if (fluxes%salt_left_behind(i,j) > 0.0) then
           !Don't add in the salt that will later be distributed by the brine plume scheme
-          netSalt(i) = netSalt(i) - dt*((1000.0*US%ppt_to_S) * &
+          netSalt(i,j) = netSalt(i,j) - dt*((1000.0*US%ppt_to_S) * &
                                         (CS%plume_strength * fluxes%salt_left_behind(i,j))) * GV%RZ_to_H
         endif
       endif
@@ -1216,39 +1266,53 @@ subroutine applyBoundaryFluxesInOut(CS, G, GV, US, dt, fluxes, optics, nsw, h, t
     ! B/ update mass, salt, temp from mass leaving ocean.
     ! C/ update temp due to penetrative SW
 
-    do i=is,ie
+    !   Steps A and B and the brine plume scheme are done here in a single kernel, with each
+    ! column handled by one thread.  The error messages and the diagnostics of grounding that
+    ! the equivalent column loop used to write are deferred to the host loop below it, because
+    ! neither MOM_error nor a write statement can be executed on a device.
+    do concurrent( j=js:je, i=is:ie) DO_LOCALITY(local(k, dThickness, dTemp, dSalt, Temp_in, Salin_in)) &
+                                   & DO_LOCALITY(local(hOld, Ithickness,fractionOfForcing, IforcingDepthScale)) &
+                                   & DO_LOCALITY(local(RivermixConst, A_brine, plume_flux, mixing_depth)) &
+                                   & DO_LOCALITY(local(total_h, plume_source, salt_added, salt_removed)) &
+                                   & DO_LOCALITY(local(salt_before, salt_after, top, bottom, nz_finite)) &
+                                   & DO_LOCALITY(local(top_np1, bottom_np1))
+      !   Flag this column as having neither lost all of its mass nor failed the brine plume salt
+      ! conservation check.  This is done outside of the mask test below because the host loop
+      ! that reports these errors examines the land points too.
+      ml_k(i,j) = 0
+      bp_error(i,j) = .false.
       if (G%mask2dT(i,j) > 0.) then
 
         ! A/ Update mass, temp, and salinity due to incoming mass flux.
         do k=1,1
 
           ! Change in state due to forcing
-          dThickness = netMassIn(i) ! Since we are adding mass, we can use all of it
+          dThickness = netMassIn(i,j) ! Since we are adding mass, we can use all of it
           dTemp = 0.
           dSalt = 0.
 
           ! Update the forcing by the part to be consumed within the present k-layer.
           ! If fractionOfForcing = 1, then updated netMassIn, netHeat, and netSalt vanish.
-          netMassIn(i) = netMassIn(i) - dThickness
+          netMassIn(i,j) = netMassIn(i,j) - dThickness
           ! This line accounts for the temperature of the mass exchange
-          Temp_in = T2d(i,k)
+          Temp_in = tv%T(i,j,k)
           Salin_in = 0.0
           dTemp = dTemp + dThickness*Temp_in*EnthalpyConst
 
           ! Diagnostics of heat content associated with mass fluxes
-          if (.not. associated(fluxes%heat_content_evap)) then
-            if (associated(fluxes%heat_content_massin)) &
+          if (.not.use_hc_evap) then
+            if (use_hc_massin) &
               fluxes%heat_content_massin(i,j) = fluxes%heat_content_massin(i,j) + &
-                           T2d(i,k) * max(0.,dThickness) * GV%H_to_RZ * tv%C_p * Idt
-            if (associated(fluxes%heat_content_massout)) &
+                            tv%T(i,j,k) * max(0.,dThickness) * GV%H_to_RZ * tv%C_p * Idt
+            if (use_hc_massout) &
               fluxes%heat_content_massout(i,j) = fluxes%heat_content_massout(i,j) + &
-                           T2d(i,k) * min(0.,dThickness) * GV%H_to_RZ * tv%C_p * Idt
-            if (associated(tv%TempxPmE)) tv%TempxPmE(i,j) = tv%TempxPmE(i,j) + &
-                           T2d(i,k) * dThickness * GV%H_to_RZ
+                            tv%T(i,j,k) * min(0.,dThickness) * GV%H_to_RZ * tv%C_p * Idt
+            if (use_TempxPmE) tv%TempxPmE(i,j) = tv%TempxPmE(i,j) + &
+                            tv%T(i,j,k) * dThickness * GV%H_to_RZ
           endif
 
           ! Determine the energetics of river mixing before updating the state.
-          if (calculate_energetics .and. associated(fluxes%lrunoff) .and. CS%do_rivermix) then
+          if (calculate_energetics .and. use_lrunoff .and. CS%do_rivermix) then
             ! Here we add an additional source of TKE to the mixed layer where river
             ! is present to simulate unresolved estuaries. The TKE input, TKE_river in
             ! [Z3 T-3 ~> m3 s-3], is diagnosed as follows:
@@ -1261,29 +1325,29 @@ subroutine applyBoundaryFluxesInOut(CS, G, GV, US, dt, fluxes, optics, nsw, h, t
             ! Sriver = 0 (i.e. rivers are assumed to be pure freshwater)
             if (GV%Boussinesq) then
               RivermixConst = -0.5*(CS%rivermix_depth*dt) * GV%g_Earth_Z_T2 * GV%Rho0
-            elseif (allocated(tv%SpV_avg)) then
+            elseif (use_SpV_avg) then
               RivermixConst = -0.5*(CS%rivermix_depth*dt) * GV%g_Earth_Z_T2 / tv%SpV_avg(i,j,1)
             else
               RivermixConst = -0.5*(CS%rivermix_depth*dt) * GV%Rho0 * GV%g_Earth_Z_T2
             endif
             cTKE(i,j,k) = cTKE(i,j,k) + max(0.0, RivermixConst*dSV_dS(i,j,1) * &
                             ((fluxes%lrunoff(i,j) + fluxes%frunoff(i,j)) + &
-                             (fluxes%lrunoff_glc(i,j) + fluxes%frunoff_glc(i,j))) * tv%S(i,j,1))
+                              (fluxes%lrunoff_glc(i,j) + fluxes%frunoff_glc(i,j))) * tv%S(i,j,1))
           endif
 
           ! Update state
-          hOld     = h2d(i,k)               ! Keep original thickness in hand
-          h2d(i,k) = h2d(i,k) + dThickness  ! New thickness
-          if (h2d(i,k) > 0.0) then
+          hOld     = h(i,j,k)               ! Keep original thickness in hand
+          h(i,j,k) = h(i,j,k) + dThickness  ! New thickness
+          if (h(i,j,k) > 0.0) then
             if (calculate_energetics .and. (dThickness > 0.)) then
               ! Calculate the energy required to mix the newly added water over
               ! the topmost grid cell.
               cTKE(i,j,k) = cTKE(i,j,k) + 0.5*g_Hconv2*(hOld*dThickness) * &
-                 ((T2d(i,k) - Temp_in) * dSV_dT(i,j,k) + (tv%S(i,j,k) - Salin_in) * dSV_dS(i,j,k))
+                  ((tv%T(i,j,k) - Temp_in) * dSV_dT(i,j,k) + (tv%S(i,j,k) - Salin_in) * dSV_dS(i,j,k))
             endif
-            Ithickness  = 1.0/h2d(i,k)      ! Inverse new thickness
+            Ithickness  = 1.0/h(i,j,k)      ! Inverse new thickness
             ! The "if"s below avoid changing T/S by roundoff unnecessarily
-            if (dThickness /= 0. .or. dTemp /= 0.) T2d(i,k)    = (hOld*T2d(i,k)    + dTemp)*Ithickness
+            if (dThickness /= 0. .or. dTemp /= 0.) tv%T(i,j,k) = (hOld*tv%T(i,j,k) + dTemp)*Ithickness
             if (dThickness /= 0. .or. dSalt /= 0.) tv%S(i,j,k) = (hOld*tv%S(i,j,k) + dSalt)*Ithickness
 
           endif
@@ -1295,99 +1359,98 @@ subroutine applyBoundaryFluxesInOut(CS, G, GV, US, dt, fluxes, optics, nsw, h, t
           ! Place forcing into this layer if this layer has nontrivial thickness.
           ! For layers thin relative to 1/IforcingDepthScale, then distribute
           ! forcing into deeper layers.
-          IforcingDepthScale = 1. / max(GV%H_subroundoff, minimum_forcing_depth - netMassOut(i) )
-          ! fractionOfForcing = 1.0, unless h2d is less than IforcingDepthScale.
-          fractionOfForcing = min(1.0, h2d(i,k)*IforcingDepthScale)
+          IforcingDepthScale = 1. / max(GV%H_subroundoff, minimum_forcing_depth - netMassOut(i,j) )
+          ! fractionOfForcing = 1.0, unless h is less than IforcingDepthScale.
+          fractionOfForcing = min(1.0, h(i,j,k)*IforcingDepthScale)
 
           ! In the case with (-1)*netMassOut*fractionOfForcing greater than cfl*h, we
           ! limit the forcing applied to this cell, leaving the remaining forcing to
           ! be distributed downwards.
-          if (-fractionOfForcing*netMassOut(i) > evap_CFL_limit*h2d(i,k)) then
-            fractionOfForcing = -evap_CFL_limit*h2d(i,k)/netMassOut(i)
+          if (-fractionOfForcing*netMassOut(i,j) > evap_CFL_limit*h(i,j,k)) then
+            fractionOfForcing = -evap_CFL_limit*h(i,j,k)/netMassOut(i,j)
           endif
 
           ! Change in state due to forcing
 
-          dThickness = max( fractionOfForcing*netMassOut(i), -h2d(i,k) )
-          dTemp      = fractionOfForcing*netHeat(i)
-          dSalt = max( fractionOfForcing*netSalt(i), -CS%dSalt_frac_max * h2d(i,k) * tv%S(i,j,k))
+          dThickness = max( fractionOfForcing*netMassOut(i,j), -h(i,j,k) )
+          dTemp      = fractionOfForcing*netHeat(i,j)
+          dSalt = max( fractionOfForcing*netSalt(i,j), -CS%dSalt_frac_max * h(i,j,k) * tv%S(i,j,k))
 
           ! Update the forcing by the part to be consumed within the present k-layer.
           ! If fractionOfForcing = 1, then new netMassOut vanishes.
-          netMassOut(i) = netMassOut(i) - dThickness
-          netHeat(i) = netHeat(i) - dTemp
-          netSalt(i) = netSalt(i) - dSalt
+          netMassOut(i,j) = netMassOut(i,j) - dThickness
+          netHeat(i,j) = netHeat(i,j) - dTemp
+          netSalt(i,j) = netSalt(i,j) - dSalt
 
           ! This line accounts for the temperature of the mass exchange
-          dTemp = dTemp + dThickness*T2d(i,k)*EnthalpyConst
+          dTemp = dTemp + dThickness*tv%T(i,j,k)*EnthalpyConst
 
           ! Diagnostics of heat content associated with mass fluxes
-          if (.not. associated(fluxes%heat_content_evap)) then
-            if (associated(fluxes%heat_content_massin)) &
+          if (.not.use_hc_evap) then
+            if (use_hc_massin) &
               fluxes%heat_content_massin(i,j) = fluxes%heat_content_massin(i,j) + &
-                           T2d(i,k) * max(0.,dThickness) * GV%H_to_RZ * tv%C_p * Idt
-            if (associated(fluxes%heat_content_massout)) &
+                            tv%T(i,j,k) * max(0.,dThickness) * GV%H_to_RZ * tv%C_p * Idt
+            if (use_hc_massout) &
               fluxes%heat_content_massout(i,j) = fluxes%heat_content_massout(i,j) + &
-                           T2d(i,k) * min(0.,dThickness) * GV%H_to_RZ * tv%C_p * Idt
-            if (associated(tv%TempxPmE)) tv%TempxPmE(i,j) = tv%TempxPmE(i,j) + &
-                           T2d(i,k) * dThickness * GV%H_to_RZ
+                            tv%T(i,j,k) * min(0.,dThickness) * GV%H_to_RZ * tv%C_p * Idt
+            if (use_TempxPmE) tv%TempxPmE(i,j) = tv%TempxPmE(i,j) + &
+                            tv%T(i,j,k) * dThickness * GV%H_to_RZ
           endif
 
           ! Update state by the appropriate increment.
-          hOld     = h2d(i,k)               ! Keep original thickness in hand
-          h2d(i,k) = h2d(i,k) + dThickness  ! New thickness
+          hOld     = h(i,j,k)               ! Keep original thickness in hand
+          h(i,j,k) = h(i,j,k) + dThickness  ! New thickness
 
-          if (h2d(i,k) > 0.) then
+          if (h(i,j,k) > 0.) then
             if (calculate_energetics) then
               ! Calculate the energy required to mix the newly added water over the topmost grid
               ! cell, assuming that the fluxes of heat and salt and rejected brine are initially
               ! applied in vanishingly thin layers at the top of the layer before being mixed
               ! throughout the layer.  Note that dThickness is always <= 0 here, and that
               ! negative cTKE is a deficit that will need to be filled later.
-              cTKE(i,j,k) = cTKE(i,j,k) - (0.5*h2d(i,k)*g_Hconv2) * &
-                            ((dTemp - dthickness*T2d(i,k)) * dSV_dT(i,j,k) + &
-                             (dSalt - dthickness*tv%S(i,j,k)) * dSV_dS(i,j,k))
+              cTKE(i,j,k) = cTKE(i,j,k) - (0.5*h(i,j,k)*g_Hconv2) * &
+                            ((dTemp - dthickness*tv%T(i,j,k)) * dSV_dT(i,j,k) + &
+                              (dSalt - dthickness*tv%S(i,j,k)) * dSV_dS(i,j,k))
             endif
-            Ithickness  = 1.0/h2d(i,k) ! Inverse of new thickness
-            T2d(i,k)    = (hOld*T2d(i,k) + dTemp)*Ithickness
+            Ithickness  = 1.0/h(i,j,k) ! Inverse of new thickness
+            tv%T(i,j,k) = (hOld*tv%T(i,j,k) + dTemp)*Ithickness
             tv%S(i,j,k) = (hOld*tv%S(i,j,k) + dSalt)*Ithickness
-          elseif (h2d(i,k) < 0.0) then ! h2d==0 is a special limit that needs no extra handling
-            call forcing_SinglePointPrint(fluxes,G,i,j,'applyBoundaryFluxesInOut (h<0)')
-            !TODO: remove write statements
-            write(0,*) 'applyBoundaryFluxesInOut(): lon,lat=',G%geoLonT(i,j),G%geoLatT(i,j)
-            write(0,*) 'applyBoundaryFluxesInOut(): netT,netS,netH=', &
-                US%C_to_degC*netHeat(i), US%S_to_ppt*netSalt(i), netMassInOut(i)
-            write(0,*) 'applyBoundaryFluxesInOut(): dT,dS,dH=', &
-                US%C_to_degC*dTemp, US%S_to_ppt*dSalt, dThickness
-            write(0,*) 'applyBoundaryFluxesInOut(): h(n),h(n+1),k=',hOld,h2d(i,k),k
-            call MOM_error(FATAL, "MOM_diabatic_aux.F90, applyBoundaryFluxesInOut(): "//&
-                           "Complete mass loss in column!")
+          elseif (h(i,j,k) < 0.0) then ! h==0 is a special limit that needs no extra handling
+            !   Record the first layer in this column that has lost all of its mass, along with
+            ! the state that describes it, so that the fatal error message can be written by the
+            ! host loop below.  The column loop used to stop at this point, but a device region
+            ! can not, so the values are taken from the first such layer.
+            if (ml_k(i,j) == 0) then
+              ml_k(i,j) = k
+              ml_dTemp(i,j) = dTemp ; ml_dSalt(i,j) = dSalt
+              ml_dThick(i,j) = dThickness ; ml_hOld(i,j) = hOld ; ml_hNew(i,j) = h(i,j,k)
+              ml_netHeat(i,j) = netHeat(i,j) ; ml_netSalt(i,j) = netSalt(i,j)
+            endif
           endif
 
         enddo ! k
 
-        if (CS%do_brine_plume .and. associated(fluxes%salt_left_behind)) then
+        if (CS%do_brine_plume .and. use_salt_left_behind) then
           if (fluxes%salt_left_behind(i,j) > 0.0) then
 
             ! Find the plume mixing depth.
             total_h = 0.0
             do k=1,nz
-              total_h = total_h + h2d(i,k)
-              if (h2d(i,k)>GV%h_subroundoff) nz_finite = k
+              total_h = total_h + h(i,j,k)
+              if (h(i,j,k)>GV%h_subroundoff) nz_finite = k
             enddo
             mixing_depth = min( max(CS%plume_mld_fac * MLD_h(i,j), minimum_forcing_depth), &
                                 max(total_h, GV%angstrom_h) )
 
             ! Sets the brine plume coefficient based on integral constraint
-            A_brine = (CS%brine_plume_n + 1) / (mixing_depth**(CS%brine_plume_n + 1))
+            A_brine = np1 / (mixing_depth**np1)
 
             if (CS%check_salt_bp) then
               ! Record the total salt in the column before applying the plume scheme
               salt_before = 0.0
               do k=1,nz
-                salt_before = salt_before + h2d(i,k)*tv%S(i,j,k)
+                salt_before = salt_before + h(i,j,k)*tv%S(i,j,k)
               enddo
-              !DEBUG if (CS%check_salt_verbose) call MOM_error(NOTE,'Salt before brine plume: ',salt_before)
             endif
 
             ! Set the plume strength based on the salt rejected
@@ -1402,33 +1465,28 @@ subroutine applyBoundaryFluxesInOut(CS, G, GV, US, dt, fluxes, optics, nsw, h, t
             bottom_np1 = 0.0
             do k=1,nz ; if (salt_removed > salt_added) then
               top = bottom
-              bottom = top+h2d(i,k)
+              bottom = top+h(i,j,k)
 
               if (bottom <= mixing_depth .and. k<nz_finite) then
                 !Flux convergence integrated over layer
                 top_np1 = bottom_np1
                 bottom_np1 = bottom**np1
                 plume_flux = min(salt_removed-salt_added, dt * ( (plume_source * A_brine) &
-                                                     * ( (bottom_np1 - top_np1) * inp1)))
-              elseif (h2d(i,k)>GV%H_subroundoff) then
+                                                      * ( (bottom_np1 - top_np1) * inp1)))
+              elseif (h(i,j,k)>GV%H_subroundoff) then
                 ! if the bottom of the cell is > MLD or we are in the last
                 ! finite thickness cell, we put all the remaining salt in the level
                 plume_flux = salt_removed-salt_added
               endif
 
               ! Update salinity
-              Ithickness  = 1.0/h2d(i,k)
+              Ithickness  = 1.0/h(i,j,k)
               tv%S(i,j,k) = tv%S(i,j,k) + plume_flux*Ithickness
 
               ! Track salt added
               salt_added = salt_added + plume_flux
-              !DEBUG if (CS%check_salt_verbose) then
-              !DEBUG   write(mesg, '(A, I0, A, ES24.16, A, ES24.16)') &
-              !DEBUG        'Salt to layer ', k, ' and remaining deficit: ', salt_added, ', ', salt_removed-salt_added
-              !DEBUG   call MOM_error(NOTE,trim(mesg))
-              !DEBUG endif
 
-              if (CS%id_brine_input > 0.) then
+              if (CS%id_brine_input > 0) then
                 CS%brine_input(i,j,k) = plume_flux*Idt
               endif
 
@@ -1437,47 +1495,15 @@ subroutine applyBoundaryFluxesInOut(CS, G, GV, US, dt, fluxes, optics, nsw, h, t
             if (CS%check_salt_bp) then
               salt_after = 0.0
               do k=1,nz
-                salt_after = salt_after + h2d(i,k)*tv%S(i,j,k)
+                salt_after = salt_after + h(i,j,k)*tv%S(i,j,k)
               enddo
               if (abs((salt_after-salt_before-salt_removed)/salt_after)>CS%check_salt_threshold) then
-                write(salt_error_mesg(1), '(A, ES24.16)')  &
-                      'Net plume strength:    ', fluxes%salt_left_behind(i,j)
-                write(salt_error_mesg(2), '(A, 2ES24.16)') &
-                     ' H/Plume dpt (h-unit): ', total_h, mixing_depth
-                write(salt_error_mesg(3), '(A, 2ES24.16)') &
-                     ' H/Plume dpt (m):      ', total_h*GV%H_to_Z, mixing_depth*GV%H_to_Z
-                write(salt_error_mesg(4), '(A, 2ES24.16)') &
-                     ' Salt before/after BP: ', salt_before, salt_after
-                write(salt_error_mesg(5), '(A, 2ES24.16)') &
-                     ' Salt change, abs/rel: ', salt_after-salt_before, (salt_after-salt_before)/salt_after
-                write(salt_error_mesg(6), '(A, 2ES24.16)') &
-                     ' Salt removed, abs/rel:', salt_removed, salt_removed/salt_after
-                write(salt_error_mesg(7), '(A, 2ES24.16)') &
-                     ' Salt added, abs/rel:  ', salt_added, salt_added/salt_after
-                write(salt_error_mesg(8), '(A, ES24.16)')  &
-                     ' Scheme relative error:', (salt_added-salt_removed)/salt_after
-                write(salt_error_mesg(9), '(A, ES24.16)')  &
-                     ' Diagnosed salt error: ', (salt_after-salt_before-salt_removed)/salt_after
-                write(salt_error_mesg(10),'(A, ES24.16)')  &
-                     ' Allowed error:        ', CS%check_salt_threshold
-
-                !DEBUG write(0,*),'h',h2d(i,:)
-                !DEBUG write(0,*),'z',h2d(i,:)*GV%H_to_Z
-                !DEBUG write(0,*),'S',tv%S(i,j,:)
-
-                ! Ideally this would be written to a single fatal error call,
-                !  but the long message seems to hit an FMS character limit?
-                call MOM_error(WARNING,'Salt change in brine plume scheme exceeds CHECK_SALT_BRINE_PLUME_THRESHOLD ')
-                do ne=1,10
-                  call MOM_error(WARNING,salt_error_mesg(ne),all_print=.true.)
-                enddo
-                call MOM_error(FATAL,'Salt conservation failed check in brine plume parameterization')
-                !call MOM_error(FATAL,'Salt conservation failed check in brine plume parameterization'//&
-                !               NEW_LINE('a')//salt_error_mesg(1)//NEW_LINE('a')//salt_error_mesg(2)//&
-                !               NEW_LINE('a')//salt_error_mesg(3)//NEW_LINE('a')//salt_error_mesg(4)//&
-                !               NEW_LINE('a')//salt_error_mesg(5)//NEW_LINE('a')//salt_error_mesg(6)//&
-                !               NEW_LINE('a')//salt_error_mesg(7)//NEW_LINE('a')//salt_error_mesg(8)//&
-                !               NEW_LINE('a')//salt_error_mesg(9)//NEW_LINE('a')//salt_error_mesg(10))
+                !   Record everything that the salt conservation error message needs, so that the
+                ! host loop below can write it.
+                bp_error(i,j) = .true.
+                bp_total_h(i,j) = total_h ; bp_mixing_depth(i,j) = mixing_depth
+                bp_salt_before(i,j) = salt_before ; bp_salt_after(i,j) = salt_after
+                bp_salt_removed(i,j) = salt_removed ; bp_salt_added(i,j) = salt_added
               endif
             endif
 
@@ -1485,36 +1511,100 @@ subroutine applyBoundaryFluxesInOut(CS, G, GV, US, dt, fluxes, optics, nsw, h, t
 
         endif ! Do brine plume
 
+      endif ! mask2dT > 0
+
+    enddo ! i- and j-loop
+
+    ! Bring back everything that the error reporting and grounding diagnostics below need.
+    !$omp target update from(netMassInOut, netMassIn, netMassOut, netHeat, netSalt)
+    !$omp target update from(ml_k, ml_dTemp, ml_dSalt, ml_dThick, ml_hOld, ml_hNew)
+    !$omp target update from(ml_netHeat, ml_netSalt)
+    !$omp target update from(bp_error, bp_total_h, bp_mixing_depth) if(CS%check_salt_bp)
+    !$omp target update from(bp_salt_before, bp_salt_after) if(CS%check_salt_bp)
+    !$omp target update from(bp_salt_removed, bp_salt_added) if(CS%check_salt_bp)
+    !$omp target update from(fluxes%heat_content_massin) if(use_hc_massin)
+    !$omp target update from(fluxes%heat_content_massout) if(use_hc_massout)
+    !$omp target update from(tv%TempxPmE) if(use_TempxPmE)
+
+    !   Report the errors that the kernel above detected and accumulate the grounding events, in
+    ! the same j-outer, i-inner order that the column loop used to visit them in.
+    do j=js,je ; do i=is,ie
+
+      if (ml_k(i,j) > 0) then
+        call forcing_SinglePointPrint(fluxes,G,i,j,'applyBoundaryFluxesInOut (h<0)')
+        !TODO: remove write statements
+        write(0,*) 'applyBoundaryFluxesInOut(): lon,lat=',G%geoLonT(i,j),G%geoLatT(i,j)
+        write(0,*) 'applyBoundaryFluxesInOut(): netT,netS,netH=', &
+            US%C_to_degC*ml_netHeat(i,j), US%S_to_ppt*ml_netSalt(i,j), netMassInOut(i,j)
+        write(0,*) 'applyBoundaryFluxesInOut(): dT,dS,dH=', &
+            US%C_to_degC*ml_dTemp(i,j), US%S_to_ppt*ml_dSalt(i,j), ml_dThick(i,j)
+        write(0,*) 'applyBoundaryFluxesInOut(): h(n),h(n+1),k=',ml_hOld(i,j),ml_hNew(i,j),ml_k(i,j)
+        call MOM_error(FATAL, "MOM_diabatic_aux.F90, applyBoundaryFluxesInOut(): "//&
+                        "Complete mass loss in column!")
+      endif
+
+      if (CS%check_salt_bp) then ; if (bp_error(i,j)) then
+        write(salt_error_mesg(1), '(A, ES24.16)')  &
+              'Net plume strength:    ', fluxes%salt_left_behind(i,j)
+        write(salt_error_mesg(2), '(A, 2ES24.16)') &
+              ' H/Plume dpt (h-unit): ', bp_total_h(i,j), bp_mixing_depth(i,j)
+        write(salt_error_mesg(3), '(A, 2ES24.16)') &
+              ' H/Plume dpt (m):      ', bp_total_h(i,j)*GV%H_to_Z, bp_mixing_depth(i,j)*GV%H_to_Z
+        write(salt_error_mesg(4), '(A, 2ES24.16)') &
+              ' Salt before/after BP: ', bp_salt_before(i,j), bp_salt_after(i,j)
+        write(salt_error_mesg(5), '(A, 2ES24.16)') &
+              ' Salt change, abs/rel: ', bp_salt_after(i,j)-bp_salt_before(i,j), &
+              (bp_salt_after(i,j)-bp_salt_before(i,j))/bp_salt_after(i,j)
+        write(salt_error_mesg(6), '(A, 2ES24.16)') &
+              ' Salt removed, abs/rel:', bp_salt_removed(i,j), bp_salt_removed(i,j)/bp_salt_after(i,j)
+        write(salt_error_mesg(7), '(A, 2ES24.16)') &
+              ' Salt added, abs/rel:  ', bp_salt_added(i,j), bp_salt_added(i,j)/bp_salt_after(i,j)
+        write(salt_error_mesg(8), '(A, ES24.16)')  &
+              ' Scheme relative error:', (bp_salt_added(i,j)-bp_salt_removed(i,j))/bp_salt_after(i,j)
+        write(salt_error_mesg(9), '(A, ES24.16)')  &
+              ' Diagnosed salt error: ', &
+              (bp_salt_after(i,j)-bp_salt_before(i,j)-bp_salt_removed(i,j))/bp_salt_after(i,j)
+        write(salt_error_mesg(10),'(A, ES24.16)')  &
+              ' Allowed error:        ', CS%check_salt_threshold
+
+        ! Ideally this would be written to a single fatal error call,
+        !  but the long message seems to hit an FMS character limit?
+        call MOM_error(WARNING,'Salt change in brine plume scheme exceeds CHECK_SALT_BRINE_PLUME_THRESHOLD ')
+        do ne=1,10
+          call MOM_error(WARNING,salt_error_mesg(ne),all_print=.true.)
+        enddo
+        call MOM_error(FATAL,'Salt conservation failed check in brine plume parameterization')
+      endif ; endif
+
       ! Check if trying to apply fluxes over land points
-      elseif ((abs(netHeat(i)) + abs(netSalt(i)) + abs(netMassIn(i)) + abs(netMassOut(i))) > 0.) then
+      if (G%mask2dT(i,j) <= 0.) then
+        if ((abs(netHeat(i,j)) + abs(netSalt(i,j)) + abs(netMassIn(i,j)) + abs(netMassOut(i,j))) > 0.) then
+          if (.not. CS%ignore_fluxes_over_land) then
+            call forcing_SinglePointPrint(fluxes,G,i,j,'applyBoundaryFluxesInOut (land)')
+            !TODO: Remove write statements
+            write(0,*) 'applyBoundaryFluxesInOut(): lon,lat=',G%geoLonT(i,j),G%geoLatT(i,j)
+            write(0,*) 'applyBoundaryFluxesInOut(): netHeat,netSalt,netMassIn,netMassOut=',&
+                US%C_to_degC*netHeat(i,j), US%S_to_ppt*netSalt(i,j), netMassIn(i,j), netMassOut(i,j)
 
-        if (.not. CS%ignore_fluxes_over_land) then
-           call forcing_SinglePointPrint(fluxes,G,i,j,'applyBoundaryFluxesInOut (land)')
-           !TODO: Remove write statements
-           write(0,*) 'applyBoundaryFluxesInOut(): lon,lat=',G%geoLonT(i,j),G%geoLatT(i,j)
-           write(0,*) 'applyBoundaryFluxesInOut(): netHeat,netSalt,netMassIn,netMassOut=',&
-               US%C_to_degC*netHeat(i), US%S_to_ppt*netSalt(i), netMassIn(i), netMassOut(i)
-
-           call MOM_error(FATAL, "MOM_diabatic_aux.F90, applyBoundaryFluxesInOut(): "//&
-                                 "Mass loss over land?")
+            call MOM_error(FATAL, "MOM_diabatic_aux.F90, applyBoundaryFluxesInOut(): "//&
+                                  "Mass loss over land?")
+          endif
         endif
-
       endif
 
       ! If anything remains after the k-loop, then we have grounded out, which is a problem.
-      if (netMassIn(i)+netMassOut(i) /= 0.0) then
-!$OMP critical
+      if (netMassIn(i,j)+netMassOut(i,j) /= 0.0) then
         numberOfGroundings = numberOfGroundings +1
         if (numberOfGroundings<=maxGroundings) then
           iGround(numberOfGroundings) = i ! Record i,j location of event for
           jGround(numberOfGroundings) = j ! warning message
-          hGrounding(numberOfGroundings) = netMassIn(i)+netMassOut(i)
+          hGrounding(numberOfGroundings) = netMassIn(i,j)+netMassOut(i,j)
         endif
-!$OMP end critical
-        if (CS%id_createdH>0) CS%createdH(i,j) = CS%createdH(i,j) - (netMassIn(i)+netMassOut(i))/dt
+        if (CS%id_createdH>0) &
+          CS%createdH(i,j) = CS%createdH(i,j) - (netMassIn(i,j)+netMassOut(i,j))/dt
       endif
 
-    enddo ! i
+    enddo ; enddo ! i- and j-loop for the error reporting
 
     ! Step C/ in the application of fluxes
     ! Heat by the convergence of penetrating SW.
@@ -1523,44 +1613,36 @@ subroutine applyBoundaryFluxesInOut(CS, G, GV, US, dt, fluxes, optics, nsw, h, t
     ! Save temperature before increment with SW heating
     ! and initialize CS%penSWflux_diag to zero.
     if (CS%id_penSW_diag > 0 .or. CS%id_penSWflux_diag > 0) then
-      do k=1,nz ; do i=is,ie
-        CS%penSW_diag(i,j,k)     = T2d(i,k)
+      do concurrent( k=1:nz, j=js:je, i=is:ie)
+        CS%penSW_diag(i,j,k)     = tv%T(i,j,k)
         CS%penSWflux_diag(i,j,k) = 0.0
-      enddo ; enddo
-      k=nz+1 ; do i=is,ie
-        CS%penSWflux_diag(i,j,k) = 0.0
-      enddo
+      end do
+      do concurrent( j=js:je, i=is:ie)
+        CS%penSWflux_diag(i,j,nz+1) = 0.0
+      end do
     endif
 
     if (calculate_energetics) then
-      call absorbRemainingSW(G, GV, US, h2d, opacityBand, nsw, optics, j, dt, H_limit_fluxes, &
-                             .false., .true., T2d, Pen_SW_bnd, TKE=pen_TKE_2d, dSV_dT=dSV_dT_2d)
-      k = 1 ! For setting break-points.
-      do k=1,nz ; do i=is,ie
-        cTKE(i,j,k) = cTKE(i,j,k) + pen_TKE_2d(i,k)
-      enddo ; enddo
+      call absorbRemainingSW_3d(G, GV, US, h, opacityBand, nsw, optics, dt, H_limit_fluxes, &
+                                .false., .true., tv%T, Pen_SW_bnd, dom3, T_chg_above, &
+                                TKE=pen_TKE_3d, dSV_dT=dSV_dT)
+      do concurrent (k=1:nz, j=js:je, i=is:ie)
+        cTKE(i,j,k) = cTKE(i,j,k) + pen_TKE_3d(i,j,k)
+      enddo
     else
-      call absorbRemainingSW(G, GV, US, h2d, opacityBand, nsw, optics, j, dt, H_limit_fluxes, &
-                             .false., .true., T2d, Pen_SW_bnd)
+      call absorbRemainingSW_3d(G, GV, US, h, opacityBand, nsw, optics, dt, H_limit_fluxes, &
+                                .false., .true., tv%T, Pen_SW_bnd, dom3, T_chg_above)
     endif
-
-
-    ! Step D/ copy updated thickness and temperature
-    ! 2d slice now back into model state.
-    do k=1,nz ; do i=is,ie
-      h(i,j,k)    = h2d(i,k)
-      tv%T(i,j,k) = T2d(i,k)
-    enddo ; enddo
 
     ! Diagnose heating [Q R Z T-1 ~> W m-2] applied to a grid cell from SW penetration
     ! Also diagnose the penetrative SW heat flux at base of layer.
     if (CS%id_penSW_diag > 0 .or. CS%id_penSWflux_diag > 0) then
 
       ! convergence of SW into a layer
-      do k=1,nz ; do i=is,ie
+      do concurrent( k=1:nz, j=js:je, i=is:ie)
         ! Note that the units of penSW_diag change here, from [C ~> degC] to [Q R Z T-1 ~> W m-2].
-        CS%penSW_diag(i,j,k) = (T2d(i,k)-CS%penSW_diag(i,j,k))*h(i,j,k) * Idt * tv%C_p * GV%H_to_RZ
-      enddo ; enddo
+        CS%penSW_diag(i,j,k) = (tv%T(i,j,k)-CS%penSW_diag(i,j,k))*h(i,j,k) * Idt * tv%C_p * GV%H_to_RZ
+      enddo
 
       ! Perform a cumulative sum upwards from bottom to
       ! diagnose penetrative SW flux at base of tracer cell.
@@ -1569,18 +1651,21 @@ subroutine applyBoundaryFluxesInOut(CS, G, GV, US, dt, fluxes, optics, nsw, h, t
       ! CS%penSWflux_diag = rsdo  and CS%penSW_diag = rsdoabsorb
       ! rsdoabsorb(k) = rsdo(k) - rsdo(k+1), so that rsdo(k) = rsdo(k+1) + rsdoabsorb(k)
       if (CS%id_penSWflux_diag > 0) then
-        do k=nz,1,-1 ; do i=is,ie
-          CS%penSWflux_diag(i,j,k) = CS%penSW_diag(i,j,k) + CS%penSWflux_diag(i,j,k+1)
-        enddo ; enddo
+        do concurrent( j=js:je, i=is:ie)
+          do k=nz,1,-1
+            CS%penSWflux_diag(i,j,k) = CS%penSW_diag(i,j,k) + CS%penSWflux_diag(i,j,k+1)
+          enddo
+        enddo
       endif
 
     endif
 
     ! Fill CS%nonpenSW_diag
     if (CS%id_nonpenSW_diag > 0) then
-      do i=is,ie
-        CS%nonpenSW_diag(i,j) = nonpenSW(i) * Idt * tv%C_p * GV%H_to_RZ
-      enddo
+      !$omp target update from(nonpenSW)
+      do j=js,je ; do i=is,ie
+        CS%nonpenSW_diag(i,j) = nonpenSW(i,j) * Idt * tv%C_p * GV%H_to_RZ
+      enddo ; enddo
     endif
 
     ! BGR: Get buoyancy flux to return for ePBL
@@ -1589,55 +1674,67 @@ subroutine applyBoundaryFluxesInOut(CS, G, GV, US, dt, fluxes, optics, nsw, h, t
     !  1) Answers will change due to round-off
     !  2) Be sure to save their values BEFORE fluxes are used.
     if (Calculate_Buoyancy) then
-      netPen_rate(:) = 0.0
       ! Sum over bands and attenuate as a function of depth.
       ! netPen_rate is the netSW as a function of depth, but only the surface value is used here,
       ! in which case the values of dt, h, optics and H_limit_fluxes are irrelevant.  Consider
       ! writing a shorter and simpler variant to handle this very limited case.
-      ! Find the vertical distances across layers.
-      ! call thickness_to_dz(h, tv, dz, j, G, GV)
-      ! call sumSWoverBands(G, GV, US, h2d, dz, optics_nbands(optics), optics, j, dt, &
-      !                     H_limit_fluxes, .true., pen_SW_bnd_rate, netPen)
-      do i=is,ie ; do nb=1,nsw ; netPen_rate(i) = netPen_rate(i) + pen_SW_bnd_rate(nb,i) ; enddo ; enddo
+      do concurrent( j=js:je, i=is:ie)
+        netPen_rate(i,j) = 0.0
+        do nb=1,nsw ; netPen_rate(i,j) = netPen_rate(i,j) + pen_SW_bnd_rate(nb,i,j) ; enddo
 
-      ! 1. Adjust netSalt to reflect dilution effect of FW flux
-      ! 2. Add in the SW heating for purposes of calculating the net
-      ! surface buoyancy flux affecting the top layer.
-      ! 3. Convert to a buoyancy flux, excluding penetrating SW heating
-      !    BGR-Jul 5, 2017: The contribution of SW heating here needs investigated for ePBL.
-      if (associated(tv%p_surf)) then ; do i=is,ie ; SurfPressure(i) = tv%p_surf(i,j) ; enddo ; endif
+        ! 1. Adjust netSalt to reflect dilution effect of FW flux
+        ! 2. Add in the SW heating for purposes of calculating the net
+        ! surface buoyancy flux affecting the top layer.
+        ! 3. Convert to a buoyancy flux, excluding penetrating SW heating
+        !    BGR-Jul 5, 2017: The contribution of SW heating here needs investigated for ePBL.
+        SurfPressure(i,j,1) = 0.0
+        if (use_p_surf) SurfPressure(i,j,1) = tv%p_surf(i,j)
+      enddo
 
       if ((.not.GV%Boussinesq) .and. (.not.GV%semi_Boussinesq)) then
         g_conv = GV%g_Earth_Z_T2 * GV%H_to_RZ
 
         ! Specific volume derivatives
-        call calculate_specific_vol_derivs(T2d(:,1), tv%S(:,j,1), SurfPressure, dSpV_dT, dSpV_dS, &
-                                  tv%eqn_of_state, EOS_domain(G%HI))
-        do i=is,ie
+        call calculate_specific_vol_derivs(tv%T, tv%S, SurfPressure, dSpV_dT, dSpV_dS, &
+                                  tv%eqn_of_state, EOSdom_sfc)
+        ! !$omp target teams distribute parallel do collapse(2) private(i, j)
+        do concurrent( j=js:je, i=is:ie)
           SkinBuoyFlux(i,j) = g_conv * &
-              (dSpV_dS(i) * ( netSalt_rate(i) - tv%S(i,j,1)*netMassInOut_rate(i)) + &
-               dSpV_dT(i) * ( netHeat_rate(i) + netPen_rate(i)) ) ! [Z2 T-3 ~> m2 s-3]
+              (dSpV_dS(i,j,1) * ( netSalt_rate(i,j) - tv%S(i,j,1)*netMassInOut_rate(i,j)) + &
+                dSpV_dT(i,j,1) * ( netHeat_rate(i,j) + netPen_rate(i,j)) ) ! [Z2 T-3 ~> m2 s-3]
         enddo
       else
         ! Density derivatives
-        call calculate_density_derivs(T2d(:,1), tv%S(:,j,1), SurfPressure, dRhodT, dRhodS, &
-                                      tv%eqn_of_state, EOSdom)
-        do i=is,ie
+        call calculate_density_derivs(tv%T, tv%S, SurfPressure, dRhodT, dRhodS, &
+                                      tv%eqn_of_state, EOSdom_sfc)
+        do concurrent( j=js:je, i=is:ie)
           SkinBuoyFlux(i,j) = - GoRho * GV%H_to_Z * &
-              (dRhodS(i) * ( netSalt_rate(i) - tv%S(i,j,1)*netMassInOut_rate(i)) + &
-               dRhodT(i) * ( netHeat_rate(i) + netPen_rate(i)) ) ! [Z2 T-3 ~> m2 s-3]
+              (dRhodS(i,j,1) * ( netSalt_rate(i,j) - tv%S(i,j,1)*netMassInOut_rate(i,j)) + &
+                dRhodT(i,j,1) * ( netHeat_rate(i,j) + netPen_rate(i,j)) ) ! [Z2 T-3 ~> m2 s-3]
         enddo
       endif
     endif
 
-  enddo ! j-loop finish
+  endif ! associated(fluxes%sw)
 
   ! Post the diagnostics
   if (CS%id_createdH       > 0) call post_data(CS%id_createdH      , CS%createdH      , CS%diag)
-  if (CS%id_brine_input    > 0) call post_data(CS%id_brine_input   , CS%brine_input   , CS%diag)
-  if (CS%id_penSW_diag     > 0) call post_data(CS%id_penSW_diag    , CS%penSW_diag    , CS%diag)
-  if (CS%id_penSWflux_diag > 0) call post_data(CS%id_penSWflux_diag, CS%penSWflux_diag, CS%diag)
-  if (CS%id_nonpenSW_diag  > 0) call post_data(CS%id_nonpenSW_diag , CS%nonpenSW_diag , CS%diag)
+  if (CS%id_brine_input    > 0) then
+    !$omp target update from(CS%brine_input)
+    call post_data(CS%id_brine_input   , CS%brine_input   , CS%diag)
+  endif
+  if (CS%id_penSW_diag     > 0) then
+    !$omp target update from(CS%penSW_diag)
+    call post_data(CS%id_penSW_diag    , CS%penSW_diag    , CS%diag)
+  endif
+  if (CS%id_penSWflux_diag > 0) then
+    !$omp target update from(CS%penSWflux_diag)
+    call post_data(CS%id_penSWflux_diag, CS%penSWflux_diag, CS%diag)
+  endif
+  if (CS%id_nonpenSW_diag  > 0) then
+    !$omp target update from(CS%nonpenSW_diag)
+    call post_data(CS%id_nonpenSW_diag , CS%nonpenSW_diag , CS%diag)
+  endif
 
 ! The following check will be ignored if ignore_fluxes_over_land = true
   if ((numberOfGroundings > 0) .and. .not.CS%ignore_fluxes_over_land) then
@@ -1655,6 +1752,15 @@ subroutine applyBoundaryFluxesInOut(CS, G, GV, US, dt, fluxes, optics, nsw, h, t
                               trim(mesg) // " groundings remaining")
     endif
   endif
+
+  !$omp target exit data map(delete: netMassInOut, netMassIn, netMassOut, netHeat, netSalt, &
+  !$omp                              nonpenSW, netheat_rate, netsalt_rate, netMassInOut_rate, &
+  !$omp                              netPen_rate, SurfPressure, dRhodT, dRhodS, dSpV_dT, dSpV_dS, &
+  !$omp                              p_lay, pen_TKE_3d, T_chg_above, Pen_SW_bnd, Pen_SW_bnd_rate, &
+  !$omp                              opacityBand, ml_k, ml_dTemp, ml_dSalt, ml_dThick, ml_hOld, &
+  !$omp                              ml_hNew, ml_netHeat, ml_netSalt, bp_error, bp_total_h, &
+  !$omp                              bp_mixing_depth, bp_salt_before, bp_salt_after, &
+  !$omp                              bp_salt_removed, bp_salt_added)
 
 end subroutine applyBoundaryFluxesInOut
 
@@ -1879,6 +1985,9 @@ subroutine diabatic_aux_init(Time, G, GV, US, param_file, diag, CS, useALEalgori
   id_clock_uv_at_h = cpu_clock_id('(Ocean find_uv_at_h)', grain=CLOCK_ROUTINE)
   id_clock_frazil  = cpu_clock_id('(Ocean frazil)', grain=CLOCK_ROUTINE)
 
+  !$omp target enter data map(to: CS)
+  !$omp target enter data map(alloc: CS%brine_input, CS%penSW_diag, CS%penSWflux_diag)
+
 end subroutine diabatic_aux_init
 
 !> This subroutine initializes the control structure and any related memory
@@ -1894,6 +2003,8 @@ subroutine diabatic_aux_end(CS)
   if (CS%id_penSWflux_diag >0) deallocate(CS%penSWflux_diag)
   if (CS%id_nonpenSW_diag  >0) deallocate(CS%nonpenSW_diag)
 
+  !$omp target exit data map(delete: CS%brine_input, CS%penSW_diag, CS%penSWflux_diag)
+  !$omp target exit data map(delete: CS)
   if (associated(CS)) deallocate(CS)
 
 end subroutine diabatic_aux_end
