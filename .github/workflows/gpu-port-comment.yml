@@ -138,7 +138,11 @@ jobs:
             let body = fs.readFileSync('gpu_port_comment.md', 'utf8');
             const pagesUrl = process.env.PAGES_URL;
             if (pagesUrl) {
-              body += `\n[Full line-by-line coverage report](${pagesUrl})\n`;
+              body += `\n[Full line-by-line coverage report](${pagesUrl}total/) (combined across all cases)\n`;
+              // Each case is also run and reported in isolation — see
+              // gpu-port-report's "Generate per-case GPU port coverage pages" step.
+              const cases = ['benchmark_ALE', 'double_gyre', 'benchmark'];
+              body += cases.map(c => `[${c}](${pagesUrl}${c}/)`).join(' · ') + '\n';
             }
             const marker = '<!-- gpu-port-report -->';
             const fullBody = `${marker}\n${body}`;

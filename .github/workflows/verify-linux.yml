@@ -644,29 +644,111 @@ jobs:
           tar -xpvf mom6-coverage.tar
           find .testing/build/cov -name "*.gcno" -exec touch {} \;
 
-      # Only the benchmark_ALE inputs are needed here — no MOM6/FMS build,
-      # since the coverage-instrumented binary from build-coverage is reused
-      # as-is.
-      - name: Clone MOM6-gpu/MOM6-examples for the benchmark_ALE case
-        run: git clone --depth 1 https://github.com/MOM6-gpu/MOM6-examples.git MOM6-examples
-
-      # Force a single-rank layout and a short run: this is a coverage smoke
-      # run, not a scaling test, and the runner may have far fewer cores
-      # than whatever layout benchmark_ALE happens to be checked in with.
-      - name: Shorten benchmark_ALE to a single-rank, single short run
+      # Only the inputs for these three cases are needed here — no MOM6/FMS
+      # build, since the coverage-instrumented binary from build-coverage is
+      # reused as-is for all of them. A plain `git clone` would also pull
+      # down every other case's input/restart files (several NetCDF files
+      # each), so this fetches just these directories instead.
+      - name: Clone MOM6-gpu/MOM6-examples for the benchmark_ALE, double_gyre, and benchmark cases
         run: |
+          # --depth 1: only fetch the latest commit, not the repo's full
+          #   history.
+          # --filter=blob:none: a "partial clone" — fetch commit and
+          #   directory-tree metadata for everything, but not file
+          #   contents (blobs); those are downloaded on demand the first
+          #   time something asks for them (below).
+          # --no-checkout: don't populate a working tree yet (which would
+          #   need every blob in the latest commit) — .git metadata only,
+          #   deferring the on-demand blob fetch above until the git
+          #   archive step explicitly asks for one directory.
+          git clone --depth 1 --filter=blob:none --no-checkout \
+            https://github.com/MOM6-gpu/MOM6-examples.git MOM6-examples
+          cd MOM6-examples
+          # `git archive` packs directories (here, ocean_only/benchmark_ALE,
+          # ocean_only/double_gyre, and ocean_only/benchmark) from a given
+          # commit (HEAD) into a tar stream. This is what triggers the
+          # on-demand blob fetch from above — only for files under these
+          # paths — and `tar -x` unpacks that stream straight into the
+          # working directory, so the net effect is "check out just these
+          # directories" without ever downloading the other cases' data
+          # files.
+          git archive HEAD -- \
+            ocean_only/benchmark_ALE \
+            ocean_only/double_gyre \
+            ocean_only/benchmark \
+            | tar -x
+
+      # Force a single-rank layout and a short run for each case: these are
+      # coverage smoke runs, not scaling tests, and the runner may have far
+      # fewer cores than whatever layout each case happens to be checked in
+      # with. benchmark is a much larger grid than the other two, so it gets
+      # a shorter DAYMAX to keep the smoke run quick; double_gyre is already
+      # small and fast at its checked-in DAYMAX, so only LAYOUT is forced.
+      #
+      # Some checked-in MOM_override files already carry their own #override
+      # DAYMAX/LAYOUT lines (e.g. benchmark's ships with an active
+      # `#override DAYMAX = 24.`). MOM_file_parser fatals if a second,
+      # differing #override for the same parameter is appended to the same
+      # file ("found with multiple inconsistent overrides"), so strip any
+      # pre-existing DAYMAX/LAYOUT overrides before adding ours.
+      - name: Shorten cases to single-rank, single short runs
+        run: |
+          for case in benchmark_ALE double_gyre benchmark; do
+            sed -i -E '/^!*#override[[:space:]]+(DAYMAX|LAYOUT)[[:space:]]*=/d' \
+              "MOM6-examples/ocean_only/$case/MOM_override"
+          done
           {
             echo '#override DAYMAX = 0.5'
             echo '#override LAYOUT = 1,1'
           } >> MOM6-examples/ocean_only/benchmark_ALE/MOM_override
+          echo '#override LAYOUT = 1,1' >> MOM6-examples/ocean_only/double_gyre/MOM_override
+          {
+            echo '#override DAYMAX = 3'
+            echo '#override LAYOUT = 1,1'
+          } >> MOM6-examples/ocean_only/benchmark/MOM_override
 
-      - name: Run benchmark_ALE with the coverage-instrumented binary
+      # Each case's coverage is captured in isolation: .gcda counters are reset
+      # before every run, so this case's gcov snapshot (and the per-case HTML
+      # report generated from it below) reflects only its own code paths, not
+      # an accumulation across all three. Snapshots are archived to
+      # gcov-reports/<case>/ before the next case resets the counters again.
+      - name: Run benchmark_ALE and archive its own gcov snapshot
         working-directory: MOM6-examples/ocean_only/benchmark_ALE
-        run: mpirun -np 1 "$GITHUB_WORKSPACE/.testing/build/cov/MOM6"
+        run: |
+          rm -f "$GITHUB_WORKSPACE/.testing/build/cov"/*.gcda
+          mpirun -np 1 "$GITHUB_WORKSPACE/.testing/build/cov/MOM6"
+          cd "$GITHUB_WORKSPACE/.testing/build/cov" && gcov -b *.gcda
+          mkdir -p "$GITHUB_WORKSPACE/gcov-reports/benchmark_ALE"
+          mv "$GITHUB_WORKSPACE/.testing/build/cov"/*.gcov "$GITHUB_WORKSPACE/gcov-reports/benchmark_ALE/"
 
-      - name: Generate gcov reports
-        working-directory: .testing/build/cov
-        run: gcov -b *.gcda
+      - name: Run double_gyre and archive its own gcov snapshot
+        working-directory: MOM6-examples/ocean_only/double_gyre
+        run: |
+          rm -f "$GITHUB_WORKSPACE/.testing/build/cov"/*.gcda
+          mpirun -np 1 "$GITHUB_WORKSPACE/.testing/build/cov/MOM6"
+          cd "$GITHUB_WORKSPACE/.testing/build/cov" && gcov -b *.gcda
+          mkdir -p "$GITHUB_WORKSPACE/gcov-reports/double_gyre"
+          mv "$GITHUB_WORKSPACE/.testing/build/cov"/*.gcov "$GITHUB_WORKSPACE/gcov-reports/double_gyre/"
+
+      - name: Run benchmark and archive its own gcov snapshot
+        working-directory: MOM6-examples/ocean_only/benchmark
+        run: |
+          rm -f "$GITHUB_WORKSPACE/.testing/build/cov"/*.gcda
+          mpirun -np 1 "$GITHUB_WORKSPACE/.testing/build/cov/MOM6"
+          cd "$GITHUB_WORKSPACE/.testing/build/cov" && gcov -b *.gcda
+          mkdir -p "$GITHUB_WORKSPACE/gcov-reports/benchmark"
+          mv "$GITHUB_WORKSPACE/.testing/build/cov"/*.gcov "$GITHUB_WORKSPACE/gcov-reports/benchmark/"
+
+      # One page per case, generated from that case's own isolated snapshot
+      # above (gcov-reports/<case>/) — not the combined report below.
+      - name: Generate per-case GPU port coverage pages
+        run: |
+          for case in benchmark_ALE double_gyre benchmark; do
+            python3 .testing/tools/track_gpu_port.py \
+              --src-root . \
+              --gcov-dir "gcov-reports/$case" \
+              --out-html "gpu_port_html/$case"
+          done
 
       # List the .F90/.f90 files this PR actually touches, so the comment can report a
       # "this PR's files" subset in addition to the repo-wide total. Paths are left
@@ -709,7 +791,12 @@ jobs:
           github-token: ${{ github.token }}
           path: baseline
 
-      - name: Generate GPU port coverage report
+      # Combines all three cases' archived snapshots (gcov-reports/<case>/) into the
+      # one overall report used for the PR comment, baseline delta, job summary, and
+      # annotations — mathematically the same union-of-executed-lines a single
+      # accumulated run would give, since track_gpu_port.py already merges same-source
+      # counts across every .gcov file found under --gcov-dir (recursively).
+      - name: Generate combined GPU port coverage report
         run: |
           EXTRA_ARGS=()
           if [ -f baseline/gpu_port_report.json ]; then
@@ -720,13 +807,34 @@ jobs:
           fi
           python3 .testing/tools/track_gpu_port.py \
             --src-root . \
-            --gcov-dir .testing/build/cov \
+            --gcov-dir gcov-reports \
             --out-md gpu_port_report.md \
             --out-json gpu_port_report.json \
-            --out-html gpu_port_html \
+            --out-html gpu_port_html/total \
             --github-annotations \
             --verbose \
             "${EXTRA_ARGS[@]}"
+
+      # gpu_port_html/ itself has no report of its own — total/ (above) and each
+      # case/ (from "Generate per-case GPU port coverage pages") are siblings inside
+      # it, so this page just lets a reader pick one. Copied as-is to gh-pages by
+      # gpu-port-comment.yml, so this becomes the landing page at pr-<number>/ or
+      # porting_progress/.
+      - name: Generate GPU port coverage case picker page
+        run: |
+          {
+            echo '<!doctype html><html><head><meta charset="utf-8">'
+            echo '<title>GPU port coverage</title>'
+            echo '<style>body{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;margin:0;padding:1rem 1.5rem}ul{padding-left:1.2rem}li{margin:4px 0}</style>'
+            echo '</head><body>'
+            echo '<h1>GPU port coverage</h1>'
+            echo '<ul>'
+            echo '<li><a href="total/index.html">total (all three cases combined)</a></li>'
+            for case in benchmark_ALE double_gyre benchmark; do
+              echo "<li><a href=\"$case/index.html\">$case</a></li>"
+            done
+            echo '</ul></body></html>'
+          } > gpu_port_html/index.html
 
       - name: Publish report to job summary
         if: always()

@@ -187,6 +187,13 @@ AS_IF(
 MOM6_FC_DO_CONCURRENT_LOCAL
 
 
+# Detect if parentheses are honored in floating point arithmetic
+MOM6_FC_FAST_RINT
+AS_IF([test -n "$FAST_RINT_FCFLAGS"],
+  [FCFLAGS="$FCFLAGS $FAST_RINT_FCFLAGS"]
+)
+
+
 # OpenMP configuration
 
 # NOTE: AC_OPENMP fails on `Fortran` for Autoconf <2.69 due to a m4 bug.
@@ -204,6 +211,9 @@ AS_IF(
   FCFLAGS="$FCFLAGS $OPENMP_FCFLAGS"
   LDFLAGS="$LDFLAGS $OPENMP_FCFLAGS"
 ])
+
+# Check for support of the OpenMP loop construct's bind clause
+MOM6_FC_OMP_LOOP_BIND
 
 
 # FMS support
