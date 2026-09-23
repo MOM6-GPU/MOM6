@@ -758,7 +758,12 @@ subroutine calculate_diagnostic_fields(u, v, h, uh, vh, tv, ADp, CDp, p_surf, &
 
   if ((CS%id_cg1>0) .or. (CS%id_Rd1>0) .or. (CS%id_cfl_cg1>0) .or. &
       (CS%id_cfl_cg1_x>0) .or. (CS%id_cfl_cg1_y>0)) then
+    ! wave_speed calculates cg1 on the device, so its inputs have to be resident there.
+    !$omp target enter data map(to: tv, tv%T, tv%S)
+    !$omp target enter data map(alloc: cg1)
     call wave_speed(h, tv, G, GV, US, cg1, CS%wave_speed)
+    !$omp target exit data map(release: tv%T, tv%S, tv)
+    !$omp target exit data map(from: cg1)
     if (CS%id_cg1>0) call post_data(CS%id_cg1, cg1, CS%diag)
     if (CS%id_Rd1>0) then
       !$OMP parallel do default(shared) private(f2_h,mag_beta)
@@ -2285,7 +2290,7 @@ subroutine MOM_diagnostics_init(MIS, ADp, CDp, Time, G, GV, US, param_file, diag
   if ((CS%id_cg1>0) .or. (CS%id_Rd1>0) .or. (CS%id_cfl_cg1>0) .or. &
       (CS%id_cfl_cg1_x>0) .or. (CS%id_cfl_cg1_y>0) .or. &
       (CS%id_cg_ebt>0) .or. (CS%id_Rd_ebt>0) .or. (CS%id_p_ebt>0)) then
-    call wave_speed_init(CS%wave_speed, GV, remap_answer_date=remap_answer_date, &
+    call wave_speed_init(CS%wave_speed, GV, param_file, remap_answer_date=remap_answer_date, &
                          better_speed_est=better_speed_est, min_speed=wave_speed_min, &
                          wave_speed_tol=wave_speed_tol, om4_remap_via_sub_cells=om4_remap_via_sub_cells)
   endif
