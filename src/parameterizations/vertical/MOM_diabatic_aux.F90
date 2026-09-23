@@ -173,22 +173,21 @@ subroutine make_frazil_block(h, tv, G, GV, US, CS, is, ie, js, je, nii, njj, p_s
 
   ! Local variables
   real, dimension(nii,njj) :: &
-    fraz_col    ! The accumulated heat requirement due to frazil [Q R Z ~> J m-2].
+    fraz_col, & ! The accumulated heat requirement due to frazil [Q R Z ~> J m-2].
+    tmp_mask    ! A block-local copy of G%mask2dT, positive on ocean points [nondim].
   real, dimension(nii,njj,SZK_(GV)) :: &
     pressure, & ! The pressure at the middle of each layer [R L2 T-2 ~> Pa].
-    T_freeze    ! The freezing potential temperature at the current salinity [C ~> degC].
+    T_freeze, & ! The freezing potential temperature at the current salinity [C ~> degC].
+    tmp_S       ! A block-local copy of tv%S, correctly aligned with pressure and T_freeze
+                ! [S ~> ppt].
 
   real :: H_to_RL2_T2  ! A conversion factor from thicknesses in H to pressure [R L2 T-2 H-1 ~> Pa m-1 or Pa m2 kg-1]
   real :: hc    ! A layer's heat capacity [Q R Z C-1 ~> J m-2 degC-1].
   logical :: p_surf_is_present  ! True if p_surf is present. Used to determine if p_surf is used
                                 ! when calculating pressure for pressure dependent frazil.
-  logical :: pressure_dependent_frazil ! A local copy of CS%pressure_dependent_frazil, so that no
-                                ! control structure element is read from within a device region.
-  logical :: reclaim_frazil     ! A local copy of CS%reclaim_frazil, for the same reason.
   integer :: EOSdom(3,2) ! The computational domain for the equation of state within the blocked
                          ! pressure and T_freeze arrays, taking into account that the arrays inside
                          ! the EOS routines start at 1.
-  integer :: EOSdom_S(3,2) ! The corresponding domain within the unblocked tv%S and G%mask2dT.
   integer :: i, j, k, nz
   integer :: isb, ieb    ! The i-index bounds of the current block.
   integer :: jsb, jeb    ! The j-index bounds of the current block.
@@ -197,12 +196,10 @@ subroutine make_frazil_block(h, tv, G, GV, US, CS, is, ie, js, je, nii, njj, p_s
   nz = GV%ke
   p_surf_is_present = present(p_surf)
   H_to_RL2_T2 = GV%H_to_RZ * GV%g_Earth
-  pressure_dependent_frazil = CS%pressure_dependent_frazil
-  reclaim_frazil = CS%reclaim_frazil
 
   call cpu_clock_begin(id_clock_frazil)
 
-  !$omp target enter data map(alloc: pressure, T_freeze, fraz_col)
+  !$omp target enter data map(alloc: pressure, T_freeze, fraz_col, tmp_S, tmp_mask)
 
   do jsb=js,je,njj ; do isb=is,ie,nii
     jeb = min(je, jsb+njj-1) ; ieb = min(ie, isb+nii-1)
@@ -210,23 +207,31 @@ subroutine make_frazil_block(h, tv, G, GV, US, CS, is, ie, js, je, nii, njj, p_s
     EOSdom(1,1) = 1 ; EOSdom(1,2) = ieb - isb + 1
     EOSdom(2,1) = 1 ; EOSdom(2,2) = jeb - jsb + 1
     EOSdom(3,1) = 1 ; EOSdom(3,2) = nz
-    EOSdom_S(1,1) = isb - (G%isd-1) ; EOSdom_S(1,2) = ieb - (G%isd-1)
-    EOSdom_S(2,1) = jsb - (G%jsd-1) ; EOSdom_S(2,2) = jeb - (G%jsd-1)
-    EOSdom_S(3,1) = 1 ; EOSdom_S(3,2) = nz
 
-    if (.not.pressure_dependent_frazil) then
-      do concurrent( k=1:nz, j=jsb:jeb, i=isb:ieb, G%mask2dT(i,j) > 0.0 ) DO_LOCALITY(local(ii,jj))
+    ! tmp_mask must be set unconditionally (including land) so that calculate_TFreeze, which
+    ! indexes it with the same block-local indices as pressure and T_freeze, sees the correct
+    ! land/ocean value at every point in the block -- G%mask2dT itself cannot be passed directly,
+    ! since it is dimensioned over the whole domain including halos and would be misaligned with
+    ! the block-local indices used inside calculate_TFreeze.
+    do concurrent( j=jsb:jeb, i=isb:ieb ) DO_LOCALITY(local(ii,jj))
+      ii = i - isb + 1 ; jj = j - jsb + 1
+      tmp_mask(ii,jj) = G%mask2dT(i,j)
+    enddo
+
+    do concurrent( k=1:nz, j=jsb:jeb, i=isb:ieb, G%mask2dT(i,j) > 0.0 ) DO_LOCALITY(local(ii,jj))
         ii = i - isb + 1 ; jj = j - jsb + 1
-        pressure(ii,jj,k) = 0.0
-      enddo
-    endif
+        tmp_S(ii,jj,k) = tv%S(i,j,k)
+        if (.not.CS%pressure_dependent_frazil) then
+          pressure(ii,jj,k) = 0.0
+        endif
+    enddo
 
     do concurrent( j=jsb:jeb, i=isb:ieb, G%mask2dT(i,j) > 0.0 ) DO_LOCALITY(local(ii,jj))
       ii = i - isb + 1 ; jj = j - jsb + 1
 
       fraz_col(ii,jj) = 0.0
 
-      if (pressure_dependent_frazil) then
+      if (CS%pressure_dependent_frazil) then
         if (p_surf_is_present) then
           pressure(ii,jj,1) = p_surf(i,j) + (0.5*H_to_RL2_T2)*h(i,j,1)
         else
@@ -239,13 +244,13 @@ subroutine make_frazil_block(h, tv, G, GV, US, CS, is, ie, js, je, nii, njj, p_s
     enddo
 
     ! Calculate freezing point temperature for each grid cell.
-    call calculate_TFreeze(tv%S, pressure, T_freeze, tv%eqn_of_state, &
-                           EOSdom, G%mask2dT, dom_S=EOSdom_S)
+    call calculate_TFreeze(tmp_S, pressure, T_freeze, tv%eqn_of_state, &
+                           EOSdom, tmp_mask, nii, njj, nz)
 
     do concurrent( j=jsb:jeb, i=isb:ieb, G%mask2dT(i,j) > 0.0 ) DO_LOCALITY(local(hc,ii,jj))
       ii = i - isb + 1 ; jj = j - jsb + 1
 
-      if (reclaim_frazil) then
+      if (CS%reclaim_frazil) then
         if (tv%frazil(i,j) > 0.0) then
           if (tv%T(i,j,1) > T_freeze(ii,jj,1)) then
             ! If frazil had previously been formed, but the surface temperature is now
@@ -290,7 +295,7 @@ subroutine make_frazil_block(h, tv, G, GV, US, CS, is, ie, js, je, nii, njj, p_s
 
   tv%frazil_was_reset = .false.
 
-  !$omp target exit data map(delete: pressure, T_freeze, fraz_col)
+  !$omp target exit data map(delete: pressure, T_freeze, fraz_col, tmp_S, tmp_mask)
 
   call cpu_clock_end(id_clock_frazil)
 

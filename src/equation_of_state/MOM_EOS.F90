@@ -912,13 +912,15 @@ end subroutine calculate_TFreeze_1d
 !! dimensionally rescaled arguments with factors stored in EOS.  Unlike the other variants of
 !! calculate_TFreeze, this one evaluates the freezing point inside do concurrent loops so that the
 !! expressions that permit it can run on a device.  Points where mask is 0 are set to 0 rather than
-!! being left undefined, so that nothing downstream can read an uninitialized value.  The optional
-!! dom_S argument allows S and mask to be shaped differently from pressure and T_fr, as happens when
-!! a caller works on blocks but reads its salinity from a whole-domain array.
-subroutine calculate_TFreeze_3d(S, pressure, T_fr, EOS, dom, mask, dom_S)
-  real, dimension(:,:,:), intent(in)    :: S        !< Salinity [S ~> ppt]
-  real, dimension(:,:,:), intent(in)    :: pressure !< Pressure [R L2 T-2 ~> Pa]
-  real, dimension(:,:,:), intent(inout) :: T_fr     !< Freezing point, either potential temperature
+!! being left undefined, so that nothing downstream can read an uninitialized value.  S and mask
+!! must share the same block-local indexing as pressure and T_fr (i.e. they must already be
+!! shaped/copied to match dom, not passed as whole-domain arrays with a different origin), since
+!! they are indexed here with the same (i,j,k) as pressure and T_fr.
+subroutine calculate_TFreeze_3d(S, pressure, T_fr, EOS, dom, mask, nii, njj, nkk)
+  integer, intent(in)                               :: nii, njj, nkk !< The sizes of the i-, j-, and k-blocks [nondim]
+  real, dimension(1:nii,1:njj,1:nkk), intent(in)    :: S        !< Salinity [S ~> ppt]
+  real, dimension(1:nii,1:njj,1:nkk), intent(in)    :: pressure !< Pressure [R L2 T-2 ~> Pa]
+  real, dimension(1:nii,1:njj,1:nkk), intent(inout) :: T_fr     !< Freezing point, either potential temperature
                                                     !! referenced to the surface or conservative
                                                     !! temperature depending on settings [C ~> degC]
   type(EOS_type),         intent(in)    :: EOS      !< Equation of state structure
@@ -929,33 +931,18 @@ subroutine calculate_TFreeze_3d(S, pressure, T_fr, EOS, dom, mask, dom_S)
                                                     !! (1 = lower, 2 = upper).
   real, dimension(:,:),   intent(in)    :: mask     !< A mask that is positive on the points to
                                                     !! evaluate and 0 on land points [nondim]
-  integer,      optional, intent(in)    :: dom_S(3,2) !< The domain of indices to work on within S
-                                                    !! and mask, for callers whose S and mask are not
-                                                    !! blocked in the same way as pressure and T_fr.
-                                                    !! Its extents must match those of dom.  The
-                                                    !! default is dom, in which case all four arrays
-                                                    !! share a common shape and origin.
 
   ! Local variables
-  real, dimension(size(pressure,1),size(pressure,2),size(pressure,3)) :: absS ! Salinity converted
+  real, dimension(1:nii,1:njj,1:nkk) :: absS ! Salinity converted
                                             ! to absolute salinity [ppt]
-  real, dimension(size(pressure,1),size(pressure,2),size(pressure,3)) :: TFreeze_S ! The salinity for
+  real, dimension(1:nii,1:njj,1:nkk) :: TFreeze_S ! The salinity for
                                             ! the freezing point expression in model units [S ~> PSU or ppt]
   integer :: i, j, k
   integer :: is, ie, js, je, ks, ke
-  integer :: i_off, j_off, k_off ! Offsets to add to the indices of pressure and T_fr to obtain the
-                                 ! corresponding indices of S and mask [nondim]
 
   is = dom(1,1) ; ie = dom(1,2)
   js = dom(2,1) ; je = dom(2,2)
   ks = dom(3,1) ; ke = dom(3,2)
-
-  i_off = 0 ; j_off = 0 ; k_off = 0
-  if (present(dom_S)) then
-    i_off = dom_S(1,1) - dom(1,1)
-    j_off = dom_S(2,1) - dom(2,1)
-    k_off = dom_S(3,1) - dom(3,1)
-  endif
 
   !$omp target enter data map(alloc: TFreeze_S)
 
@@ -963,7 +950,7 @@ subroutine calculate_TFreeze_3d(S, pressure, T_fr, EOS, dom, mask, dom_S)
     ! The conversion from absolute to practical is not pure so it is done on cpu
     !$omp target update from(S)
     do k=ks,ke ; do j=js,je ; do i=is,ie
-      absS(i,j,k) = S(i+i_off,j+j_off,k+k_off)*EOS%S_to_ppt
+      absS(i,j,k) = S(i,j,k)*EOS%S_to_ppt
     enddo ; enddo ; enddo
     if (EOS%TFreeze_S_is_pracS) then
       do k=ks,ke ; do j=js,je ; do i=is,ie
@@ -971,50 +958,38 @@ subroutine calculate_TFreeze_3d(S, pressure, T_fr, EOS, dom, mask, dom_S)
       enddo ; enddo ; enddo
     else
       do k=ks,ke ; do j=js,je ; do i=is,ie
-        TFreeze_S(i,j,k) = S(i+i_off,j+j_off,k+k_off)
+        TFreeze_S(i,j,k) = S(i,j,k)
       enddo ; enddo ; enddo
     endif
     !$omp target update to(TFreeze_S)
   else
     do concurrent (k=ks:ke, j=js:je, i=is:ie)
-      TFreeze_S(i,j,k) = S(i+i_off,j+j_off,k+k_off)
+      TFreeze_S(i,j,k) = S(i,j,k)
     enddo
   endif
 
   select case (EOS%form_of_TFreeze)
     case (TFREEZE_LINEAR)
-      do concurrent (k=ks:ke, j=js:je, i=is:ie)
-        if (mask(i+i_off,j+j_off) > 0.0) then
-          call calculate_TFreeze_linear(EOS%S_to_ppt*TFreeze_S(i,j,k), &
+      do concurrent (k=ks:ke, j=js:je, i=is:ie, (mask(i,j) > 0.0) )
+        call calculate_TFreeze_linear(EOS%S_to_ppt*TFreeze_S(i,j,k), &
                                         EOS%RL2_T2_to_Pa*pressure(i,j,k), T_fr(i,j,k), &
                                         EOS%TFr_S0_P0, EOS%dTFr_dS, EOS%dTFr_dp)
-        else
-          T_fr(i,j,k) = 0.0
-        endif
       enddo
     case (TFREEZE_MILLERO)
-      do concurrent (k=ks:ke, j=js:je, i=is:ie)
-        if (mask(i+i_off,j+j_off) > 0.0) then
-          call calculate_TFreeze_Millero(EOS%S_to_ppt*TFreeze_S(i,j,k), &
-                                         EOS%RL2_T2_to_Pa*pressure(i,j,k), T_fr(i,j,k))
-        else
-          T_fr(i,j,k) = 0.0
-        endif
+      do concurrent (k=ks:ke, j=js:je, i=is:ie, (mask(i,j) > 0.0) )
+        call calculate_TFreeze_Millero(EOS%S_to_ppt*TFreeze_S(i,j,k), &
+                                       EOS%RL2_T2_to_Pa*pressure(i,j,k), T_fr(i,j,k))
       enddo
     case (TFREEZE_TEOSPOLY)
-      do concurrent (k=ks:ke, j=js:je, i=is:ie)
-        if (mask(i+i_off,j+j_off) > 0.0) then
-          call calculate_TFreeze_TEOS_poly(EOS%S_to_ppt*TFreeze_S(i,j,k), &
-                                           EOS%RL2_T2_to_Pa*pressure(i,j,k), T_fr(i,j,k))
-        else
-          T_fr(i,j,k) = 0.0
-        endif
+      do concurrent (k=ks:ke, j=js:je, i=is:ie, (mask(i,j) > 0.0) )
+        call calculate_TFreeze_TEOS_poly(EOS%S_to_ppt*TFreeze_S(i,j,k), &
+                                         EOS%RL2_T2_to_Pa*pressure(i,j,k), T_fr(i,j,k))
       enddo
     case (TFREEZE_TEOS10)
       ! calculate_TFreeze_teos10 calls gsw_ct_freezing_exact, which is not pure so it is done on the cpu
       !$omp target update from(TFreeze_S, pressure)
       do k=ks,ke ; do j=js,je ; do i=is,ie
-        if (mask(i+i_off,j+j_off) > 0.0) then
+        if (mask(i,j) > 0.0) then
           call calculate_TFreeze_teos10(EOS%S_to_ppt*TFreeze_S(i,j,k), &
                                         EOS%RL2_T2_to_Pa*pressure(i,j,k), T_fr(i,j,k))
         else
@@ -1031,7 +1006,7 @@ subroutine calculate_TFreeze_3d(S, pressure, T_fr, EOS, dom, mask, dom_S)
     ! absS is in ppt and T_fr is in degC at this point.
     !$omp target update from(T_fr)
     do k=ks,ke ; do j=js,je ; do i=is,ie
-      if (mask(i+i_off,j+j_off) > 0.0) T_fr(i,j,k) = gsw_ct_from_pt(absS(i,j,k), T_fr(i,j,k))
+      if (mask(i,j) > 0.0) T_fr(i,j,k) = gsw_ct_from_pt(absS(i,j,k), T_fr(i,j,k))
     enddo ; enddo ; enddo
     !$omp target update to(T_fr)
   endif
