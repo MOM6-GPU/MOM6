@@ -2999,7 +2999,7 @@ subroutine btstep_timeloop(eta, ubt, vbt, uhbt0, Datu, BTCL_u, vhbt0, Datv, BTCL
       enddo
 
       if (eta_is_submerged) then
-        !$omp target update from(submerged)
+        !$omp target update from(submerged, eta)
         do j=jsv,jev ; do i=isv,iev ; if (submerged(i,j)) then
           write(mesg,'(ES24.16, " vs. ", ES24.16, " at ", ES12.4, ES12.4, i7, i7)') &
               GV%H_to_m*eta(i,j), -US%Z_to_m*G%bathyT(i,j), G%geoLonT(i,j), G%geoLatT(i,j), &
@@ -3035,7 +3035,7 @@ subroutine btstep_timeloop(eta, ubt, vbt, uhbt0, Datu, BTCL_u, vhbt0, Datv, BTCL
       enddo
 
       if (eta_is_submerged) then
-        !$omp target update from(submerged)
+        !$omp target update from(submerged, eta)
         do j=js,je ; do i=is,ie ; if (submerged(i,j)) then
           write(mesg,'(ES24.16, " vs. ", ES24.16, " at ", ES12.4, ES12.4, i7, i7)') &
               GV%H_to_m*eta(i,j), -US%Z_to_m*G%bathyT(i,j), G%geoLonT(i,j), G%geoLatT(i,j), &
