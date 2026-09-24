@@ -201,7 +201,7 @@ subroutine make_frazil_block(h, tv, G, GV, US, CS, is, ie, js, je, nii, njj, p_s
 
   call cpu_clock_begin(id_clock_frazil)
 
-  !$omp target enter data map(alloc: pressure, T_freeze, fraz_col, S_block, frazil_mask)
+  !$omp target enter data map(alloc: pressure, T_freeze, fraz_col, S_block, frazil_mask, any_frazil)
 
   do jsb=js,je,njj ; do isb=is,ie,nii
     jeb = min(je, jsb+njj-1) ; ieb = min(ie, isb+nii-1)
@@ -327,7 +327,7 @@ subroutine make_frazil_block(h, tv, G, GV, US, CS, is, ie, js, je, nii, njj, p_s
 
   tv%frazil_was_reset = .false.
 
-  !$omp target exit data map(delete: pressure, T_freeze, fraz_col, S_block, frazil_mask)
+  !$omp target exit data map(delete: pressure, T_freeze, fraz_col, S_block, frazil_mask, any_frazil)
 
   call cpu_clock_end(id_clock_frazil)
 

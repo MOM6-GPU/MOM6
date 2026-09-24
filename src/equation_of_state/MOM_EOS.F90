@@ -916,7 +916,7 @@ end subroutine calculate_TFreeze_1d
 !! shaped/copied to match dom, not passed as whole-domain arrays with a different origin), since
 !! they are indexed here with the same (i,j,k) as pressure and T_fr.
 subroutine calculate_TFreeze_3d(S, pressure, T_fr, EOS, dom, mask, nii, njj, nkk)
-  integer, intent(in)                               :: nii,!< The i-size of blocked arrays [nondim]
+  integer, intent(in)                               :: nii !< The i-size of blocked arrays [nondim]
   integer, intent(in)                               :: njj !< The j-size of blocked arrays [nondim]
   integer, intent(in)                               :: nkk !< The k-size of blocked arrays [nondim]
   real, dimension(1:nii,1:njj,1:nkk), intent(in)    :: S        !< Salinity [S ~> ppt]
