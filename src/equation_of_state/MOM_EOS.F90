@@ -911,13 +911,14 @@ end subroutine calculate_TFreeze_1d
 !> Calls the appropriate subroutine to calculate the freezing point for a 3-D array, taking
 !! dimensionally rescaled arguments with factors stored in EOS.  Unlike the other variants of
 !! calculate_TFreeze, this one evaluates the freezing point inside do concurrent loops so that the
-!! expressions that permit it can run on a device.  Points where mask is 0 are set to 0 rather than
-!! being left undefined, so that nothing downstream can read an uninitialized value.  S and mask
+!! expressions that permit it can run on a GPU. Masked points are left undefined.  S and mask
 !! must share the same block-local indexing as pressure and T_fr (i.e. they must already be
 !! shaped/copied to match dom, not passed as whole-domain arrays with a different origin), since
 !! they are indexed here with the same (i,j,k) as pressure and T_fr.
 subroutine calculate_TFreeze_3d(S, pressure, T_fr, EOS, dom, mask, nii, njj, nkk)
-  integer, intent(in)                               :: nii, njj, nkk !< The sizes of the i-, j-, and k-blocks [nondim]
+  integer, intent(in)                               :: nii,!< The i-size of blocked arrays [nondim]
+  integer, intent(in)                               :: njj !< The j-size of blocked arrays [nondim]
+  integer, intent(in)                               :: nkk !< The k-size of blocked arrays [nondim]
   real, dimension(1:nii,1:njj,1:nkk), intent(in)    :: S        !< Salinity [S ~> ppt]
   real, dimension(1:nii,1:njj,1:nkk), intent(in)    :: pressure !< Pressure [R L2 T-2 ~> Pa]
   real, dimension(1:nii,1:njj,1:nkk), intent(inout) :: T_fr     !< Freezing point, either potential temperature
@@ -934,9 +935,9 @@ subroutine calculate_TFreeze_3d(S, pressure, T_fr, EOS, dom, mask, nii, njj, nkk
 
   ! Local variables
   real, dimension(1:nii,1:njj,1:nkk) :: absS ! Salinity converted
-                                            ! to absolute salinity [ppt]
-  real, dimension(1:nii,1:njj,1:nkk) :: TFreeze_S ! The salinity for
-                                            ! the freezing point expression in model units [S ~> PSU or ppt]
+                                             ! to absolute salinity [ppt]
+  real, dimension(1:nii,1:njj,1:nkk) :: TFreeze_S ! The salinity for the freezing point expression
+                                                  !  in model units [S ~> PSU or ppt]
   integer :: i, j, k
   integer :: is, ie, js, je, ks, ke
 
@@ -963,7 +964,7 @@ subroutine calculate_TFreeze_3d(S, pressure, T_fr, EOS, dom, mask, nii, njj, nkk
     endif
     !$omp target update to(TFreeze_S)
   else
-    do concurrent (k=ks:ke, j=js:je, i=is:ie)
+    do concurrent (k=ks:ke, j=js:je, i=is:ie, (mask(i,j) > 0.0))
       TFreeze_S(i,j,k) = S(i,j,k)
     enddo
   endif
