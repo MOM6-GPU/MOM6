@@ -18,8 +18,6 @@ use MOM_unit_scaling, only : unit_scale_type
 use MOM_variables, only : BT_cont_type, porous_barrier_type
 use MOM_verticalGrid, only : verticalGrid_type
 
-!$ use omp_lib, only: omp_get_num_devices
-
 implicit none ; private
 
 #include <MOM_memory.h>
