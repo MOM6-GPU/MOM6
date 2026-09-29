@@ -1139,9 +1139,6 @@ subroutine applyBoundaryFluxesInOut(CS, G, GV, US, dt, fluxes, optics, nsw, h, t
   !$omp                              bp_mixing_depth, bp_salt_before, bp_salt_after, &
   !$omp                              bp_salt_removed, bp_salt_added)
 
-  ! The control structure and the diagnostic arrays that it owns are persistently resident on
-  ! the device, having been mapped there by diabatic_aux_init, so they are not mapped here.
-
   if (calculate_energetics) then
     !   The partial derivatives of specific volume with temperature and salinity need to be
     ! precalculated to avoid having heating of tiny layers give nonsensical values.
@@ -1227,12 +1224,12 @@ subroutine applyBoundaryFluxesInOut(CS, G, GV, US, dt, fluxes, optics, nsw, h, t
                   h, tv%T, netMassInOut, netMassOut, netHeat, netSalt,                   &
                   Pen_SW_bnd, tv, aggregate_FW_forcing, dom, nonpenSW=nonpenSW,          &
                   net_Heat_rate=netheat_rate, net_salt_rate=netsalt_rate,                &
-                  netmassinout_rate=netmassinout_rate, pen_sw_bnd_rate=pen_sw_bnd_rate)
+                  netmassinout_rate=netmassinout_rate, pen_sw_bnd_rate=pen_sw_bnd_rate, do_offload=.true.)
     else
       call extractFluxes_3d(G, GV, US, fluxes, optics, nsw, G%jsd, G%jed, dt,            &
                   H_limit_fluxes, CS%use_river_heat_content, CS%use_calving_heat_content, &
                   h, tv%T, netMassInOut, netMassOut, netHeat, netSalt,                   &
-                  Pen_SW_bnd, tv, aggregate_FW_forcing, dom, nonpenSW=nonpenSW)
+                  Pen_SW_bnd, tv, aggregate_FW_forcing, dom, nonpenSW=nonpenSW, do_offload=.true.)
     endif
 
     ! ea is for passive tracers
