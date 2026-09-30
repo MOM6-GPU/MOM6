@@ -881,7 +881,7 @@ end subroutine absorbRemainingSW
 !! (MOM_bulk_mixed_layer) still works in j-slices and should keep calling absorbRemainingSW.
 subroutine absorbRemainingSW_3d(G, GV, US, h, opacity_band, nsw, optics, dt, H_limit_fluxes, &
                                 adjustAbsorptionProfile, absorbAllSW, T, Pen_SW_bnd, dom, &
-                                T_chg_above, TKE, dSV_dT)
+                                TKE, dSV_dT)
 
   type(ocean_grid_type),   intent(in)    :: G    !< The ocean's grid structure.
   type(verticalGrid_type), intent(in)    :: GV   !< The ocean's vertical grid structure.
@@ -929,26 +929,23 @@ subroutine absorbRemainingSW_3d(G, GV, US, h, opacity_band, nsw, optics, dt, H_l
                                                  !! first index is the rank (i, j, k) and the
                                                  !! second is the bound (1 = lower, 2 = upper).
   real, dimension(SZI_(G),SZJ_(G),SZK_(GV)), &
-                           intent(inout) :: T_chg_above !< Workspace holding a temperature change
-                                                 !! that will be applied to all the thick layers
-                                                 !! above a given layer [C ~> degC].  This is only
-                                                 !! nonzero if adjustAbsorptionProfile is true, in
-                                                 !! which case the net change in the temperature of
-                                                 !! a layer is the sum of the direct heating of that
-                                                 !! layer plus T_chg_above from all of the layers
-                                                 !! below, plus any contribution from absorbing
-                                                 !! radiation that hits the bottom.  It is a dummy
-                                                 !! argument rather than a local automatic array so
-                                                 !! that the caller can keep it resident on the
-                                                 !! device across calls.
-  real, dimension(SZI_(G),SZJ_(G),SZK_(GV)), &
                  optional, intent(in)    :: dSV_dT !< The partial derivative of specific volume
                                                  !! with temperature [R-1 C-1 ~> m3 kg-1 degC-1]
   real, dimension(SZI_(G),SZJ_(G),SZK_(GV)), &
                  optional, intent(inout) :: TKE !< The TKE sink from mixing the heating
-                                                 !! throughout a layer [R Z3 T-2 ~> J m-2].
+                                                 !! throughout a layer, which is added to the
+                                                 !! incoming values [R Z3 T-2 ~> J m-2].
 
   ! Local variables
+  real, dimension(SZI_(G),SZJ_(G),SZK_(GV)) :: &
+    T_chg_above      ! A temperature change that will be applied to all the thick layers above a
+                     ! given layer [C ~> degC].  This is only nonzero if adjustAbsorptionProfile
+                     ! is true, in which case the net change in the temperature of a layer is the
+                     ! sum of the direct heating of that layer plus T_chg_above from all of the
+                     ! layers below, plus any contribution from absorbing radiation that hits the
+                     ! bottom.
+  real :: TKE_lay           ! The TKE sink from mixing the heating by all bands throughout a layer
+                            ! [R Z3 T-2 ~> J m-2]
   real :: SW_trans          ! fraction of shortwave radiation that is not
                             ! absorbed in a layer [nondim]
   real :: unabsorbed        ! fraction of the shortwave radiation that
@@ -1006,18 +1003,22 @@ subroutine absorbRemainingSW_3d(G, GV, US, h, opacity_band, nsw, optics, dt, H_l
     g_Hconv2 = GV%g_Earth_Z_T2 * GV%H_to_RZ**2
   endif
 
+  !$omp target enter data map(alloc: T_chg_above)
+
   ! The whole column sweep is done inside a single kernel over the horizontal indices, so that
   ! h_heat, T_chg and Pen_SW_rem stay thread-local scalars and the vertical recurrences that
   ! they carry remain sequential.  T_chg_above spans both vertical sweeps, so it is a 3-d array
   ! rather than a per-thread automatic.
-  do concurrent (j=js:je, i=is:ie) local(k, n, h_heat, T_chg, Pen_SW_rem, SW_trans, unabsorbed, &
-                                         opt_depth, exp_OD, heat_bnd, SWa, coSWa_frac)
+  do concurrent (j=js:je, i=is:ie) DO_LOCALITY(local(k, n, h_heat, T_chg, Pen_SW_rem, SW_trans )) &
+                                 & DO_LOCALITY(local(unabsorbed, opt_depth, exp_OD, heat_bnd, SWa)) &
+                                 & DO_LOCALITY(local(coSWa_frac, TKE_lay))
     h_heat = 0.0
 
     ! Apply penetrating SW radiation to remaining parts of layers.
     ! Excessively thin layers are not heated to avoid runaway temps.
     do k=ks,ke
       T_chg_above(i,j,k) = 0.0
+      TKE_lay = 0.0
 
       ! In absorbRemainingSW this test is h > 1.5*eps, with eps defaulting to zero.
       if (h(i,j,k) > 0.0) then
@@ -1078,13 +1079,13 @@ subroutine absorbRemainingSW_3d(G, GV, US, h, opacity_band, nsw, optics, dt, H_l
 
           if (TKE_calc) then
             if (opt_depth > 1e-2) then
-              TKE(i,j,k) = TKE(i,j,k) - coSWa_frac*Heat_bnd*dSV_dT(i,j,k)* &
+              TKE_lay = TKE_lay - coSWa_frac*Heat_bnd*dSV_dT(i,j,k)* &
                  (0.5*h(i,j,k)*g_Hconv2) * &
                  (opt_depth*(1.0+exp_OD) - 2.0*(1.0-exp_OD)) / (opt_depth*(1.0-exp_OD))
             else
               ! Use Taylor series-derived approximation to the above expression
               ! that is well behaved and more accurate when opt_depth is small.
-              TKE(i,j,k) = TKE(i,j,k) - coSWa_frac*Heat_bnd*dSV_dT(i,j,k)* &
+              TKE_lay = TKE_lay - coSWa_frac*Heat_bnd*dSV_dT(i,j,k)* &
                  (0.5*h(i,j,k)*g_Hconv2) * &
                  (C1_6*opt_depth * (1.0 - C1_60*opt_depth**2))
             endif
@@ -1093,6 +1094,10 @@ subroutine absorbRemainingSW_3d(G, GV, US, h, opacity_band, nsw, optics, dt, H_l
           Pen_SW_bnd(n,i,j) = Pen_SW_bnd(n,i,j) * SW_trans
         endif ; enddo ! n-loop over the shortwave bands
       endif
+
+      ! Adding the layer's total to TKE, rather than accumulating each band directly, keeps the
+      ! answers identical to those from a workspace that starts at zero.
+      if (TKE_calc) TKE(i,j,k) = TKE(i,j,k) + TKE_lay
 
       ! Add to the accumulated thickness above that could be heated.
       ! Only layers greater than h_min_heat thick should get heated.
@@ -1138,6 +1143,8 @@ subroutine absorbRemainingSW_3d(G, GV, US, h, opacity_band, nsw, optics, dt, H_l
       enddo ! k-loop of the upward sweep
     endif ! absorbAllSW .or. adjustAbsorptionProfile
   enddo ! i- and j-loop over columns
+
+  !$omp target exit data map(delete: T_chg_above)
 
 end subroutine absorbRemainingSW_3d
 

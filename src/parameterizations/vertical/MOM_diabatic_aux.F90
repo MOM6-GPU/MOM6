@@ -967,11 +967,7 @@ subroutine applyBoundaryFluxesInOut(CS, G, GV, US, dt, fluxes, optics, nsw, h, t
     dSpV_dT,      &  ! Partial derivative of specific volume with temperature [R-1 C-1 ~> m3 kg-1 degC-1]
     dSpV_dS          ! Partial derivative of specific volume with to salinity [R-1 S-1 ~> m3 kg-1 ppt-1]
   real, dimension(SZI_(G),SZJ_(G),SZK_(GV)) :: &
-    p_lay, &         ! The pressure at the middle of each layer [R L2 T-2 ~> Pa]
-    pen_TKE_3d, &    ! The TKE required to homogenize the heating by shortwave radiation within
-                     ! a layer [R Z3 T-2 ~> J m-2]
-    T_chg_above      ! Workspace for absorbRemainingSW_3d, holding a temperature change that is
-                     ! applied to the thick layers above a given layer [C ~> degC]
+    p_lay            ! The pressure at the middle of each layer [R L2 T-2 ~> Pa]
   real, dimension(max(nsw,1),SZI_(G),SZJ_(G)) :: &
     Pen_SW_bnd, &    ! The penetrative shortwave heating integrated over a timestep by band
                      ! [C H ~> degC m or degC kg m-2]
@@ -1129,7 +1125,7 @@ subroutine applyBoundaryFluxesInOut(CS, G, GV, US, dt, fluxes, optics, nsw, h, t
   !$omp target enter data map(alloc: netMassInOut, netMassIn, netMassOut, netHeat, netSalt, &
   !$omp                              nonpenSW, netheat_rate, netsalt_rate, netMassInOut_rate, &
   !$omp                              netPen_rate, SurfPressure, dRhodT, dRhodS, dSpV_dT, dSpV_dS, &
-  !$omp                              p_lay, pen_TKE_3d, T_chg_above, Pen_SW_bnd, Pen_SW_bnd_rate, &
+  !$omp                              p_lay, Pen_SW_bnd, Pen_SW_bnd_rate, &
   !$omp                              opacityBand, ml_k, ml_dTemp, ml_dSalt, ml_dThick, ml_hOld, &
   !$omp                              ml_hNew, ml_netHeat, ml_netSalt, bp_error, bp_total_h, &
   !$omp                              bp_mixing_depth, bp_salt_before, bp_salt_after, &
@@ -1148,10 +1144,6 @@ subroutine applyBoundaryFluxesInOut(CS, G, GV, US, dt, fluxes, optics, nsw, h, t
     enddo
 
     call calculate_specific_vol_derivs(tv%T, tv%S, p_lay, dSV_dT, dSV_dS, tv%eqn_of_state, EOSdom)
-
-    do concurrent (k=1:nz, j=js:je, i=is:ie)
-      pen_TKE_3d(i,j,k) = 0.0
-    enddo
   endif
 
   !   Nothing more is done unless there is shortwave forcing.
@@ -1617,14 +1609,11 @@ subroutine applyBoundaryFluxesInOut(CS, G, GV, US, dt, fluxes, optics, nsw, h, t
 
     if (calculate_energetics) then
       call absorbRemainingSW_3d(G, GV, US, h, opacityBand, nsw, optics, dt, H_limit_fluxes, &
-                                .false., .true., tv%T, Pen_SW_bnd, dom3, T_chg_above, &
-                                TKE=pen_TKE_3d, dSV_dT=dSV_dT)
-      do concurrent (k=1:nz, j=js:je, i=is:ie)
-        cTKE(i,j,k) = cTKE(i,j,k) + pen_TKE_3d(i,j,k)
-      enddo
+                                .false., .true., tv%T, Pen_SW_bnd, dom3, &
+                                TKE=cTKE, dSV_dT=dSV_dT)
     else
       call absorbRemainingSW_3d(G, GV, US, h, opacityBand, nsw, optics, dt, H_limit_fluxes, &
-                                .false., .true., tv%T, Pen_SW_bnd, dom3, T_chg_above)
+                                .false., .true., tv%T, Pen_SW_bnd, dom3)
     endif
 
     ! Diagnose heating [Q R Z T-1 ~> W m-2] applied to a grid cell from SW penetration
@@ -1748,7 +1737,7 @@ subroutine applyBoundaryFluxesInOut(CS, G, GV, US, dt, fluxes, optics, nsw, h, t
   !$omp target exit data map(delete: netMassInOut, netMassIn, netMassOut, netHeat, netSalt, &
   !$omp                              nonpenSW, netheat_rate, netsalt_rate, netMassInOut_rate, &
   !$omp                              netPen_rate, SurfPressure, dRhodT, dRhodS, dSpV_dT, dSpV_dS, &
-  !$omp                              p_lay, pen_TKE_3d, T_chg_above, Pen_SW_bnd, Pen_SW_bnd_rate, &
+  !$omp                              p_lay, Pen_SW_bnd, Pen_SW_bnd_rate, &
   !$omp                              opacityBand, ml_k, ml_dTemp, ml_dSalt, ml_dThick, ml_hOld, &
   !$omp                              ml_hNew, ml_netHeat, ml_netSalt, bp_error, bp_total_h, &
   !$omp                              bp_mixing_depth, bp_salt_before, bp_salt_after, &
