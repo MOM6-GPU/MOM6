@@ -94,6 +94,7 @@ end interface calculate_density_derivs
 !> Calculate the derivatives of specific volume with temperature and salinity from T, S, and P
 interface calculate_specific_vol_derivs
   module procedure calc_spec_vol_derivs_1d
+  module procedure calc_spec_vol_derivs_2d
   module procedure calc_spec_vol_derivs_3d
 end interface calculate_specific_vol_derivs
 
@@ -1586,6 +1587,82 @@ subroutine calc_spec_vol_derivs_1d(T, S, pressure, dSV_dT, dSV_dS, EOS, dom, sca
   enddo ; endif
 
 end subroutine calc_spec_vol_derivs_1d
+
+!> Calls the appropriate subroutine to calculate specific volume derivatives for 2-d array
+!! inputs, potentially limiting the domain of indices that are worked on.
+subroutine calc_spec_vol_derivs_2d(T, S, pressure, dSV_dT, dSV_dS, EOS, dom, scale)
+  real, intent(in) :: T(:,:)
+    !< Potential temperature referenced to the surface [C ~> degC]
+  real, intent(in) :: S(:,:)
+    !< Salinity [S ~> ppt]
+  real, intent(in) :: pressure(:,:)
+    !< Pressure [R L2 T-2 ~> Pa]
+  real, intent(inout) :: dSV_dT(:,:)
+    !< The partial derivative of specific volume with potential temperature
+    !! [R-1 C-1 ~> m3 kg-1 degC-1]
+  real, intent(inout) :: dSV_dS(:,:)
+    !< The partial derivative of specific volume with salinity
+    !! [R-1 S-1 ~> m3 kg-1 ppt-1]
+  type(EOS_type), intent(in) :: EOS
+    !< Equation of state structure
+  integer, optional, intent(in) :: dom(2,2)
+    !< The domain of indices to work on, taking into account that arrays start
+    !! at 1.  The first index is the rank (i, j) and the second is the bound
+    !! (1 = lower, 2 = upper).
+  real, optional, intent(in) :: scale
+    !< A multiplicative factor by which to scale specific volume in combination
+    !! with scaling stored in EOS [various]
+
+  ! Local variables
+  real :: Ta(size(T,1), size(T,2))
+    ! Temperature converted to [degC]
+  real :: Sa(size(S,1), size(S,2))
+    ! Salinity converted to [ppt]
+  real :: pres(size(pressure,1), size(pressure,2))
+    ! Pressure converted to [Pa]
+  real :: spv_scale ! A factor to convert specific volume from m3 kg-1 to the desired units
+                    ! [kg R-1 m-3 ~> 1]
+  real :: dSVdT_scale ! A factor to convert dSV_dT to the desired units [kg degC R-1 C-1 m-3 ~> 1]
+  real :: dSVdS_scale ! A factor to convert dSV_dS to the desired units [kg ppt R-1 S-1 m-3 ~> 1]
+  integer :: i, j
+  integer :: is, ie, js, je
+  integer :: domain(2,2)
+
+  if (present(dom)) then
+    domain(:,:) = dom(:,:)
+  else
+    domain(1,:) = [1, size(dSV_dT, 1)]
+    domain(2,:) = [1, size(dSV_dT, 2)]
+  endif
+  is = domain(1,1) ; ie = domain(1,2)
+  js = domain(2,1) ; je = domain(2,2)
+
+  if (.not. allocated(EOS%type)) call MOM_error(FATAL, &
+      "calc_spec_vol_derivs_2d: EOS%form_of_EOS is not valid.")
+
+  if ((EOS%RL2_T2_to_Pa == 1.0) .and. (EOS%C_to_degC == 1.0) .and. (EOS%S_to_ppt == 1.0)) then
+    call EOS%type%calculate_specvol_derivs_2d(T, S, pressure, dSV_dT, dSV_dS, domain)
+  else
+    do concurrent (j=js:je, i=is:ie)
+      pres(i,j) = EOS%RL2_T2_to_Pa * pressure(i,j)
+      Ta(i,j) = EOS%C_to_degC * T(i,j)
+      Sa(i,j) = EOS%S_to_ppt * S(i,j)
+    enddo
+    call EOS%type%calculate_specvol_derivs_2d(Ta, Sa, pres, dSV_dT, dSV_dS, domain)
+  endif
+
+  spv_scale = EOS%R_to_kg_m3
+  if (present(scale)) spv_scale = spv_scale * scale
+  dSVdT_scale = spv_scale * EOS%C_to_degC
+  dSVdS_scale = spv_scale * EOS%S_to_ppt
+  if ((dSVdT_scale /= 1.0) .or. (dSVdS_scale /= 1.0)) then
+    do concurrent (j=js:je, i=is:ie)
+      dSV_dT(i,j) = dSVdT_scale * dSV_dT(i,j)
+      dSV_dS(i,j) = dSVdS_scale * dSV_dS(i,j)
+    enddo
+  endif
+
+end subroutine calc_spec_vol_derivs_2d
 
 !> Calls the appropriate subroutine to calculate specific volume derivatives for 3-d array
 !! inputs, potentially limiting the domain of indices that are worked on.

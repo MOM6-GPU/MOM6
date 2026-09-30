@@ -959,17 +959,13 @@ subroutine applyBoundaryFluxesInOut(CS, G, GV, US, dt, fluxes, optics, nsw, h, t
     netsalt_rate, &  ! netsalt but for dt=1 (e.g. returns a rate)
                      ! [S H T-1 ~> ppt m s-1 or ppt kg m-2 s-1]
     netMassInOut_rate, & ! netmassinout but for dt=1 [H T-1 ~> m s-1 or kg m-2 s-1]
-    netPen_rate      ! The surface penetrative shortwave heating rate summed over all bands
+    netPen_rate,  &  ! The surface penetrative shortwave heating rate summed over all bands
                      ! [C H T-1 ~> degC m s-1 or degC kg m-2 s-1]
-  real, dimension(SZI_(G),SZJ_(G),1) :: &
     SurfPressure, &  ! Surface pressure (approximated as 0.0) [R L2 T-2 ~> Pa]
     dRhodT,       &  ! change in density per change in temperature [R C-1 ~> kg m-3 degC-1]
     dRhodS,       &  ! change in density per change in salinity [R S-1 ~> kg m-3 ppt-1]
     dSpV_dT,      &  ! Partial derivative of specific volume with temperature [R-1 C-1 ~> m3 kg-1 degC-1]
     dSpV_dS          ! Partial derivative of specific volume with to salinity [R-1 S-1 ~> m3 kg-1 ppt-1]
-                     ! These five arrays only describe the surface layer, but they are given a third
-                     ! dimension of extent one so that they can be passed to the three-dimensional
-                     ! equation of state entry points, which work on data that is on the device.
   real, dimension(SZI_(G),SZJ_(G),SZK_(GV)) :: &
     p_lay, &         ! The pressure at the middle of each layer [R L2 T-2 ~> Pa]
     pen_TKE_3d, &    ! The TKE required to homogenize the heating by shortwave radiation within
@@ -1047,7 +1043,7 @@ subroutine applyBoundaryFluxesInOut(CS, G, GV, US, dt, fluxes, optics, nsw, h, t
   integer :: nz_finite! the index of the last (deepest) finite thickness layer
   integer :: EOSdom(3,2) ! The i-, j- and k-computational domain for the equation of state, taking
                          ! into account that the arrays inside of the EOS routines start at 1.
-  integer :: EOSdom_sfc(3,2) ! The corresponding domain for the surface-only calls.
+  integer :: EOSdom_sfc(2,2) ! The corresponding horizontal domain for the surface-only calls.
   integer :: dom(2,2) ! The i- and j-index ranges that extractFluxes_3d works on.
   integer :: dom3(3,2) ! The i-, j- and k-index ranges that absorbRemainingSW_3d works on.
   integer :: i, j, is, ie, js, je, k, nz, nb, n, ne
@@ -1123,7 +1119,7 @@ subroutine applyBoundaryFluxesInOut(CS, G, GV, US, dt, fluxes, optics, nsw, h, t
   EOSdom(1,1) = is - (G%isd-1) ; EOSdom(1,2) = ie - (G%isd-1)
   EOSdom(2,1) = js - (G%jsd-1) ; EOSdom(2,2) = je - (G%jsd-1)
   EOSdom(3,1) = 1 ; EOSdom(3,2) = nz
-  EOSdom_sfc(:,:) = EOSdom(:,:) ; EOSdom_sfc(3,2) = 1
+  EOSdom_sfc(:,:) = EOSdom(1:2,:)
   dom(1,1) = is ; dom(1,2) = ie
   dom(2,1) = js ; dom(2,2) = je
   dom3(1,1) = is ; dom3(1,2) = ie
@@ -1684,30 +1680,29 @@ subroutine applyBoundaryFluxesInOut(CS, G, GV, US, dt, fluxes, optics, nsw, h, t
         ! surface buoyancy flux affecting the top layer.
         ! 3. Convert to a buoyancy flux, excluding penetrating SW heating
         !    BGR-Jul 5, 2017: The contribution of SW heating here needs investigated for ePBL.
-        SurfPressure(i,j,1) = 0.0
-        if (use_p_surf) SurfPressure(i,j,1) = tv%p_surf(i,j)
+        SurfPressure(i,j) = 0.0
+        if (use_p_surf) SurfPressure(i,j) = tv%p_surf(i,j)
       enddo
 
       if ((.not.GV%Boussinesq) .and. (.not.GV%semi_Boussinesq)) then
         g_conv = GV%g_Earth_Z_T2 * GV%H_to_RZ
 
         ! Specific volume derivatives
-        call calculate_specific_vol_derivs(tv%T, tv%S, SurfPressure, dSpV_dT, dSpV_dS, &
+        call calculate_specific_vol_derivs(tv%T(:,:,1), tv%S(:,:,1), SurfPressure, dSpV_dT, dSpV_dS, &
                                   tv%eqn_of_state, EOSdom_sfc)
-        ! !$omp target teams distribute parallel do collapse(2) private(i, j)
         do concurrent( j=js:je, i=is:ie)
           SkinBuoyFlux(i,j) = g_conv * &
-              (dSpV_dS(i,j,1) * ( netSalt_rate(i,j) - tv%S(i,j,1)*netMassInOut_rate(i,j)) + &
-                dSpV_dT(i,j,1) * ( netHeat_rate(i,j) + netPen_rate(i,j)) ) ! [Z2 T-3 ~> m2 s-3]
+              (dSpV_dS(i,j) * ( netSalt_rate(i,j) - tv%S(i,j,1)*netMassInOut_rate(i,j)) + &
+                dSpV_dT(i,j) * ( netHeat_rate(i,j) + netPen_rate(i,j)) ) ! [Z2 T-3 ~> m2 s-3]
         enddo
       else
         ! Density derivatives
-        call calculate_density_derivs(tv%T, tv%S, SurfPressure, dRhodT, dRhodS, &
+        call calculate_density_derivs(tv%T(:,:,1), tv%S(:,:,1), SurfPressure, dRhodT, dRhodS, &
                                       tv%eqn_of_state, EOSdom_sfc)
         do concurrent( j=js:je, i=is:ie)
           SkinBuoyFlux(i,j) = - GoRho * GV%H_to_Z * &
-              (dRhodS(i,j,1) * ( netSalt_rate(i,j) - tv%S(i,j,1)*netMassInOut_rate(i,j)) + &
-                dRhodT(i,j,1) * ( netHeat_rate(i,j) + netPen_rate(i,j)) ) ! [Z2 T-3 ~> m2 s-3]
+              (dRhodS(i,j) * ( netSalt_rate(i,j) - tv%S(i,j,1)*netMassInOut_rate(i,j)) + &
+                dRhodT(i,j) * ( netHeat_rate(i,j) + netPen_rate(i,j)) ) ! [Z2 T-3 ~> m2 s-3]
         enddo
       endif
     endif
