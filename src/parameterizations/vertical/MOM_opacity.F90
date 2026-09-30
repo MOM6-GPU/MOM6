@@ -2,6 +2,9 @@
 ! See the LICENSE file for licensing information.
 ! SPDX-License-Identifier: Apache-2.0
 
+#include <MOM_memory.h>
+#include "do_concurrent_compat.h"
+
 !> Routines used to calculate the opacity of the ocean.
 module MOM_opacity
 
@@ -14,10 +17,9 @@ use MOM_grid,          only : ocean_grid_type
 use MOM_unit_scaling,  only : unit_scale_type
 use MOM_variables,     only : thermo_var_ptrs
 use MOM_verticalGrid,  only : verticalGrid_type
+use MOM_intrinsic_functions, only : exp_repro
 
 implicit none ; private
-
-#include <MOM_memory.h>
 
 public set_opacity, opacity_init, opacity_end
 public extract_optics_slice, extract_optics_fields, optics_nbands
@@ -1025,7 +1027,7 @@ subroutine absorbRemainingSW_3d(G, GV, US, h, opacity_band, nsw, optics, dt, H_l
         do n=1,nsw ; if (Pen_SW_bnd(n,i,j) > 0.0) then
           ! SW_trans is the SW that is transmitted THROUGH the layer
           opt_depth = h(i,j,k) * opacity_band(n,i,j,k)
-          exp_OD = exp(-opt_depth)
+          exp_OD = exp_repro(-opt_depth)
           SW_trans = exp_OD
 
           ! Heating at a very small rate can be absorbed by a sufficiently thick layer or several
