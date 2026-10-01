@@ -1041,6 +1041,7 @@ subroutine applyBoundaryFluxesInOut(CS, G, GV, US, dt, fluxes, optics, nsw, h, t
                          ! into account that the arrays inside of the EOS routines start at 1.
   integer :: EOSdom_sfc(2,2) ! The corresponding horizontal domain for the surface-only calls.
   integer :: dom(2,2) ! The i- and j-index ranges that extractFluxes_3d works on.
+  integer :: wb(2,2)  ! The declared i- and j-bounds of the work arrays passed to extractFluxes_3d.
   integer :: dom3(3,2) ! The i-, j- and k-index ranges that absorbRemainingSW_3d works on.
   integer :: i, j, is, ie, js, je, k, nz, nb, n, ne
   character(len=45) :: mesg
@@ -1118,6 +1119,8 @@ subroutine applyBoundaryFluxesInOut(CS, G, GV, US, dt, fluxes, optics, nsw, h, t
   EOSdom_sfc(:,:) = EOSdom(1:2,:)
   dom(1,1) = is ; dom(1,2) = ie
   dom(2,1) = js ; dom(2,2) = je
+  wb(1,1) = G%isd ; wb(1,2) = G%ied
+  wb(2,1) = G%jsd ; wb(2,2) = G%jed
   dom3(1,1) = is ; dom3(1,2) = ie
   dom3(2,1) = js ; dom3(2,2) = je
   dom3(3,1) = 1 ; dom3(3,2) = nz
@@ -1207,14 +1210,14 @@ subroutine applyBoundaryFluxesInOut(CS, G, GV, US, dt, fluxes, optics, nsw, h, t
     !   but do change answers.
     !-----------------------------------------------------------------------------------------
     if (calculate_buoyancy) then
-      call extractFluxes_3d(G, GV, US, fluxes, optics, nsw, G%jsd, G%jed, dt,            &
+      call extractFluxes_3d(G, GV, US, fluxes, optics, nsw, G%jsd, G%jed, wb, dt,        &
                   H_limit_fluxes, CS%use_river_heat_content, CS%use_calving_heat_content, &
                   h, tv%T, netMassInOut, netMassOut, netHeat, netSalt,                   &
                   Pen_SW_bnd, tv, aggregate_FW_forcing, dom, nonpenSW=nonpenSW,          &
                   net_Heat_rate=netheat_rate, net_salt_rate=netsalt_rate,                &
                   netmassinout_rate=netmassinout_rate, pen_sw_bnd_rate=pen_sw_bnd_rate, do_offload=.true.)
     else
-      call extractFluxes_3d(G, GV, US, fluxes, optics, nsw, G%jsd, G%jed, dt,            &
+      call extractFluxes_3d(G, GV, US, fluxes, optics, nsw, G%jsd, G%jed, wb, dt,        &
                   H_limit_fluxes, CS%use_river_heat_content, CS%use_calving_heat_content, &
                   h, tv%T, netMassInOut, netMassOut, netHeat, netSalt,                   &
                   Pen_SW_bnd, tv, aggregate_FW_forcing, dom, nonpenSW=nonpenSW, do_offload=.true.)

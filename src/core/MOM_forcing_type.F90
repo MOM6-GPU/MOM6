@@ -531,16 +531,19 @@ subroutine extractFluxes1d(G, GV, US, fluxes, optics, nsw, j, dt, &
 
   ! local
   integer :: dom(2,2)         ! The i- and j-index ranges to work on
+  integer :: wb(2,2)          ! The declared i- and j-bounds of the output arrays
 
   dom(1,1) = G%isc ; dom(1,2) = G%iec
   dom(2,1) = j ; dom(2,2) = j
+  wb(1,1) = G%isd ; wb(1,2) = G%ied
+  wb(2,1) = j ; wb(2,2) = j
 
   !   All of the work is done by extractFluxes_3d, which is given the j-index of this row as
   ! both the lower and the upper j-bound of its array arguments.  The two-dimensional (i,k) and
   ! one-dimensional (i) arrays here are therefore sequence associated with three- and
   ! two-dimensional dummy arguments whose j-dimension has an extent of one, and they describe
   ! exactly the same sequence of elements.
-  call extractFluxes_3d(G, GV, US, fluxes, optics, nsw, j, j, dt, &
+  call extractFluxes_3d(G, GV, US, fluxes, optics, nsw, j, j, wb, dt, &
                   FluxRescaleDepth, useRiverHeatContent, useCalvingHeatContent, &
                   h, T, netMassInOut, netMassOut, net_heat, net_salt, pen_SW_bnd, tv, &
                   aggregate_FW, dom, nonpenSW, netmassInOut_rate, net_Heat_Rate, &
@@ -557,7 +560,7 @@ end subroutine extractFluxes1d
 !! Unlike extractFluxes1d, this routine takes the optics type directly rather than as a pointer,
 !! and it works on three-dimensional arrays rather than on the two-dimensional j-row workspace
 !! that the bulk mixed layer uses.
-subroutine extractFluxes_3d(G, GV, US, fluxes, optics, nsw, jsa, jea, dt, &
+subroutine extractFluxes_3d(G, GV, US, fluxes, optics, nsw, jsa, jea, wb, dt, &
                   FluxRescaleDepth, useRiverHeatContent, useCalvingHeatContent, &
                   h, T, netMassInOut, netMassOut, net_heat, net_salt, pen_SW_bnd, tv, &
                   aggregate_FW, dom, nonpenSW, netmassInOut_rate, net_Heat_Rate, &
@@ -571,14 +574,18 @@ subroutine extractFluxes_3d(G, GV, US, fluxes, optics, nsw, jsa, jea, dt, &
   type(optics_type),        intent(in)    :: optics         !< An optics structure that has values of
                                                             !! opacities and shortwave fluxes
   integer,                  intent(in)    :: nsw            !< number of bands of penetrating SW
-  integer,                  intent(in)    :: jsa            !< The lower j-bound of the array arguments,
-                                                            !! which is G%jsd for whole three-dimensional
-                                                            !! arrays but j for a single row of slice
-                                                            !! workspace.
-  integer,                  intent(in)    :: jea            !< The upper j-bound of the array arguments,
-                                                            !! which is G%jed for whole three-dimensional
-                                                            !! arrays but j for a single row of slice
-                                                            !! workspace.
+  integer,                  intent(in)    :: jsa            !< The lower j-bound of h and T, which is
+                                                            !! G%jsd for whole three-dimensional arrays
+                                                            !! but j for a single row of slice workspace.
+  integer,                  intent(in)    :: jea            !< The upper j-bound of h and T, which is
+                                                            !! G%jed for whole three-dimensional arrays
+                                                            !! but j for a single row of slice workspace.
+  integer,                  intent(in)    :: wb(2,2)        !< The declared i- and j-bounds of the output
+                                                            !! arrays, which may be a block of the domain.
+                                                            !! Unlike dom, these are array bounds, not the
+                                                            !! range of points worked on.  The first index
+                                                            !! is the rank (i, j) and the second is the
+                                                            !! bound (1 = lower, 2 = upper).
   real,                     intent(in)    :: dt             !< The time step for these fluxes [T ~> s]
   real,                     intent(in)    :: FluxRescaleDepth !< min ocean depth before fluxes
                                                             !! are scaled away [H ~> m or kg m-2]
@@ -588,16 +595,16 @@ subroutine extractFluxes_3d(G, GV, US, fluxes, optics, nsw, jsa, jea, dt, &
                             intent(in)    :: h              !< layer thickness [H ~> m or kg m-2]
   real, dimension(SZI_(G),jsa:jea,SZK_(GV)), &
                             intent(in)    :: T              !< layer temperatures [C ~> degC]
-  real, dimension(SZI_(G),jsa:jea), &
+  real, dimension(wb(1,1):wb(1,2),wb(2,1):wb(2,2)), &
                             intent(out)   :: netMassInOut   !< net mass flux (non-Bouss) or volume flux
                                                             !! (if Bouss) of water in/out of ocean over
                                                             !! a time step [H ~> m or kg m-2]
-  real, dimension(SZI_(G),jsa:jea), &
+  real, dimension(wb(1,1):wb(1,2),wb(2,1):wb(2,2)), &
                             intent(out)   :: netMassOut     !< net mass flux (non-Bouss) or volume flux
                                                             !! (if Bouss) of water leaving ocean surface
                                                             !! over a time step [H ~> m or kg m-2].
                                                             !! netMassOut < 0 means mass leaves ocean.
-  real, dimension(SZI_(G),jsa:jea), &
+  real, dimension(wb(1,1):wb(1,2),wb(2,1):wb(2,2)), &
                             intent(out)   :: net_heat       !< net heat at the surface accumulated over a
                                                             !! time step for coupler + restoring.
                                                             !! Exclude two terms from net_heat:
@@ -605,14 +612,14 @@ subroutine extractFluxes_3d(G, GV, US, fluxes, optics, nsw, jsa, jea, dt, &
                                                             !! (2) evaporation heat content,
                                                             !! (since do not yet know evap temperature).
                                                             !! [C H ~> degC m or degC kg m-2].
-  real, dimension(SZI_(G),jsa:jea), &
+  real, dimension(wb(1,1):wb(1,2),wb(2,1):wb(2,2)), &
                             intent(out)   :: net_salt       !< surface salt flux into the ocean
                                                             !! accumulated over a time step
                                                             !! [S H ~> ppt m or ppt kg m-2].
-  real, dimension(max(1,nsw),G%isd:G%ied,jsa:jea), &
+  real, dimension(max(1,nsw),wb(1,1):wb(1,2),wb(2,1):wb(2,2)), &
                             intent(out)   :: pen_SW_bnd     !< penetrating SW flux, split into bands.
                                                             !! [C H ~> degC m or degC kg m-2]
-                                                            !! and array size nsw x SZI_(G) x SZJ_(G),
+                                                            !! and array size nsw by the bounds in wb,
                                                             !! where nsw=number of SW bands in pen_SW_bnd.
                                                             !! This heat flux is not part of net_heat.
   type(thermo_var_ptrs),    intent(inout) :: tv             !< structure containing pointers to available
@@ -627,20 +634,20 @@ subroutine extractFluxes_3d(G, GV, US, fluxes, optics, nsw, jsa, jea, dt, &
                                                             !! There is no vertical range because the
                                                             !! total column thickness that sets the flux
                                                             !! rescaling always spans the whole column.
-  real, dimension(SZI_(G),jsa:jea), &
+  real, dimension(wb(1,1):wb(1,2),wb(2,1):wb(2,2)), &
                   optional, intent(out)   :: nonpenSW       !< Non-penetrating SW used in net_heat
                                                             !! [C H ~> degC m or degC kg m-2].
                                                             !! Summed over SW bands when diagnosing nonpenSW.
-  real, dimension(SZI_(G),jsa:jea), &
+  real, dimension(wb(1,1):wb(1,2),wb(2,1):wb(2,2)), &
                   optional, intent(out)   :: net_Heat_rate  !< Rate of net surface heating
                                                             !! [C H T-1 ~> degC m s-1 or degC kg m-2 s-1].
-  real, dimension(SZI_(G),jsa:jea), &
+  real, dimension(wb(1,1):wb(1,2),wb(2,1):wb(2,2)), &
                   optional, intent(out)   :: net_salt_rate  !< Surface salt flux into the ocean
                                                             !! [S H T-1 ~> ppt m s-1 or ppt kg m-2 s-1].
-  real, dimension(SZI_(G),jsa:jea), &
+  real, dimension(wb(1,1):wb(1,2),wb(2,1):wb(2,2)), &
                   optional, intent(out)   :: netmassInOut_rate !< Rate of net mass flux into the ocean
                                                             !! [H T-1 ~> m s-1 or kg m-2 s-1].
-  real, dimension(max(1,nsw),G%isd:G%ied,jsa:jea), &
+  real, dimension(max(1,nsw),wb(1,1):wb(1,2),wb(2,1):wb(2,2)), &
                   optional, intent(out)   :: pen_sw_bnd_rate !< Rate of penetrative shortwave heating
                                                              !! [C H T-1 ~> degC m s-1 or degC kg m-2 s-1].
   logical,        optional, intent(in)    :: do_offload     !< If .true., the loop over the domain is run on
@@ -653,7 +660,7 @@ subroutine extractFluxes_3d(G, GV, US, fluxes, optics, nsw, jsa, jea, dt, &
                                                             !! host and no data need be present.
 
   ! local
-  real, dimension(SZI_(G),jsa:jea) :: &
+  real, dimension(wb(1,1):wb(1,2),wb(2,1):wb(2,2)) :: &
     Pen_SW_tot, &             ! sum across all bands of Pen_SW [C H ~> degC m or degC kg m-2].
     rescale                   ! A copy of scale that is retained for the shortwave consistency
                               ! check that is done on the host after the kernel [nondim]
@@ -1190,11 +1197,14 @@ subroutine extractFluxes2d(G, GV, US, fluxes, optics, nsw, dt, FluxRescaleDepth,
   logical,                          intent(in)    :: aggregate_FW   !< For determining how to aggregate the forcing.
 
   integer :: dom(2,2)         ! The i- and j-index ranges to work on
+  integer :: wb(2,2)          ! The declared i- and j-bounds of the output arrays
 
   dom(1,1) = G%isc ; dom(1,2) = G%iec
   dom(2,1) = G%jsc ; dom(2,2) = G%jec
+  wb(1,1) = G%isd ; wb(1,2) = G%ied
+  wb(2,1) = G%jsd ; wb(2,2) = G%jed
 
-  call extractFluxes_3d(G, GV, US, fluxes, optics, nsw, G%jsd, G%jed, dt, &
+  call extractFluxes_3d(G, GV, US, fluxes, optics, nsw, G%jsd, G%jed, wb, dt, &
           FluxRescaleDepth, useRiverHeatContent, useCalvingHeatContent, &
           h, T, netMassInOut, netMassOut, net_heat, net_salt, pen_SW_bnd, tv, &
           aggregate_FW, dom)
