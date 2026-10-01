@@ -729,9 +729,9 @@ subroutine diabatic_ALE_legacy(u, v, h, tv, BLD, fluxes, visc, ADp, CDp, dt, Tim
   ! Also changes: visc%Kd_shear, visc%Kv_shear and visc%Kv_slow
   if (CS%debug) &
     call MOM_state_chksum("before set_diffusivity", u, v, h, G, GV, US, haloshift=CS%halo_TS_diff)
-  !$omp target enter data map(to: tv)
+  ! Mapping tv%eqn_of_state alone with an if clause crashes gfortran 16.2, so map it with tv.
+  !$omp target enter data map(to: tv, tv%eqn_of_state) if (associated(tv%eqn_of_state))
   !$omp target enter data map(to: tv%T, tv%S) if (associated(tv%T))
-  !$omp target enter data map(to: tv%eqn_of_state) if (associated(tv%eqn_of_state))
   !$omp target enter data map(to: tv%p_surf) if (associated(tv%p_surf))
   !$omp target enter data map(to: tv%SpV_avg) if (allocated(tv%SpV_avg))
   if (CS%double_diffuse) then
@@ -743,9 +743,8 @@ subroutine diabatic_ALE_legacy(u, v, h, tv, BLD, fluxes, visc, ADp, CDp, dt, Tim
   endif
   !$omp target exit data map(release: tv%SpV_avg) if (allocated(tv%SpV_avg))
   !$omp target exit data map(release: tv%p_surf) if (associated(tv%p_surf))
-  !$omp target exit data map(release: tv%eqn_of_state) if (associated(tv%eqn_of_state))
   !$omp target exit data map(release: tv%T, tv%S) if (associated(tv%T))
-  !$omp target exit data map(release: tv)
+  !$omp target exit data map(release: tv%eqn_of_state, tv) if (associated(tv%eqn_of_state))
   !$omp target exit data map(delete: u_h, v_h) if (CS%use_kappa_shear .or. CS%use_CVMix_shear)
   call cpu_clock_end(id_clock_set_diffusivity)
   if (showCallTree) call callTree_waypoint("done with set_diffusivity (diabatic)")
@@ -1479,9 +1478,9 @@ subroutine diabatic_ALE(u, v, h, tv, BLD, fluxes, visc, ADp, CDp, dt, Time_end, 
   ! Also changes: visc%Kd_shear, visc%Kv_shear and visc%Kv_slow
   if (CS%debug) &
     call MOM_state_chksum("before set_diffusivity", u, v, h, G, GV, US, haloshift=CS%halo_TS_diff)
-  !$omp target enter data map(to: tv)
+  ! Mapping tv%eqn_of_state alone with an if clause crashes gfortran 16.2, so map it with tv.
+  !$omp target enter data map(to: tv, tv%eqn_of_state) if (associated(tv%eqn_of_state))
   !$omp target enter data map(to: tv%T, tv%S) if (associated(tv%T))
-  !$omp target enter data map(to: tv%eqn_of_state) if (associated(tv%eqn_of_state))
   !$omp target enter data map(to: tv%p_surf) if (associated(tv%p_surf))
   !$omp target enter data map(to: tv%SpV_avg) if (allocated(tv%SpV_avg))
   if (CS%double_diffuse) then
@@ -1493,9 +1492,8 @@ subroutine diabatic_ALE(u, v, h, tv, BLD, fluxes, visc, ADp, CDp, dt, Time_end, 
   endif
   !$omp target exit data map(release: tv%SpV_avg) if (allocated(tv%SpV_avg))
   !$omp target exit data map(release: tv%p_surf) if (associated(tv%p_surf))
-  !$omp target exit data map(release: tv%eqn_of_state) if (associated(tv%eqn_of_state))
   !$omp target exit data map(release: tv%T, tv%S) if (associated(tv%T))
-  !$omp target exit data map(release: tv)
+  !$omp target exit data map(release: tv%eqn_of_state, tv) if (associated(tv%eqn_of_state))
   !$omp target exit data map(delete: u_h, v_h) if (CS%use_kappa_shear .or. CS%use_CVMix_shear)
   call cpu_clock_end(id_clock_set_diffusivity)
   if (showCallTree) call callTree_waypoint("done with set_diffusivity (diabatic)")
@@ -2204,9 +2202,9 @@ subroutine layered_diabatic(u, v, h, tv, BLD, fluxes, visc, ADp, CDp, dt, Time_e
 
   if (CS%debug) &
     call MOM_state_chksum("before set_diffusivity", u, v, h, G, GV, US, haloshift=CS%halo_TS_diff)
-  !$omp target enter data map(to: tv)
+  ! Mapping tv%eqn_of_state alone with an if clause crashes gfortran 16.2, so map it with tv.
+  !$omp target enter data map(to: tv, tv%eqn_of_state) if (associated(tv%eqn_of_state))
   !$omp target enter data map(to: tv%T, tv%S) if (associated(tv%T))
-  !$omp target enter data map(to: tv%eqn_of_state) if (associated(tv%eqn_of_state))
   !$omp target enter data map(to: tv%p_surf) if (associated(tv%p_surf))
   !$omp target enter data map(to: tv%SpV_avg) if (allocated(tv%SpV_avg))
   if (CS%double_diffuse) then
@@ -2218,9 +2216,8 @@ subroutine layered_diabatic(u, v, h, tv, BLD, fluxes, visc, ADp, CDp, dt, Time_e
   endif
   !$omp target exit data map(release: tv%SpV_avg) if (allocated(tv%SpV_avg))
   !$omp target exit data map(release: tv%p_surf) if (associated(tv%p_surf))
-  !$omp target exit data map(release: tv%eqn_of_state) if (associated(tv%eqn_of_state))
   !$omp target exit data map(release: tv%T, tv%S) if (associated(tv%T))
-  !$omp target exit data map(release: tv)
+  !$omp target exit data map(release: tv%eqn_of_state, tv) if (associated(tv%eqn_of_state))
   !$omp target exit data map(delete: u_h, v_h) if (CS%use_kappa_shear .or. CS%use_CVMix_shear)
   !$omp target update from(Kd_lay)
 
