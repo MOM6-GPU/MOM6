@@ -1070,6 +1070,8 @@ subroutine applyBoundaryFluxesInOut_block(CS, G, GV, US, dt, fluxes, optics, nsw
                       ! and rejected brine are initially applied in vanishingly thin layers at the
                       ! top of the layer before being mixed throughout the layer.
   logical :: calculate_buoyancy ! If true, calculate the surface buoyancy flux.
+  logical :: do_error_loop ! If true, some column in this block may need the error reporting
+                           ! or grounding loop.
   !   The following record whether optional fields are in use.  They are set once here so that
   ! there is no need to repeat an associated() or allocated() test inside of a loop, and so that
   ! no such test occurs inside of a device region.
@@ -1183,7 +1185,7 @@ subroutine applyBoundaryFluxesInOut_block(CS, G, GV, US, dt, fluxes, optics, nsw
   !$omp                              ml_hNew, ml_netHeat, ml_netSalt, bp_error, bp_total_h, &
   !$omp                              bp_mixing_depth, bp_salt_before, bp_salt_after, &
   !$omp                              bp_salt_removed, bp_salt_added, pres_b, T_sfc_b, S_sfc_b, &
-  !$omp                              T_b, S_b, dSVdT_b, dSVdS_b)
+  !$omp                              T_b, S_b, dSVdT_b, dSVdS_b, do_error_loop)
 
   do jsb=js,je,njj ; do isb=is,ie,nii
     jeb = min(je, jsb+njj-1) ; ieb = min(ie, isb+nii-1)
@@ -1339,12 +1341,15 @@ subroutine applyBoundaryFluxesInOut_block(CS, G, GV, US, dt, fluxes, optics, nsw
       ! column handled by one thread.  The error messages and the diagnostics of grounding that
       ! the equivalent column loop used to write are deferred to the host loop below it, because
       ! neither MOM_error nor a write statement can be executed on a device.
+      do_error_loop = .false.
+      !$omp target update to( do_error_loop )
       do concurrent( j=jsb:jeb, i=isb:ieb) DO_LOCALITY(local(k, dThickness, dTemp, dSalt, Temp_in, Salin_in)) &
                                      & DO_LOCALITY(local(hOld, Ithickness,fractionOfForcing, IforcingDepthScale)) &
                                      & DO_LOCALITY(local(RivermixConst, A_brine, plume_flux, mixing_depth)) &
                                      & DO_LOCALITY(local(total_h, plume_source, salt_added, salt_removed)) &
                                      & DO_LOCALITY(local(salt_before, salt_after, top, bottom, nz_finite)) &
-                                     & DO_LOCALITY(local(top_np1, bottom_np1, ii, jj))
+                                     & DO_LOCALITY(local(top_np1, bottom_np1, ii, jj)) &
+                                     & DO_LOCALITY(reduce(.or.: do_error_loop))
         ii = i - isb + 1 ; jj = j - jsb + 1
         !   Flag this column as having neither lost all of its mass nor failed the brine plume salt
         ! conservation check.  This is done outside of the mask test below because the host loop
@@ -1583,96 +1588,105 @@ subroutine applyBoundaryFluxesInOut_block(CS, G, GV, US, dt, fluxes, optics, nsw
 
         endif ! mask2dT > 0
 
+        ! A superset of the host loop conditions, so that loop can be skipped when nothing needs it.
+        do_error_loop = do_error_loop .or. (ml_k(ii,jj) > 0) .or. bp_error(ii,jj) .or. &
+                     (netMassIn(ii,jj) /= 0.0) .or. (netMassOut(ii,jj) /= 0.0) .or. &
+                     ((G%mask2dT(i,j) <= 0.) .and. ((netHeat(ii,jj) /= 0.0) .or. (netSalt(ii,jj) /= 0.0)))
+
       enddo ! i- and j-loop
 
-      ! Bring back everything that the error reporting and grounding diagnostics below need.
-      !$omp target update from(netMassInOut, netMassIn, netMassOut, netHeat, netSalt)
-      !$omp target update from(ml_k, ml_dTemp, ml_dSalt, ml_dThick, ml_hOld, ml_hNew)
-      !$omp target update from(ml_netHeat, ml_netSalt)
-      !$omp target update from(bp_error, bp_total_h, bp_mixing_depth) if(CS%check_salt_bp)
-      !$omp target update from(bp_salt_before, bp_salt_after) if(CS%check_salt_bp)
-      !$omp target update from(bp_salt_removed, bp_salt_added) if(CS%check_salt_bp)
+      !$omp target update from( do_error_loop )
 
-      !   Report the errors that the kernel above detected and accumulate the grounding events, in
-      ! the same j-outer, i-inner order within each block that the column loop used to visit them in.
-      do j=jsb,jeb ; do i=isb,ieb
-        ii = i - isb + 1 ; jj = j - jsb + 1
+      if (do_error_loop) then
+        ! Bring back everything that the error reporting and grounding diagnostics below need.
+        !$omp target update from(netMassInOut, netMassIn, netMassOut, netHeat, netSalt)
+        !$omp target update from(ml_k, ml_dTemp, ml_dSalt, ml_dThick, ml_hOld, ml_hNew)
+        !$omp target update from(ml_netHeat, ml_netSalt)
+        !$omp target update from(bp_error, bp_total_h, bp_mixing_depth) if(CS%check_salt_bp)
+        !$omp target update from(bp_salt_before, bp_salt_after) if(CS%check_salt_bp)
+        !$omp target update from(bp_salt_removed, bp_salt_added) if(CS%check_salt_bp)
 
-        if (ml_k(ii,jj) > 0) then
-          call forcing_SinglePointPrint(fluxes,G,i,j,'applyBoundaryFluxesInOut (h<0)')
-          !TODO: remove write statements
-          write(0,*) 'applyBoundaryFluxesInOut(): lon,lat=',G%geoLonT(i,j),G%geoLatT(i,j)
-          write(0,*) 'applyBoundaryFluxesInOut(): netT,netS,netH=', &
-              US%C_to_degC*ml_netHeat(ii,jj), US%S_to_ppt*ml_netSalt(ii,jj), netMassInOut(ii,jj)
-          write(0,*) 'applyBoundaryFluxesInOut(): dT,dS,dH=', &
-              US%C_to_degC*ml_dTemp(ii,jj), US%S_to_ppt*ml_dSalt(ii,jj), ml_dThick(ii,jj)
-          write(0,*) 'applyBoundaryFluxesInOut(): h(n),h(n+1),k=',ml_hOld(ii,jj),ml_hNew(ii,jj),ml_k(ii,jj)
-          call MOM_error(FATAL, "MOM_diabatic_aux.F90, applyBoundaryFluxesInOut(): "//&
-                          "Complete mass loss in column!")
-        endif
+        !   Report the errors that the kernel above detected and accumulate the grounding events, in
+        ! the same j-outer, i-inner order within each block that the column loop used to visit them in.
+        do j=jsb,jeb ; do i=isb,ieb
+          ii = i - isb + 1 ; jj = j - jsb + 1
 
-        if (CS%check_salt_bp) then ; if (bp_error(ii,jj)) then
-          write(salt_error_mesg(1), '(A, ES24.16)')  &
-                'Net plume strength:    ', fluxes%salt_left_behind(i,j)
-          write(salt_error_mesg(2), '(A, 2ES24.16)') &
-                ' H/Plume dpt (h-unit): ', bp_total_h(ii,jj), bp_mixing_depth(ii,jj)
-          write(salt_error_mesg(3), '(A, 2ES24.16)') &
-                ' H/Plume dpt (m):      ', bp_total_h(ii,jj)*GV%H_to_Z, bp_mixing_depth(ii,jj)*GV%H_to_Z
-          write(salt_error_mesg(4), '(A, 2ES24.16)') &
-                ' Salt before/after BP: ', bp_salt_before(ii,jj), bp_salt_after(ii,jj)
-          write(salt_error_mesg(5), '(A, 2ES24.16)') &
-                ' Salt change, abs/rel: ', bp_salt_after(ii,jj)-bp_salt_before(ii,jj), &
-                (bp_salt_after(ii,jj)-bp_salt_before(ii,jj))/bp_salt_after(ii,jj)
-          write(salt_error_mesg(6), '(A, 2ES24.16)') &
-                ' Salt removed, abs/rel:', bp_salt_removed(ii,jj), bp_salt_removed(ii,jj)/bp_salt_after(ii,jj)
-          write(salt_error_mesg(7), '(A, 2ES24.16)') &
-                ' Salt added, abs/rel:  ', bp_salt_added(ii,jj), bp_salt_added(ii,jj)/bp_salt_after(ii,jj)
-          write(salt_error_mesg(8), '(A, ES24.16)')  &
-                ' Scheme relative error:', (bp_salt_added(ii,jj)-bp_salt_removed(ii,jj))/bp_salt_after(ii,jj)
-          write(salt_error_mesg(9), '(A, ES24.16)')  &
-                ' Diagnosed salt error: ', &
-                (bp_salt_after(ii,jj)-bp_salt_before(ii,jj)-bp_salt_removed(ii,jj))/bp_salt_after(ii,jj)
-          write(salt_error_mesg(10),'(A, ES24.16)')  &
-                ' Allowed error:        ', CS%check_salt_threshold
+          if (ml_k(ii,jj) > 0) then
+            call forcing_SinglePointPrint(fluxes,G,i,j,'applyBoundaryFluxesInOut (h<0)')
+            !TODO: remove write statements
+            write(0,*) 'applyBoundaryFluxesInOut(): lon,lat=',G%geoLonT(i,j),G%geoLatT(i,j)
+            write(0,*) 'applyBoundaryFluxesInOut(): netT,netS,netH=', &
+                US%C_to_degC*ml_netHeat(ii,jj), US%S_to_ppt*ml_netSalt(ii,jj), netMassInOut(ii,jj)
+            write(0,*) 'applyBoundaryFluxesInOut(): dT,dS,dH=', &
+                US%C_to_degC*ml_dTemp(ii,jj), US%S_to_ppt*ml_dSalt(ii,jj), ml_dThick(ii,jj)
+            write(0,*) 'applyBoundaryFluxesInOut(): h(n),h(n+1),k=',ml_hOld(ii,jj),ml_hNew(ii,jj),ml_k(ii,jj)
+            call MOM_error(FATAL, "MOM_diabatic_aux.F90, applyBoundaryFluxesInOut(): "//&
+                            "Complete mass loss in column!")
+          endif
 
-          ! Ideally this would be written to a single fatal error call,
-          !  but the long message seems to hit an FMS character limit?
-          call MOM_error(WARNING,'Salt change in brine plume scheme exceeds CHECK_SALT_BRINE_PLUME_THRESHOLD ')
-          do ne=1,10
-            call MOM_error(WARNING,salt_error_mesg(ne),all_print=.true.)
-          enddo
-          call MOM_error(FATAL,'Salt conservation failed check in brine plume parameterization')
-        endif ; endif
+          if (CS%check_salt_bp) then ; if (bp_error(ii,jj)) then
+            write(salt_error_mesg(1), '(A, ES24.16)')  &
+                  'Net plume strength:    ', fluxes%salt_left_behind(i,j)
+            write(salt_error_mesg(2), '(A, 2ES24.16)') &
+                  ' H/Plume dpt (h-unit): ', bp_total_h(ii,jj), bp_mixing_depth(ii,jj)
+            write(salt_error_mesg(3), '(A, 2ES24.16)') &
+                  ' H/Plume dpt (m):      ', bp_total_h(ii,jj)*GV%H_to_Z, bp_mixing_depth(ii,jj)*GV%H_to_Z
+            write(salt_error_mesg(4), '(A, 2ES24.16)') &
+                  ' Salt before/after BP: ', bp_salt_before(ii,jj), bp_salt_after(ii,jj)
+            write(salt_error_mesg(5), '(A, 2ES24.16)') &
+                  ' Salt change, abs/rel: ', bp_salt_after(ii,jj)-bp_salt_before(ii,jj), &
+                  (bp_salt_after(ii,jj)-bp_salt_before(ii,jj))/bp_salt_after(ii,jj)
+            write(salt_error_mesg(6), '(A, 2ES24.16)') &
+                  ' Salt removed, abs/rel:', bp_salt_removed(ii,jj), bp_salt_removed(ii,jj)/bp_salt_after(ii,jj)
+            write(salt_error_mesg(7), '(A, 2ES24.16)') &
+                  ' Salt added, abs/rel:  ', bp_salt_added(ii,jj), bp_salt_added(ii,jj)/bp_salt_after(ii,jj)
+            write(salt_error_mesg(8), '(A, ES24.16)')  &
+                  ' Scheme relative error:', (bp_salt_added(ii,jj)-bp_salt_removed(ii,jj))/bp_salt_after(ii,jj)
+            write(salt_error_mesg(9), '(A, ES24.16)')  &
+                  ' Diagnosed salt error: ', &
+                  (bp_salt_after(ii,jj)-bp_salt_before(ii,jj)-bp_salt_removed(ii,jj))/bp_salt_after(ii,jj)
+            write(salt_error_mesg(10),'(A, ES24.16)')  &
+                  ' Allowed error:        ', CS%check_salt_threshold
 
-        ! Check if trying to apply fluxes over land points
-        if (G%mask2dT(i,j) <= 0.) then
-          if ((abs(netHeat(ii,jj)) + abs(netSalt(ii,jj)) + abs(netMassIn(ii,jj)) + abs(netMassOut(ii,jj))) > 0.) then
-            if (.not. CS%ignore_fluxes_over_land) then
-              call forcing_SinglePointPrint(fluxes,G,i,j,'applyBoundaryFluxesInOut (land)')
-              !TODO: Remove write statements
-              write(0,*) 'applyBoundaryFluxesInOut(): lon,lat=',G%geoLonT(i,j),G%geoLatT(i,j)
-              write(0,*) 'applyBoundaryFluxesInOut(): netHeat,netSalt,netMassIn,netMassOut=',&
-                  US%C_to_degC*netHeat(ii,jj), US%S_to_ppt*netSalt(ii,jj), netMassIn(ii,jj), netMassOut(ii,jj)
+            ! Ideally this would be written to a single fatal error call,
+            !  but the long message seems to hit an FMS character limit?
+            call MOM_error(WARNING,'Salt change in brine plume scheme exceeds CHECK_SALT_BRINE_PLUME_THRESHOLD ')
+            do ne=1,10
+              call MOM_error(WARNING,salt_error_mesg(ne),all_print=.true.)
+            enddo
+            call MOM_error(FATAL,'Salt conservation failed check in brine plume parameterization')
+          endif ; endif
 
-              call MOM_error(FATAL, "MOM_diabatic_aux.F90, applyBoundaryFluxesInOut(): "//&
-                                    "Mass loss over land?")
+          ! Check if trying to apply fluxes over land points
+          if (G%mask2dT(i,j) <= 0.) then
+            if ((abs(netHeat(ii,jj)) + abs(netSalt(ii,jj)) + abs(netMassIn(ii,jj)) + abs(netMassOut(ii,jj))) > 0.) then
+              if (.not. CS%ignore_fluxes_over_land) then
+                call forcing_SinglePointPrint(fluxes,G,i,j,'applyBoundaryFluxesInOut (land)')
+                !TODO: Remove write statements
+                write(0,*) 'applyBoundaryFluxesInOut(): lon,lat=',G%geoLonT(i,j),G%geoLatT(i,j)
+                write(0,*) 'applyBoundaryFluxesInOut(): netHeat,netSalt,netMassIn,netMassOut=',&
+                    US%C_to_degC*netHeat(ii,jj), US%S_to_ppt*netSalt(ii,jj), netMassIn(ii,jj), netMassOut(ii,jj)
+
+                call MOM_error(FATAL, "MOM_diabatic_aux.F90, applyBoundaryFluxesInOut(): "//&
+                                      "Mass loss over land?")
+              endif
             endif
           endif
-        endif
 
-        ! If anything remains after the k-loop, then we have grounded out, which is a problem.
-        if (netMassIn(ii,jj)+netMassOut(ii,jj) /= 0.0) then
-          numberOfGroundings = numberOfGroundings +1
-          if (numberOfGroundings<=maxGroundings) then
-            iGround(numberOfGroundings) = i ! Record i,j location of event for
-            jGround(numberOfGroundings) = j ! warning message
-            hGrounding(numberOfGroundings) = netMassIn(ii,jj)+netMassOut(ii,jj)
+          ! If anything remains after the k-loop, then we have grounded out, which is a problem.
+          if (netMassIn(ii,jj)+netMassOut(ii,jj) /= 0.0) then
+            numberOfGroundings = numberOfGroundings +1
+            if (numberOfGroundings<=maxGroundings) then
+              iGround(numberOfGroundings) = i ! Record i,j location of event for
+              jGround(numberOfGroundings) = j ! warning message
+              hGrounding(numberOfGroundings) = netMassIn(ii,jj)+netMassOut(ii,jj)
+            endif
+            if (CS%id_createdH>0) &
+              CS%createdH(i,j) = CS%createdH(i,j) - (netMassIn(ii,jj)+netMassOut(ii,jj))/dt
           endif
-          if (CS%id_createdH>0) &
-            CS%createdH(i,j) = CS%createdH(i,j) - (netMassIn(ii,jj)+netMassOut(ii,jj))/dt
-        endif
 
-      enddo ; enddo ! i- and j-loop for the error reporting
+        enddo ; enddo ! i- and j-loop for the error reporting
+      endif ! do_error_loop
 
       ! Step C/ in the application of fluxes
       ! Heat by the convergence of penetrating SW.
@@ -1836,7 +1850,7 @@ subroutine applyBoundaryFluxesInOut_block(CS, G, GV, US, dt, fluxes, optics, nsw
   !$omp                              ml_hNew, ml_netHeat, ml_netSalt, bp_error, bp_total_h, &
   !$omp                              bp_mixing_depth, bp_salt_before, bp_salt_after, &
   !$omp                              bp_salt_removed, bp_salt_added, pres_b, T_sfc_b, S_sfc_b, &
-  !$omp                              T_b, S_b, dSVdT_b, dSVdS_b)
+  !$omp                              T_b, S_b, dSVdT_b, dSVdS_b, do_error_loop)
 
 end subroutine applyBoundaryFluxesInOut_block
 
