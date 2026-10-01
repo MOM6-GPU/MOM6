@@ -1041,7 +1041,8 @@ subroutine applyBoundaryFluxesInOut(CS, G, GV, US, dt, fluxes, optics, nsw, h, t
                          ! into account that the arrays inside of the EOS routines start at 1.
   integer :: EOSdom_sfc(2,2) ! The corresponding horizontal domain for the surface-only calls.
   integer :: dom(2,2) ! The i- and j-index ranges that extractFluxes_3d works on.
-  integer :: wb(2,2)  ! The declared i- and j-bounds of the work arrays passed to extractFluxes_3d.
+  integer :: wb(2,2)  ! The declared i- and j-bounds of the work arrays passed to extractFluxes_3d
+                      ! and absorbRemainingSW_3d.
   integer :: dom3(3,2) ! The i-, j- and k-index ranges that absorbRemainingSW_3d works on.
   integer :: i, j, is, ie, js, je, k, nz, nb, n, ne
   character(len=45) :: mesg
@@ -1612,11 +1613,11 @@ subroutine applyBoundaryFluxesInOut(CS, G, GV, US, dt, fluxes, optics, nsw, h, t
 
     if (calculate_energetics) then
       call absorbRemainingSW_3d(G, GV, US, h, opacityBand, nsw, optics, dt, H_limit_fluxes, &
-                                .false., .true., tv%T, Pen_SW_bnd, dom3, &
+                                .false., .true., tv%T, Pen_SW_bnd, dom3, wb, &
                                 TKE=cTKE, dSV_dT=dSV_dT)
     else
       call absorbRemainingSW_3d(G, GV, US, h, opacityBand, nsw, optics, dt, H_limit_fluxes, &
-                                .false., .true., tv%T, Pen_SW_bnd, dom3)
+                                .false., .true., tv%T, Pen_SW_bnd, dom3, wb)
     endif
 
     ! Diagnose heating [Q R Z T-1 ~> W m-2] applied to a grid cell from SW penetration

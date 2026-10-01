@@ -882,7 +882,7 @@ end subroutine absorbRemainingSW
 !! absorbRemainingSW are not supported here, because the only caller that uses them
 !! (MOM_bulk_mixed_layer) still works in j-slices and should keep calling absorbRemainingSW.
 subroutine absorbRemainingSW_3d(G, GV, US, h, opacity_band, nsw, optics, dt, H_limit_fluxes, &
-                                adjustAbsorptionProfile, absorbAllSW, T, Pen_SW_bnd, dom, &
+                                adjustAbsorptionProfile, absorbAllSW, T, Pen_SW_bnd, dom, wb, &
                                 TKE, dSV_dT)
 
   type(ocean_grid_type),   intent(in)    :: G    !< The ocean's grid structure.
@@ -892,7 +892,13 @@ subroutine absorbRemainingSW_3d(G, GV, US, h, opacity_band, nsw, optics, dt, H_l
                            intent(in)    :: h    !< Layer thicknesses [H ~> m or kg m-2].
   integer,                 intent(in)    :: nsw  !< Number of bands of penetrating
                                                  !! shortwave radiation.
-  real, dimension(max(1,nsw),SZI_(G),SZJ_(G),SZK_(GV)), &
+  integer,                 intent(in)    :: wb(2,2) !< The declared i- and j-bounds of opacity_band
+                                                 !! and Pen_SW_bnd, which may be a block of the
+                                                 !! domain.  Unlike dom, these are array bounds,
+                                                 !! not the range of points worked on.  The first
+                                                 !! index is the rank (i, j) and the second is the
+                                                 !! bound (1 = lower, 2 = upper).
+  real, dimension(max(1,nsw),wb(1,1):wb(1,2),wb(2,1):wb(2,2),SZK_(GV)), &
                            intent(in)    :: opacity_band !< Opacity in each band of penetrating
                                                  !! shortwave radiation [H-1 ~> m-1 or m2 kg-1].
                                                  !! The indices are band, i, j, k.
@@ -920,12 +926,12 @@ subroutine absorbRemainingSW_3d(G, GV, US, h, opacity_band, nsw, optics, dt, H_l
   real, dimension(SZI_(G),SZJ_(G),SZK_(GV)), &
                            intent(inout) :: T    !< Layer potential/conservative
                                                  !! temperatures [C ~> degC]
-  real, dimension(max(1,nsw),SZI_(G),SZJ_(G)), &
+  real, dimension(max(1,nsw),wb(1,1):wb(1,2),wb(2,1):wb(2,2)), &
                            intent(inout) :: Pen_SW_bnd !< Penetrating shortwave heating in
                                                  !! each band that hits the bottom and will
                                                  !! will be redistributed through the water
                                                  !! column [C H ~> degC m or degC kg m-2],
-                                                 !! size nsw x SZI_(G) x SZJ_(G).
+                                                 !! size nsw by the bounds in wb.
   integer,                 intent(in)    :: dom(3,2) !< The domain of indices to work on, taking
                                                  !! into account that arrays start at 1.  The
                                                  !! first index is the rank (i, j, k) and the
@@ -939,7 +945,7 @@ subroutine absorbRemainingSW_3d(G, GV, US, h, opacity_band, nsw, optics, dt, H_l
                                                  !! incoming values [R Z3 T-2 ~> J m-2].
 
   ! Local variables
-  real, dimension(SZI_(G),SZJ_(G),SZK_(GV)) :: &
+  real, dimension(wb(1,1):wb(1,2),wb(2,1):wb(2,2),SZK_(GV)) :: &
     T_chg_above      ! A temperature change that will be applied to all the thick layers above a
                      ! given layer [C ~> degC].  This is only nonzero if adjustAbsorptionProfile
                      ! is true, in which case the net change in the temperature of a layer is the
