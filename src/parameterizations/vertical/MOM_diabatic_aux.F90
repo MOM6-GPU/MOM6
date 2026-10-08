@@ -194,6 +194,7 @@ subroutine make_frazil_block(h, tv, G, GV, US, CS, is, ie, js, je, nii, njj, p_s
   integer :: isb, ieb    ! The i-index bounds of the current block.
   integer :: jsb, jeb    ! The j-index bounds of the current block.
   integer :: ii, jj      ! Block-local i- and j-index loop variables.
+  integer :: iie, jje    ! The i- and j-extents of the current block.
 
   nz = GV%ke
   p_surf_is_present = present(p_surf)
@@ -205,26 +206,29 @@ subroutine make_frazil_block(h, tv, G, GV, US, CS, is, ie, js, je, nii, njj, p_s
 
   do jsb=js,je,njj ; do isb=is,ie,nii
     jeb = min(je, jsb+njj-1) ; ieb = min(ie, isb+nii-1)
+    iie = ieb - isb + 1 ; jje = jeb - jsb + 1
 
-    EOSdom(1,1) = 1 ; EOSdom(1,2) = ieb - isb + 1
-    EOSdom(2,1) = 1 ; EOSdom(2,2) = jeb - jsb + 1
+    EOSdom(1,1) = 1 ; EOSdom(1,2) = iie
+    EOSdom(2,1) = 1 ; EOSdom(2,2) = jje
     EOSdom(3,1) = 1 ; EOSdom(3,2) = nz
 
     ! Only work on the columns that can be changed below.  fraz_col starts at 0 and can only become
     ! positive below a layer with T < 0, so a column with no negative temperatures and no frazil to
     ! reclaim is left untouched, and its freezing point is never needed.  frazil_mask is set at every
     ! point in the block, including land, since calculate_TFreeze indexes it block-locally.
-    do concurrent( j=jsb:jeb )
-      do concurrent( i=isb:ieb ) DO_LOCALITY(local(ii,jj))
-        ii = i - isb + 1 ; jj = j - jsb + 1
+    do concurrent( jj=1:jje ) DO_LOCALITY(local(j))
+      j = jsb + jj - 1
+      do concurrent( ii=1:iie ) DO_LOCALITY(local(i))
+        i = isb + ii - 1
         frazil_mask(ii,jj) = 0.0
         if (CS%reclaim_frazil) then
           if ((G%mask2dT(i,j) > 0.0) .and. (tv%frazil(i,j) > 0.0)) frazil_mask(ii,jj) = 1.0
         endif
       enddo
       do k=1,nz
-        do concurrent( i=isb:ieb, G%mask2dT(i,j) > 0.0 )
-          if (tv%T(i,j,k) < 0.0) frazil_mask(i-isb+1,j-jsb+1) = 1.0
+        do concurrent( ii=1:iie, G%mask2dT(isb+ii-1,j) > 0.0 ) DO_LOCALITY(local(i))
+          i = isb + ii - 1
+          if (tv%T(i,j,k) < 0.0) frazil_mask(ii,jj) = 1.0
         enddo
       enddo
     enddo
@@ -232,13 +236,13 @@ subroutine make_frazil_block(h, tv, G, GV, US, CS, is, ie, js, je, nii, njj, p_s
     ! Skip this block entirely if none of its columns can form or reclaim frazil.
     ! Doing this in the above kernel seems to serialize on the gpu
     any_frazil = .false.
-    do concurrent( jj=1:jeb-jsb+1, ii=1:ieb-isb+1 ) DO_LOCALITY(reduce(.or.: any_frazil))
+    do concurrent( jj=1:jje, ii=1:iie ) DO_LOCALITY(reduce(.or.: any_frazil))
       any_frazil = any_frazil .or. (frazil_mask(ii,jj) > 0.0)
     enddo
     if (.not.any_frazil) cycle
 
-    do concurrent( k=1:nz, j=jsb:jeb, i=isb:ieb, frazil_mask(i-isb+1,j-jsb+1) > 0.0 ) DO_LOCALITY(local(ii,jj))
-        ii = i - isb + 1 ; jj = j - jsb + 1
+    do concurrent( k=1:nz, jj=1:jje, ii=1:iie, frazil_mask(ii,jj) > 0.0 ) DO_LOCALITY(local(i,j))
+        i = isb + ii - 1 ; j = jsb + jj - 1
         ! Block sized S helps cpu performance, but unfortunately adds an extra 3-D on the GPU
         S_block(ii,jj,k) = tv%S(i,j,k)
         if (.not.CS%pressure_dependent_frazil) then
@@ -247,9 +251,10 @@ subroutine make_frazil_block(h, tv, G, GV, US, CS, is, ie, js, je, nii, njj, p_s
     enddo
 
     if (CS%pressure_dependent_frazil) then
-      do concurrent( j=jsb:jeb )
-        do concurrent( i=isb:ieb, frazil_mask(i-isb+1,j-jsb+1) > 0.0 ) DO_LOCALITY(local(ii,jj))
-          ii = i - isb + 1 ; jj = j - jsb + 1
+      do concurrent( jj=1:jje ) DO_LOCALITY(local(j))
+        j = jsb + jj - 1
+        do concurrent( ii=1:iie, frazil_mask(ii,jj) > 0.0 ) DO_LOCALITY(local(i))
+          i = isb + ii - 1
           if (p_surf_is_present) then
             pressure(ii,jj,1) = p_surf(i,j) + (0.5*H_to_RL2_T2)*h(i,j,1)
           else
@@ -257,8 +262,8 @@ subroutine make_frazil_block(h, tv, G, GV, US, CS, is, ie, js, je, nii, njj, p_s
           endif
         enddo
         do k=2,nz
-          do concurrent( i=isb:ieb, frazil_mask(i-isb+1,j-jsb+1) > 0.0 ) DO_LOCALITY(local(ii,jj))
-            ii = i - isb + 1 ; jj = j - jsb + 1
+          do concurrent( ii=1:iie, frazil_mask(ii,jj) > 0.0 ) DO_LOCALITY(local(i))
+            i = isb + ii - 1
             pressure(ii,jj,k) = pressure(ii,jj,k-1) + (0.5*H_to_RL2_T2) * (h(i,j,k) + h(i,j,k-1))
           enddo
         enddo
@@ -269,9 +274,10 @@ subroutine make_frazil_block(h, tv, G, GV, US, CS, is, ie, js, je, nii, njj, p_s
     call calculate_TFreeze(S_block, pressure, T_freeze, tv%eqn_of_state, &
                            EOSdom, frazil_mask, nii, njj, nz)
 
-    do concurrent( j=jsb:jeb )
-      do concurrent( i=isb:ieb, frazil_mask(i-isb+1,j-jsb+1) > 0.0 ) DO_LOCALITY(local(hc,ii,jj))
-        ii = i - isb + 1 ; jj = j - jsb + 1
+    do concurrent( jj=1:jje ) DO_LOCALITY(local(j))
+      j = jsb + jj - 1
+      do concurrent( ii=1:iie, frazil_mask(ii,jj) > 0.0 ) DO_LOCALITY(local(hc,i))
+        i = isb + ii - 1
 
         fraz_col(ii,jj) = 0.0
 
@@ -294,8 +300,8 @@ subroutine make_frazil_block(h, tv, G, GV, US, CS, is, ie, js, je, nii, njj, p_s
       enddo
 
       do k=nz,1,-1
-        do concurrent( i=isb:ieb, frazil_mask(i-isb+1,j-jsb+1) > 0.0 ) DO_LOCALITY(local(hc,ii,jj))
-          ii = i - isb + 1 ; jj = j - jsb + 1
+        do concurrent( ii=1:iie, frazil_mask(ii,jj) > 0.0 ) DO_LOCALITY(local(hc,i))
+          i = isb + ii - 1
           if ((tv%T(i,j,k) < 0.0) .or. (fraz_col(ii,jj) > 0.0)) then
             hc = (tv%C_p*GV%H_to_RZ) * h(i,j,k)
             if (h(i,j,k) <= 10.0*(GV%Angstrom_H + GV%H_subroundoff)) then
@@ -317,8 +323,8 @@ subroutine make_frazil_block(h, tv, G, GV, US, CS, is, ie, js, je, nii, njj, p_s
         enddo
       enddo ! k-loop
 
-      do concurrent( i=isb:ieb, frazil_mask(i-isb+1,j-jsb+1) > 0.0 ) DO_LOCALITY(local(ii,jj))
-        ii = i - isb + 1 ; jj = j - jsb + 1
+      do concurrent( ii=1:iie, frazil_mask(ii,jj) > 0.0 ) DO_LOCALITY(local(i))
+        i = isb + ii - 1
         tv%frazil(i,j) = tv%frazil(i,j) + fraz_col(ii,jj)
       enddo
     enddo ! j-loop
@@ -551,24 +557,27 @@ subroutine triDiagTS_block(G, GV, is, ie, js, je, nii, njj, hold, ea, eb, T, S)
   integer :: isb, ieb           ! The i-index bounds of the current block.
   integer :: jsb, jeb           ! The j-index bounds of the current block.
   integer :: ii, jj             ! Block-local i- and j-index loop variables.
+  integer :: iie, jje           ! The i- and j-extents of the current block.
 
   !$omp target enter data map(alloc: b1, d1, c1)
 
   do jsb=js,je,njj ; do isb=is,ie,nii
     jeb = min(je, jsb+njj-1) ; ieb = min(ie, isb+nii-1)
 
-    do concurrent( j=jsb:jeb ) DO_LOCALITY(local(jj))
-      jj = j - jsb + 1
-      do concurrent( i=isb:ieb ) DO_LOCALITY(local(h_tr,ii))
-        ii = i - isb + 1
+    iie = ieb - isb + 1 ; jje = jeb - jsb + 1
+
+    do concurrent( jj=1:jje ) DO_LOCALITY(local(j))
+      j = jsb + jj - 1
+      do concurrent( ii=1:iie ) DO_LOCALITY(local(h_tr,i))
+        i = isb + ii - 1
         h_tr = hold(i,j,1) + GV%H_subroundoff
         b1(ii,jj) = 1.0 / (h_tr + eb(i,j,1))
         d1(ii,jj) = h_tr * b1(ii,jj)
         T(i,j,1) = (b1(ii,jj)*h_tr)*T(i,j,1)
         S(i,j,1) = (b1(ii,jj)*h_tr)*S(i,j,1)
       enddo
-      do k=2,GV%ke ; do concurrent( i=isb:ieb ) DO_LOCALITY(local(h_tr,b_denom_1,ii))
-        ii = i - isb + 1
+      do k=2,GV%ke ; do concurrent( ii=1:iie ) DO_LOCALITY(local(h_tr,b_denom_1,i))
+        i = isb + ii - 1
         c1(ii,jj,k) = eb(i,j,k-1) * b1(ii,jj)
         h_tr = hold(i,j,k) + GV%H_subroundoff
         b_denom_1 = h_tr + d1(ii,jj)*ea(i,j,k)
@@ -577,8 +586,8 @@ subroutine triDiagTS_block(G, GV, is, ie, js, je, nii, njj, hold, ea, eb, T, S)
         T(i,j,k) = b1(ii,jj) * (h_tr*T(i,j,k) + ea(i,j,k)*T(i,j,k-1))
         S(i,j,k) = b1(ii,jj) * (h_tr*S(i,j,k) + ea(i,j,k)*S(i,j,k-1))
       enddo ; enddo
-      do k=GV%ke-1,1,-1 ; do concurrent( i=isb:ieb ) DO_LOCALITY(local(ii))
-        ii = i - isb + 1
+      do k=GV%ke-1,1,-1 ; do concurrent( ii=1:iie ) DO_LOCALITY(local(i))
+        i = isb + ii - 1
         T(i,j,k) = T(i,j,k) + c1(ii,jj,k+1)*T(i,j,k+1)
         S(i,j,k) = S(i,j,k) + c1(ii,jj,k+1)*S(i,j,k+1)
       enddo ; enddo
@@ -643,24 +652,27 @@ subroutine triDiagTS_Eulerian_block(G, GV, is, ie, js, je, nii, njj, hold, ent, 
   integer :: isb, ieb           ! The i-index bounds of the current block.
   integer :: jsb, jeb           ! The j-index bounds of the current block.
   integer :: ii, jj             ! Block-local i- and j-index loop variables.
+  integer :: iie, jje           ! The i- and j-extents of the current block.
 
   !$omp target enter data map(alloc: b1, d1, c1)
 
   do jsb=js,je,njj ; do isb=is,ie,nii
     jeb = min(je, jsb+njj-1) ; ieb = min(ie, isb+nii-1)
 
-    do concurrent( j=jsb:jeb ) DO_LOCALITY(local(jj))
-      jj = j - jsb + 1
-      do concurrent( i=isb:ieb ) DO_LOCALITY(local(h_tr,ii))
-        ii = i - isb + 1
+    iie = ieb - isb + 1 ; jje = jeb - jsb + 1
+
+    do concurrent( jj=1:jje ) DO_LOCALITY(local(j))
+      j = jsb + jj - 1
+      do concurrent( ii=1:iie ) DO_LOCALITY(local(h_tr,i))
+        i = isb + ii - 1
         h_tr = hold(i,j,1) + GV%H_subroundoff
         b1(ii,jj) = 1.0 / (h_tr + ent(i,j,2))
         d1(ii,jj) = h_tr * b1(ii,jj)
         T(i,j,1) = (b1(ii,jj)*h_tr)*T(i,j,1)
         S(i,j,1) = (b1(ii,jj)*h_tr)*S(i,j,1)
       enddo
-      do k=2,GV%ke ; do concurrent( i=isb:ieb ) DO_LOCALITY(local(h_tr,b_denom_1,ii))
-        ii = i - isb + 1
+      do k=2,GV%ke ; do concurrent( ii=1:iie ) DO_LOCALITY(local(h_tr,b_denom_1,i))
+        i = isb + ii - 1
         c1(ii,jj,k) = ent(i,j,K) * b1(ii,jj)
         h_tr = hold(i,j,k) + GV%H_subroundoff
         b_denom_1 = h_tr + d1(ii,jj)*ent(i,j,K)
@@ -669,8 +681,8 @@ subroutine triDiagTS_Eulerian_block(G, GV, is, ie, js, je, nii, njj, hold, ent, 
         T(i,j,k) = b1(ii,jj) * (h_tr*T(i,j,k) + ent(i,j,K)*T(i,j,k-1))
         S(i,j,k) = b1(ii,jj) * (h_tr*S(i,j,k) + ent(i,j,K)*S(i,j,k-1))
       enddo ; enddo
-      do k=GV%ke-1,1,-1 ; do concurrent( i=isb:ieb ) DO_LOCALITY(local(ii))
-        ii = i - isb + 1
+      do k=GV%ke-1,1,-1 ; do concurrent( ii=1:iie ) DO_LOCALITY(local(i))
+        i = isb + ii - 1
         T(i,j,k) = T(i,j,k) + c1(ii,jj,k+1)*T(i,j,k+1)
         S(i,j,k) = S(i,j,k) + c1(ii,jj,k+1)*S(i,j,k+1)
       enddo ; enddo
