@@ -986,12 +986,15 @@ subroutine absorbRemainingSW_3d(G, GV, US, h, opacity_band, nsw, optics, dt, H_l
                             ! TKE budget of the shortwave heating.
   real :: C1_6, C1_60       ! Rational fractions [nondim]
   integer :: is, ie, js, je, ks, ke, i, j, k, n
+  integer :: ii, jj      ! Block-local i- and j-indices.
+  integer :: iie, jje    ! The i- and j-extents of the block being worked on.
 
   if (nsw < 1) return
 
   is = dom(1,1) ; ie = dom(1,2)
   js = dom(2,1) ; je = dom(2,2)
   ks = dom(3,1) ; ke = dom(3,2)
+  iie = ie - is + 1 ; jje = je - js + 1
 
   min_SW_heat = optics%PenSW_flux_absorb * dt
   I_Habs = optics%PenSW_absorb_Invlen
@@ -1017,9 +1020,10 @@ subroutine absorbRemainingSW_3d(G, GV, US, h, opacity_band, nsw, optics, dt, H_l
   ! h_heat, T_chg and Pen_SW_rem stay thread-local scalars and the vertical recurrences that
   ! they carry remain sequential.  T_chg_above spans both vertical sweeps, so it is a 3-d array
   ! rather than a per-thread automatic.
-  do concurrent (j=js:je, i=is:ie) DO_LOCALITY(local(k, n, h_heat, T_chg, Pen_SW_rem, SW_trans )) &
-                                 & DO_LOCALITY(local(unabsorbed, opt_depth, exp_OD, heat_bnd, SWa)) &
-                                 & DO_LOCALITY(local(coSWa_frac, TKE_lay))
+  do concurrent (jj=1:jje, ii=1:iie) DO_LOCALITY(local(i, j, k, n, h_heat, T_chg, Pen_SW_rem, SW_trans )) &
+                                   & DO_LOCALITY(local(unabsorbed, opt_depth, exp_OD, heat_bnd, SWa)) &
+                                   & DO_LOCALITY(local(coSWa_frac, TKE_lay))
+    i = is + ii - 1 ; j = js + jj - 1
     h_heat = 0.0
 
     ! Apply penetrating SW radiation to remaining parts of layers.

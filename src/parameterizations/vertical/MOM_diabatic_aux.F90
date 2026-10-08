@@ -1108,6 +1108,7 @@ subroutine applyBoundaryFluxesInOut_block(CS, G, GV, US, dt, fluxes, optics, nsw
   integer :: isb, ieb    ! The i-index bounds of the current block.
   integer :: jsb, jeb    ! The j-index bounds of the current block.
   integer :: ii, jj      ! Block-local i- and j-indices.
+  integer :: iie, jje    ! The i- and j-extents of the current block.
   character(len=45) :: mesg
   character(len=80), dimension(10) :: salt_error_mesg
 
@@ -1189,9 +1190,10 @@ subroutine applyBoundaryFluxesInOut_block(CS, G, GV, US, dt, fluxes, optics, nsw
 
   do jsb=js,je,njj ; do isb=is,ie,nii
     jeb = min(je, jsb+njj-1) ; ieb = min(ie, isb+nii-1)
+    iie = ieb - isb + 1 ; jje = jeb - jsb + 1
 
-    EOSdom(1,1) = 1 ; EOSdom(1,2) = ieb - isb + 1
-    EOSdom(2,1) = 1 ; EOSdom(2,2) = jeb - jsb + 1
+    EOSdom(1,1) = 1 ; EOSdom(1,2) = iie
+    EOSdom(2,1) = 1 ; EOSdom(2,2) = jje
     EOSdom(3,1) = 1 ; EOSdom(3,2) = nz
     EOSdom_sfc(:,:) = EOSdom(1:2,:)
     dom(1,1) = isb ; dom(1,2) = ieb
@@ -1205,14 +1207,15 @@ subroutine applyBoundaryFluxesInOut_block(CS, G, GV, US, dt, fluxes, optics, nsw
     if (calculate_energetics) then
       !   The partial derivatives of specific volume with temperature and salinity need to be
       ! precalculated to avoid having heating of tiny layers give nonsensical values.
-      do concurrent( j=jsb:jeb )
-        do concurrent( i=isb:ieb ) DO_LOCALITY(local(ii, jj))
-          ii = i - isb + 1 ; jj = j - jsb + 1
+      do concurrent( jj=1:jje ) DO_LOCALITY(local(j))
+        j = jsb + jj - 1
+        do concurrent( ii=1:iie ) DO_LOCALITY(local(i))
+          i = isb + ii - 1
           pres_b(ii,jj) = 0.0 ; if (use_p_surf) pres_b(ii,jj) = tv%p_surf(i,j)
         enddo
         do k=1,nz
-          do concurrent( i=isb:ieb ) DO_LOCALITY(local(ii, jj, d_pres))
-            ii = i - isb + 1 ; jj = j - jsb + 1
+          do concurrent( ii=1:iie ) DO_LOCALITY(local(i, d_pres))
+            i = isb + ii - 1
             d_pres = (GV%g_Earth * GV%H_to_RZ) * h(i,j,k)
             p_lay(ii,jj,k) = pres_b(ii,jj) + 0.5*d_pres
             pres_b(ii,jj) = pres_b(ii,jj) + d_pres
@@ -1223,8 +1226,8 @@ subroutine applyBoundaryFluxesInOut_block(CS, G, GV, US, dt, fluxes, optics, nsw
 
       call calculate_specific_vol_derivs(T_b, S_b, p_lay, dSVdT_b, dSVdS_b, tv%eqn_of_state, EOSdom)
 
-      do concurrent( k=1:nz, j=jsb:jeb, i=isb:ieb ) DO_LOCALITY(local(ii, jj))
-        ii = i - isb + 1 ; jj = j - jsb + 1
+      do concurrent( k=1:nz, jj=1:jje, ii=1:iie ) DO_LOCALITY(local(i, j))
+        i = isb + ii - 1 ; j = jsb + jj - 1
         dSV_dT(i,j,k) = dSVdT_b(ii,jj,k) ; dSV_dS(i,j,k) = dSVdS_b(ii,jj,k)
       enddo
     endif
@@ -1236,13 +1239,13 @@ subroutine applyBoundaryFluxesInOut_block(CS, G, GV, US, dt, fluxes, optics, nsw
         !   The opacity is taken directly from the optics type here, rather than via
         ! extract_optics_slice, becaucause that routine works on a j-row of slice workspace.
         if (GV%Boussinesq .or. (.not.use_SpV_avg)) then
-          do concurrent (k=1:nz, j=jsb:jeb, i=isb:ieb, n=1:nsw) DO_LOCALITY(local(ii, jj))
-            ii = i - isb + 1 ; jj = j - jsb + 1
+          do concurrent (k=1:nz, jj=1:jje, ii=1:iie, n=1:nsw) DO_LOCALITY(local(i, j))
+            i = isb + ii - 1 ; j = jsb + jj - 1
             opacityBand(n,ii,jj,k) = GV%H_to_Z * optics%opacity_band(n,i,j,k)
           enddo
         else
-          do concurrent (k=1:nz, j=jsb:jeb, i=isb:ieb, n=1:nsw) DO_LOCALITY(local(ii, jj))
-            ii = i - isb + 1 ; jj = j - jsb + 1
+          do concurrent (k=1:nz, jj=1:jje, ii=1:iie, n=1:nsw) DO_LOCALITY(local(i, j))
+            i = isb + ii - 1 ; j = jsb + jj - 1
             opacityBand(n,ii,jj,k) = (GV%H_to_RZ * tv%SpV_avg(i,j,k)) * optics%opacity_band(n,i,j,k)
           enddo
         endif
@@ -1306,8 +1309,8 @@ subroutine applyBoundaryFluxesInOut_block(CS, G, GV, US, dt, fluxes, optics, nsw
       endif
 
       ! ea is for passive tracers
-      do concurrent( j=jsb:jeb, i=isb:ieb ) DO_LOCALITY(local(ii, jj))
-        ii = i - isb + 1 ; jj = j - jsb + 1
+      do concurrent( jj=1:jje, ii=1:iie ) DO_LOCALITY(local(i, j))
+        i = isb + ii - 1 ; j = jsb + jj - 1
       !  ea(i,j,1) = netMassInOut(i,j)
         if (aggregate_FW_forcing) then
           netMassOut(ii,jj) = netMassInOut(ii,jj)
@@ -1343,14 +1346,14 @@ subroutine applyBoundaryFluxesInOut_block(CS, G, GV, US, dt, fluxes, optics, nsw
       ! neither MOM_error nor a write statement can be executed on a device.
       do_error_loop = .false.
       !$omp target update to( do_error_loop )
-      do concurrent( j=jsb:jeb, i=isb:ieb) DO_LOCALITY(local(k, dThickness, dTemp, dSalt, Temp_in, Salin_in)) &
-                                     & DO_LOCALITY(local(hOld, Ithickness,fractionOfForcing, IforcingDepthScale)) &
+      do concurrent( jj=1:jje, ii=1:iie) DO_LOCALITY(local(i, j, k, dThickness, dTemp, dSalt, Temp_in, Salin_in)) &
+                                     & DO_LOCALITY(local(hOld, Ithickness, fractionOfForcing, IforcingDepthScale)) &
                                      & DO_LOCALITY(local(RivermixConst, A_brine, plume_flux, mixing_depth)) &
                                      & DO_LOCALITY(local(total_h, plume_source, salt_added, salt_removed)) &
                                      & DO_LOCALITY(local(salt_before, salt_after, top, bottom, nz_finite)) &
-                                     & DO_LOCALITY(local(top_np1, bottom_np1, ii, jj)) &
+                                     & DO_LOCALITY(local(top_np1, bottom_np1)) &
                                      & DO_LOCALITY(reduce(.or.: do_error_loop))
-        ii = i - isb + 1 ; jj = j - jsb + 1
+        i = isb + ii - 1 ; j = jsb + jj - 1
         !   Flag this column as having neither lost all of its mass nor failed the brine plume salt
         ! conservation check.  This is done outside of the mask test below because the host loop
         ! that reports these errors examines the land points too.
@@ -1608,8 +1611,8 @@ subroutine applyBoundaryFluxesInOut_block(CS, G, GV, US, dt, fluxes, optics, nsw
 
         !   Report the errors that the kernel above detected and accumulate the grounding events, in
         ! the same j-outer, i-inner order within each block that the column loop used to visit them in.
-        do j=jsb,jeb ; do i=isb,ieb
-          ii = i - isb + 1 ; jj = j - jsb + 1
+        do jj=1,jje ; do ii=1,iie
+          i = isb + ii - 1 ; j = jsb + jj - 1
 
           if (ml_k(ii,jj) > 0) then
             call forcing_SinglePointPrint(fluxes,G,i,j,'applyBoundaryFluxesInOut (h<0)')
@@ -1695,11 +1698,13 @@ subroutine applyBoundaryFluxesInOut_block(CS, G, GV, US, dt, fluxes, optics, nsw
       ! Save temperature before increment with SW heating
       ! and initialize CS%penSWflux_diag to zero.
       if (CS%id_penSW_diag > 0 .or. CS%id_penSWflux_diag > 0) then
-        do concurrent( k=1:nz, j=jsb:jeb, i=isb:ieb)
+        do concurrent( k=1:nz, jj=1:jje, ii=1:iie) DO_LOCALITY(local(i, j))
+          i = isb + ii - 1 ; j = jsb + jj - 1
           CS%penSW_diag(i,j,k)     = tv%T(i,j,k)
           CS%penSWflux_diag(i,j,k) = 0.0
         end do
-        do concurrent( j=jsb:jeb, i=isb:ieb)
+        do concurrent( jj=1:jje, ii=1:iie) DO_LOCALITY(local(i, j))
+          i = isb + ii - 1 ; j = jsb + jj - 1
           CS%penSWflux_diag(i,j,nz+1) = 0.0
         end do
       endif
@@ -1718,7 +1723,8 @@ subroutine applyBoundaryFluxesInOut_block(CS, G, GV, US, dt, fluxes, optics, nsw
       if (CS%id_penSW_diag > 0 .or. CS%id_penSWflux_diag > 0) then
 
         ! convergence of SW into a layer
-        do concurrent( k=1:nz, j=jsb:jeb, i=isb:ieb)
+        do concurrent( k=1:nz, jj=1:jje, ii=1:iie) DO_LOCALITY(local(i, j))
+          i = isb + ii - 1 ; j = jsb + jj - 1
           ! Note that the units of penSW_diag change here, from [C ~> degC] to [Q R Z T-1 ~> W m-2].
           CS%penSW_diag(i,j,k) = (tv%T(i,j,k)-CS%penSW_diag(i,j,k))*h(i,j,k) * Idt * tv%C_p * GV%H_to_RZ
         enddo
@@ -1730,7 +1736,8 @@ subroutine applyBoundaryFluxesInOut_block(CS, G, GV, US, dt, fluxes, optics, nsw
         ! CS%penSWflux_diag = rsdo  and CS%penSW_diag = rsdoabsorb
         ! rsdoabsorb(k) = rsdo(k) - rsdo(k+1), so that rsdo(k) = rsdo(k+1) + rsdoabsorb(k)
         if (CS%id_penSWflux_diag > 0) then
-          do concurrent( j=jsb:jeb, i=isb:ieb)
+          do concurrent( jj=1:jje, ii=1:iie) DO_LOCALITY(local(i, j))
+            i = isb + ii - 1 ; j = jsb + jj - 1
             do k=nz,1,-1
               CS%penSWflux_diag(i,j,k) = CS%penSW_diag(i,j,k) + CS%penSWflux_diag(i,j,k+1)
             enddo
@@ -1742,8 +1749,8 @@ subroutine applyBoundaryFluxesInOut_block(CS, G, GV, US, dt, fluxes, optics, nsw
       ! Fill CS%nonpenSW_diag
       if (CS%id_nonpenSW_diag > 0) then
         !$omp target update from(nonpenSW)
-        do j=jsb,jeb ; do i=isb,ieb
-          ii = i - isb + 1 ; jj = j - jsb + 1
+        do jj=1,jje ; do ii=1,iie
+          i = isb + ii - 1 ; j = jsb + jj - 1
           CS%nonpenSW_diag(i,j) = nonpenSW(ii,jj) * Idt * tv%C_p * GV%H_to_RZ
         enddo ; enddo
       endif
@@ -1758,8 +1765,8 @@ subroutine applyBoundaryFluxesInOut_block(CS, G, GV, US, dt, fluxes, optics, nsw
         ! netPen_rate is the netSW as a function of depth, but only the surface value is used here,
         ! in which case the values of dt, h, optics and H_limit_fluxes are irrelevant.  Consider
         ! writing a shorter and simpler variant to handle this very limited case.
-        do concurrent( j=jsb:jeb, i=isb:ieb) DO_LOCALITY(local(ii, jj, nb))
-          ii = i - isb + 1 ; jj = j - jsb + 1
+        do concurrent( jj=1:jje, ii=1:iie) DO_LOCALITY(local(i, j, nb))
+          i = isb + ii - 1 ; j = jsb + jj - 1
           netPen_rate(ii,jj) = 0.0
           do nb=1,nsw ; netPen_rate(ii,jj) = netPen_rate(ii,jj) + pen_SW_bnd_rate(nb,ii,jj) ; enddo
 
@@ -1779,8 +1786,8 @@ subroutine applyBoundaryFluxesInOut_block(CS, G, GV, US, dt, fluxes, optics, nsw
           ! Specific volume derivatives
           call calculate_specific_vol_derivs(T_sfc_b, S_sfc_b, SurfPressure, dSpV_dT, dSpV_dS, &
                                     tv%eqn_of_state, EOSdom_sfc)
-          do concurrent( j=jsb:jeb, i=isb:ieb) DO_LOCALITY(local(ii, jj))
-            ii = i - isb + 1 ; jj = j - jsb + 1
+          do concurrent( jj=1:jje, ii=1:iie) DO_LOCALITY(local(i, j))
+            i = isb + ii - 1 ; j = jsb + jj - 1
             SkinBuoyFlux(i,j) = g_conv * &
                 (dSpV_dS(ii,jj) * ( netSalt_rate(ii,jj) - tv%S(i,j,1)*netMassInOut_rate(ii,jj)) + &
                   dSpV_dT(ii,jj) * ( netHeat_rate(ii,jj) + netPen_rate(ii,jj)) ) ! [Z2 T-3 ~> m2 s-3]
@@ -1789,8 +1796,8 @@ subroutine applyBoundaryFluxesInOut_block(CS, G, GV, US, dt, fluxes, optics, nsw
           ! Density derivatives
           call calculate_density_derivs(T_sfc_b, S_sfc_b, SurfPressure, dRhodT, dRhodS, &
                                         tv%eqn_of_state, EOSdom_sfc)
-          do concurrent( j=jsb:jeb, i=isb:ieb) DO_LOCALITY(local(ii, jj))
-            ii = i - isb + 1 ; jj = j - jsb + 1
+          do concurrent( jj=1:jje, ii=1:iie) DO_LOCALITY(local(i, j))
+            i = isb + ii - 1 ; j = jsb + jj - 1
             SkinBuoyFlux(i,j) = - GoRho * GV%H_to_Z * &
                 (dRhodS(ii,jj) * ( netSalt_rate(ii,jj) - tv%S(i,j,1)*netMassInOut_rate(ii,jj)) + &
                   dRhodT(ii,jj) * ( netHeat_rate(ii,jj) + netPen_rate(ii,jj)) ) ! [Z2 T-3 ~> m2 s-3]

@@ -677,6 +677,8 @@ subroutine extractFluxes_3d(G, GV, US, fluxes, optics, nsw, jsa, jea, wb, dt, &
   logical :: do_enthalpy      ! If true (default) enthalpy terms are computed in MOM6
   character(len=200) :: mesg
   integer :: is, ie, js, je, nz, i, j, k, n
+  integer :: ii, jj      ! Block-local i- and j-indices.
+  integer :: iie, jje    ! The i- and j-extents of the block being worked on.
 
   logical :: do_NHR, do_NSR, do_NMIOR, do_PSWBR, do_nonPenSW
   logical :: use_device ! If true, the loop below is run on the device
@@ -743,6 +745,7 @@ subroutine extractFluxes_3d(G, GV, US, fluxes, optics, nsw, jsa, jea, wb, dt, &
 
   is = dom(1,1) ; ie = dom(1,2)
   js = dom(2,1) ; je = dom(2,2)
+  iie = ie - is + 1 ; jje = je - js + 1
   nz = GV%ke
 
   calculate_diags = .true.
@@ -781,7 +784,8 @@ subroutine extractFluxes_3d(G, GV, US, fluxes, optics, nsw, jsa, jea, wb, dt, &
   ! than via extract_optics_slice, because that routine works on a j-row of slice workspace.
   !$omp target teams distribute parallel do collapse(2) &
   !$omp                              private(i, j, k, n, htot, scale, Pen_SW_tot_rate) if(target: use_device)
-  do j=js,je ; do i=is,ie
+  do jj=1,jje ; do ii=1,iie
+    i = is + ii - 1 ; j = js + jj - 1
 
     htot = h(i,j,1)
     do k=2,nz ; htot = htot + h(i,j,k) ; enddo
@@ -1126,7 +1130,8 @@ subroutine extractFluxes_3d(G, GV, US, fluxes, optics, nsw, jsa, jea, wb, dt, &
   ! that are emitted and the final value of fluxes%num_msg are unchanged.
   if (fluxes%num_msg < fluxes%max_msg) then
     !$omp target update from(Pen_SW_tot, rescale) if(use_device)
-    do j=js,je ; do i=is,ie
+    do jj=1,jje ; do ii=1,iie
+      i = is + ii - 1 ; j = js + jj - 1
       if (fluxes%num_msg < fluxes%max_msg) then
         if (Pen_SW_tot(i,j) > 1.000001 * I_Cp_Hconvert*rescale(i,j)*dt*fluxes%sw(i,j)) then
           fluxes%num_msg = fluxes%num_msg + 1
