@@ -2,6 +2,10 @@
 ! See the LICENSE file for licensing information.
 ! SPDX-License-Identifier: Apache-2.0
 
+#include "omp_loop_bind_compat.h"
+#include <MOM_memory.h>
+#include "do_concurrent_compat.h"
+
 !> Routines for calculating baroclinic wave speeds
 module MOM_wave_speed
 
@@ -17,9 +21,6 @@ use MOM_verticalGrid, only : verticalGrid_type
 use MOM_EOS, only : calculate_density_derivs, calculate_specific_vol_derivs
 
 implicit none ; private
-
-#include <MOM_memory.h>
-#include "do_concurrent_compat.h"
 
 public wave_speed, wave_speeds, wave_speed_init, wave_speed_set_param
 
@@ -386,10 +387,10 @@ subroutine wave_speed(h, tv, G, GV, US, cg1, CS, halo_size, use_ebt_mode, mono_N
       endif
     endif
 
-    !$omp target teams loop collapse(2) private( i, j, k, k2, itt, kc, do_merge, I_Htot, I_Hnew, &
-    !$omp &                                      det, ddet, lam, dlam, lam0, cg1_est, speed2_tot, &
-    !$omp &                                      drxh_sum, dSpVxh_sum, hw, sum_hc, gp, N2min, &
-    !$omp &                                      ms_min, ms_max, ms_sq, below_mono_N2_frac, &
+    !$omp target teams loop LOOP_BIND_TEAMS_PARALLEL collapse(2) private( i, j, k, k2, itt, kc, do_merge, &
+    !$omp &                                      I_Htot, I_Hnew, det, ddet, lam, dlam, lam0, cg1_est, &
+    !$omp &                                      speed2_tot, drxh_sum, dSpVxh_sum, hw, sum_hc, gp, &
+    !$omp &                                      N2min, ms_min, ms_max, ms_sq, below_mono_N2_frac, &
     !$omp &                                      below_mono_N2_depth, Igu, Igl, H_top, H_bot, &
     !$omp &                                      I_beta, yy)
     do jj=1,jje ; do ii=1,iie
