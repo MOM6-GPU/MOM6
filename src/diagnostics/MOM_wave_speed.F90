@@ -816,7 +816,7 @@ subroutine wave_speed(h, tv, G, GV, US, cg1, CS, halo_size, use_ebt_mode, mono_N
 
     !   Remapping done on the host to avoid accessing polymorphic Recon1d type on device
     if (present(modal_structure)) then
-      !$omp target update from(nkc, Hc, mode_struct, h)
+      !$omp target update from(nkc, Hc, mode_struct)
       do jj=1,jje ; do ii=1,iie ; if (nkc(ii,jj) >= 2) then
         i = isb + ii - 1
         j = jsb + jj - 1
@@ -1873,12 +1873,11 @@ subroutine wave_speed_init(CS, GV, param_file, use_ebt_mode, mono_N2_column_frac
 
   call get_param(param_file, mdl, "WAVE_SPEED_NIBLOCK", CS%niblock, &
                  "The i-direction block size used in the first baroclinic mode wave speed "//&
-                 "calculations. If 0, or when running with OpenMP offload, the full "//&
-                 "the full computational domain width is used. ", default=default_niblock, layoutParam=.true.)
+                 "calculations. If 0, the full computational extent in i is used.", &
+                 default=default_niblock, layoutParam=.true.)
   call get_param(param_file, mdl, "WAVE_SPEED_NJBLOCK", CS%njblock, &
                  "The j-direction block size used in the first baroclinic mode wave speed "//&
-                 "calculations. If 0, defaults to 1, except when running with OpenMP offload, in "//&
-                 "which case the full computational domain width is used. ", &
+                 "calculations. If 0, the full computational extent in j is used.", &
                  default=default_njblock, layoutParam=.true.)
   if (CS%niblock < 0) &
     call MOM_error(FATAL, "WAVE_SPEED_NIBLOCK must be nonnegative; "//&

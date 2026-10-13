@@ -760,10 +760,10 @@ subroutine calculate_diagnostic_fields(u, v, h, uh, vh, tv, ADp, CDp, p_surf, &
       (CS%id_cfl_cg1_x>0) .or. (CS%id_cfl_cg1_y>0)) then
     ! wave_speed calculates cg1 on the device, so its inputs have to be resident there.
     !$omp target enter data map(to: tv, tv%T, tv%S)
-    !$omp target enter data map(alloc: cg1)
+    !$omp target enter data map(to: cg1)
     call wave_speed(h, tv, G, GV, US, cg1, CS%wave_speed)
     !$omp target exit data map(release: tv%T, tv%S, tv)
-    !$omp target exit data map(from: cg1)
+    !$omp target update from(cg1)
     if (CS%id_cg1>0) call post_data(CS%id_cg1, cg1, CS%diag)
     if (CS%id_Rd1>0) then
       !$OMP parallel do default(shared) private(f2_h,mag_beta)
@@ -800,20 +800,28 @@ subroutine calculate_diagnostic_fields(u, v, h, uh, vh, tv, ADp, CDp, p_surf, &
       enddo ; enddo
       call post_data(CS%id_cfl_cg1_y, CFL_cg1, CS%diag)
     endif
+    !$omp target exit data map(delete: cg1)
   endif
   if ((CS%id_cg_ebt>0) .or. (CS%id_Rd_ebt>0) .or. (CS%id_p_ebt>0)) then
+    ! wave_speed calculates cg1 on the device, so its inputs have to be resident there.
+    !$omp target enter data map(to: tv, tv%T, tv%S)
+    !$omp target enter data map(to: cg1)
     if (CS%id_p_ebt>0) then
       ! Here work_3d is used for the equivalent barotropic modal structure [nondim].
       work_3d(:,:,:) = 0.0
+      !$omp target enter data map(to: work_3d)
       call wave_speed(h, tv, G, GV, US, cg1, CS%wave_speed, use_ebt_mode=.true., &
                       mono_N2_column_fraction=CS%mono_N2_column_fraction, &
                       mono_N2_depth=CS%mono_N2_depth, modal_structure=work_3d)
+      !$omp target exit data map(from: work_3d)
       call post_data(CS%id_p_ebt, work_3d, CS%diag)
     else
       call wave_speed(h, tv, G, GV, US, cg1, CS%wave_speed, use_ebt_mode=.true., &
                       mono_N2_column_fraction=CS%mono_N2_column_fraction, &
                       mono_N2_depth=CS%mono_N2_depth)
     endif
+    !$omp target exit data map(release: tv%T, tv%S, tv)
+    !$omp target update from(cg1)
     if (CS%id_cg_ebt>0) call post_data(CS%id_cg_ebt, cg1, CS%diag)
     if (CS%id_Rd_ebt>0) then
       !$OMP parallel do default(shared) private(f2_h,mag_beta)
@@ -832,6 +840,7 @@ subroutine calculate_diagnostic_fields(u, v, h, uh, vh, tv, ADp, CDp, p_surf, &
       enddo ; enddo
       call post_data(CS%id_Rd_ebt, Rd1, CS%diag)
     endif
+    !$omp target exit data map(delete: cg1)
   endif
 
 end subroutine calculate_diagnostic_fields
