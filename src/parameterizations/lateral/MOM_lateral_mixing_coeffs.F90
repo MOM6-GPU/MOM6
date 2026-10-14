@@ -274,7 +274,6 @@ subroutine calc_resoln_function(h, tv, G, GV, US, CS, MEKE, OBC, dt)
          "Module must be initialized before it is used.")
 
   if (CS%calculate_cg1) then
-    !$omp target update from(h)
     if (.not. allocated(CS%cg1)) call MOM_error(FATAL, &
       "calc_resoln_function: %cg1 is not associated with Resoln_scaled_Kh.")
     if (CS%khth_use_ebt_struct .or. CS%kdgl90_use_ebt_struct &
@@ -295,6 +294,7 @@ subroutine calc_resoln_function(h, tv, G, GV, US, CS, MEKE, OBC, dt)
       call wave_speed(h, tv, G, GV, US, CS%cg1, CS%wave_speed)
     endif
 
+    !$omp target update from(CS%cg1)
     call create_group_pass(CS%pass_cg1, CS%cg1, G%Domain)
     call do_group_pass(CS%pass_cg1, G%Domain)
     !$omp target update to(CS%cg1)
@@ -845,7 +845,7 @@ subroutine calc_slope_functions(h, tv, dt, G, GV, US, CS, OBC)
       call calc_isoneutral_slopes(G, GV, US, h, e, tv, dt*CS%kappa_smooth, CS%use_stanley_iso, &
                                   CS%slope_x, CS%slope_y, niblock, njblock, nkblock, N2_u=N2_u, &
                                   N2_v=N2_v, halo=isoneutral_halo, OBC=OBC, OBC_N2=CS%OBC_friendly)
-      !$omp target exit data map(from: CS%slope_x, CS%slope_y, N2_u, N2_v)
+      !$omp target update from( CS%slope_x, CS%slope_y, N2_u, N2_v)
       call calc_Visbeck_coeffs_old(h, CS%slope_x, CS%slope_y, N2_u, N2_v, G, GV, US, CS, OBC)
       !$omp target exit data map(release: tv%T, tv%S, tv)
       !$omp target exit data map(release: tv%p_surf) if (associated(tv%p_surf))
@@ -2146,7 +2146,7 @@ subroutine VarMix_init(Time, G, GV, US, param_file, diag, CS)
                  "If true, use the OM4 remapping-via-subcells algorithm for calculating EBT structure. "//&
                  "See REMAPPING_USE_OM4_SUBCELLS for details. "//&
                  "We recommend setting this option to false.", default=om4_remap_via_sub_cells)
-    call wave_speed_init(CS%wave_speed, GV, use_ebt_mode=CS%Resoln_use_ebt, &
+    call wave_speed_init(CS%wave_speed, GV, param_file, use_ebt_mode=CS%Resoln_use_ebt, &
                          mono_N2_depth=N2_filter_depth, remap_answer_date=remap_answer_date, &
                          better_speed_est=better_speed_est, min_speed=wave_speed_min, &
                          om4_remap_via_sub_cells=om4_remap_via_sub_cells, wave_speed_tol=wave_speed_tol)
