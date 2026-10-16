@@ -1782,16 +1782,19 @@ subroutine applyBoundaryFluxesInOut_block(CS, G, GV, US, dt, fluxes, optics, nsw
 
         if ((.not.GV%Boussinesq) .and. (.not.GV%semi_Boussinesq)) then
           g_conv = GV%g_Earth_Z_T2 * GV%H_to_RZ
+          !$omp target update from (T_sfc_b, S_sfc_b, SurfPressure, SkinBuoyFlux, netSalt_rate, &
+          !$omp &                   netMassInOut_rate, netHeat_rate, netPen_rate)
 
           ! Specific volume derivatives
           call calculate_specific_vol_derivs(T_sfc_b, S_sfc_b, SurfPressure, dSpV_dT, dSpV_dS, &
                                     tv%eqn_of_state, EOSdom_sfc)
-          do concurrent( jj=1:jje, ii=1:iie) DO_LOCALITY(local(i, j))
+          do jj=1,jje ; do ii=1,iie
             i = isb + ii - 1 ; j = jsb + jj - 1
             SkinBuoyFlux(i,j) = g_conv * &
                 (dSpV_dS(ii,jj) * ( netSalt_rate(ii,jj) - tv%S(i,j,1)*netMassInOut_rate(ii,jj)) + &
                   dSpV_dT(ii,jj) * ( netHeat_rate(ii,jj) + netPen_rate(ii,jj)) ) ! [Z2 T-3 ~> m2 s-3]
-          enddo
+          enddo ; enddo
+          !$omp target update to (SkinBuoyFlux)
         else
           ! Density derivatives
           call calculate_density_derivs(T_sfc_b, S_sfc_b, SurfPressure, dRhodT, dRhodS, &

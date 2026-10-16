@@ -1140,6 +1140,7 @@ subroutine calculate_density_derivs_2d(T, S, pressure, drho_dT, drho_dS, EOS, do
   real :: press(size(pressure,1), size(pressure,2))
     ! Pressure converted to [Pa]
   integer :: is, ie, js, je, npts
+  integer :: i, j
   integer :: domain(2,2)
 
   if (present(dom)) then
@@ -1157,17 +1158,27 @@ subroutine calculate_density_derivs_2d(T, S, pressure, drho_dT, drho_dS, EOS, do
   if (all([EOS%RL2_T2_to_Pa, EOS%C_to_degC, EOS%S_to_ppt] == 1.)) then
     call EOS%type%calculate_density_derivs_2d(T, S, pressure, drho_dT, drho_dS, domain)
   else
-    press(is:ie, js:je) = EOS%RL2_T2_to_Pa * pressure(is:ie, js:je)
-    Ta(is:ie, js:je) = EOS%C_to_degC * T(is:ie, js:je)
-    Sa(is:ie, js:je) = EOS%S_to_ppt * S(is:ie, js:je)
+    !$omp target enter data map(alloc: Ta, Sa, press)
+    do concurrent( i=is:ie, j=js:je )
+      press(i,j) = EOS%RL2_T2_to_Pa * pressure(i,j)
+      Ta(i,j) = EOS%C_to_degC * T(i,j)
+      Sa(i,j) = EOS%S_to_ppt * S(i,j)
+    enddo
 
     call EOS%type%calculate_density_derivs_2d(Ta, Sa, press, drho_dT, drho_dS, domain)
+    !$omp target exit data map(delete: Ta, Sa, press)
   endif
 
-  if (EOS%kg_m3_to_R * EOS%C_to_degC /= 1.) &
-    drho_dT(is:ie, js:je) = EOS%kg_m3_to_R * EOS%C_to_degC * drho_dT(is:ie, js:je)
-  if (EOS%kg_m3_to_R * EOS%S_to_ppt /= 1.) &
-    drho_dS(is:ie, js:je) = EOS%kg_m3_to_R * EOS%S_to_ppt * drho_dS(is:ie, js:je)
+  if (EOS%kg_m3_to_R * EOS%C_to_degC /= 1.) then
+    do concurrent( i=is:ie, j=js:je )
+      drho_dT(i,j) = EOS%kg_m3_to_R * EOS%C_to_degC * drho_dT(i,j)
+    enddo
+  endif
+  if (EOS%kg_m3_to_R * EOS%S_to_ppt /= 1.) then
+    do concurrent( i=is:ie, j=js:je )
+      drho_dS(i,j) = EOS%kg_m3_to_R * EOS%S_to_ppt * drho_dS(i,j)
+    enddo
+  endif
 end subroutine calculate_density_derivs_2d
 
 
@@ -1643,11 +1654,11 @@ subroutine calc_spec_vol_derivs_2d(T, S, pressure, dSV_dT, dSV_dS, EOS, dom, sca
   if ((EOS%RL2_T2_to_Pa == 1.0) .and. (EOS%C_to_degC == 1.0) .and. (EOS%S_to_ppt == 1.0)) then
     call EOS%type%calculate_specvol_derivs_2d(T, S, pressure, dSV_dT, dSV_dS, domain)
   else
-    do concurrent (j=js:je, i=is:ie)
+    do j=js,je ; do i=is,ie
       pres(i,j) = EOS%RL2_T2_to_Pa * pressure(i,j)
       Ta(i,j) = EOS%C_to_degC * T(i,j)
       Sa(i,j) = EOS%S_to_ppt * S(i,j)
-    enddo
+    enddo ; enddo
     call EOS%type%calculate_specvol_derivs_2d(Ta, Sa, pres, dSV_dT, dSV_dS, domain)
   endif
 
@@ -1656,10 +1667,10 @@ subroutine calc_spec_vol_derivs_2d(T, S, pressure, dSV_dT, dSV_dS, EOS, dom, sca
   dSVdT_scale = spv_scale * EOS%C_to_degC
   dSVdS_scale = spv_scale * EOS%S_to_ppt
   if ((dSVdT_scale /= 1.0) .or. (dSVdS_scale /= 1.0)) then
-    do concurrent (j=js:je, i=is:ie)
+    do j=js,je ; do i=is,ie
       dSV_dT(i,j) = dSVdT_scale * dSV_dT(i,j)
       dSV_dS(i,j) = dSVdS_scale * dSV_dS(i,j)
-    enddo
+    enddo ; enddo
   endif
 
 end subroutine calc_spec_vol_derivs_2d
@@ -1721,6 +1732,7 @@ subroutine calc_spec_vol_derivs_3d(T, S, pressure, dSV_dT, dSV_dS, EOS, dom, sca
   if ((EOS%RL2_T2_to_Pa == 1.0) .and. (EOS%C_to_degC == 1.0) .and. (EOS%S_to_ppt == 1.0)) then
     call EOS%type%calculate_specvol_derivs_3d(T, S, pressure, dSV_dT, dSV_dS, domain)
   else
+    !$omp target enter data map(alloc: Ta, Sa, pres)
     ! These rescaling loops repeat the arithmetic of the scalar loop in
     ! calc_spec_vol_derivs_1d element by element, so that they give identical answers to
     ! the 1-d version while still running on the device alongside the EOS evaluation.
@@ -1730,6 +1742,7 @@ subroutine calc_spec_vol_derivs_3d(T, S, pressure, dSV_dT, dSV_dS, EOS, dom, sca
       Sa(i,j,k) = EOS%S_to_ppt * S(i,j,k)
     enddo
     call EOS%type%calculate_specvol_derivs_3d(Ta, Sa, pres, dSV_dT, dSV_dS, domain)
+    !$omp target exit data map(delete: Ta, Sa, pres)
   endif
 
   spv_scale = EOS%R_to_kg_m3
