@@ -1521,7 +1521,7 @@ subroutine applyBoundaryFluxesInOut_block(CS, G, GV, US, dt, fluxes, optics, nsw
                                   max(total_h, GV%angstrom_h) )
 
               ! Sets the brine plume coefficient based on integral constraint
-              A_brine = np1 / (mixing_depth**np1)
+              A_brine = (CS%brine_plume_n + 1) / (mixing_depth**(CS%brine_plume_n + 1))
 
               if (CS%check_salt_bp) then
                 ! Record the total salt in the column before applying the plume scheme
@@ -2083,7 +2083,9 @@ subroutine diabatic_aux_init(Time, G, GV, US, param_file, diag, CS, useALEalgori
   id_clock_frazil  = cpu_clock_id('(Ocean frazil)', grain=CLOCK_ROUTINE)
 
   !$omp target enter data map(to: CS)
-  !$omp target enter data map(alloc: CS%brine_input, CS%penSW_diag, CS%penSWflux_diag)
+  !$omp target enter data map(to: CS%brine_input) if (allocated(CS%brine_input))
+  !$omp target enter data map(to: CS%penSW_diag) if (allocated(CS%penSW_diag))
+  !$omp target enter data map(to: CS%penSWflux_diag) if (allocated(CS%penSWflux_diag))
 
 end subroutine diabatic_aux_init
 
@@ -2095,12 +2097,14 @@ subroutine diabatic_aux_end(CS)
 
   if (.not.associated(CS)) return
 
+  !$omp target exit data map(delete: CS%brine_input) if (allocated(CS%brine_input))
+  !$omp target exit data map(delete: CS%penSW_diag) if (allocated(CS%penSW_diag))
+  !$omp target exit data map(delete: CS%penSWflux_diag) if (allocated(CS%penSWflux_diag))
   if (CS%id_createdH       >0) deallocate(CS%createdH)
   if (CS%id_penSW_diag     >0) deallocate(CS%penSW_diag)
   if (CS%id_penSWflux_diag >0) deallocate(CS%penSWflux_diag)
   if (CS%id_nonpenSW_diag  >0) deallocate(CS%nonpenSW_diag)
 
-  !$omp target exit data map(delete: CS%brine_input, CS%penSW_diag, CS%penSWflux_diag)
   !$omp target exit data map(delete: CS)
   if (associated(CS)) deallocate(CS)
 
