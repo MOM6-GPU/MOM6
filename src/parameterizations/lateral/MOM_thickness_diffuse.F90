@@ -225,7 +225,8 @@ subroutine thickness_diffuse(h, uhtr, vhtr, tv, dt, G, GV, US, MEKE, VarMix, CDp
   if (njblock == 0) njblock = je-js+2
 
   !$omp target enter data map(alloc: MEKE%GM_src) if(allocated(MEKE%GM_src))
-  !$omp target enter data map(alloc: MEKE%Kh) if(allocated(MEKE%Kh))
+  ! MEKE%Kh is set on the host by MEKE, so copy it to the device; an alloc would be copied back over it below.
+  !$omp target enter data map(to: MEKE%Kh) if(allocated(MEKE%Kh))
 
   if (allocated(MEKE%GM_src)) then
     do concurrent (j=js:je, i=is:ie) ; MEKE%GM_src(i,j) = 0. ; enddo
