@@ -551,7 +551,7 @@ subroutine thickness_diffuse(h, uhtr, vhtr, tv, dt, G, GV, US, MEKE, VarMix, CDp
 
   if (VarMix%use_variable_mixing) then
     if (allocated(MEKE%Rd_dx_h) .and. allocated(VarMix%Rd_dx_h)) then
-      !$OMP parallel do default(shared)
+      !$omp target update from (VarMix%Rd_dx_h)
       do j=js,je ; do i=is,ie
         MEKE%Rd_dx_h(i,j) = VarMix%Rd_dx_h(i,j)
       enddo ; enddo
