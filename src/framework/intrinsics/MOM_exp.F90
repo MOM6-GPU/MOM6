@@ -8,44 +8,20 @@
 
 submodule (MOM_intrinsic_functions) MOM_exp
 
-use, intrinsic :: iso_fortran_env, only : int32, int64
 use, intrinsic :: ieee_arithmetic, only : ieee_rint
 use MOM_exp_data_n128, only : ndiv, idiv_scale_lookup, idiv_residual_lookup
 
 implicit none
 
-real, parameter :: real_mold = 0.
-  !< Real mold for transfers and numerical format queries
-
-integer, parameter :: int_kind &
-    = merge(int64, int32, storage_size(real_mold) > storage_size(0_int32))
-  !< Integer kind with the same storage size as default real
-integer(kind=int_kind), parameter :: int_mold = 0
-  !< Integer mold value
-
-! Floating point layout
-integer, parameter :: expbit = digits(real_mold) - 1
-  !< Position of lowest exponent bit
-  ! NOTE: digits() includes the implicit leading digit
-integer, parameter :: signbit = storage_size(real_mold) - 1
-  !< Position of sign bit
-integer, parameter :: expwidth = signbit - expbit
-  !< Number of exponent bits
-integer, parameter :: expbias = maxexponent(real_mold) - 1
-  !< Exponent bias
-
 ! IEEE 754 special values
-integer(kind=int_kind), parameter :: pos_inf_bits &
-    = ishft(2_int_kind**expwidth - 1_int_kind, expbit)
+integer(kind=int_rsize), parameter :: pos_inf_bits = expmask
   !< IEEE +Inf bit pattern
-integer(kind=int_kind), parameter :: neg_inf_bits &
-    = ior(pos_inf_bits, ishft(-1_int_kind, signbit))
+integer(kind=int_rsize), parameter :: neg_inf_bits = ior(pos_inf_bits, signmask)
   !< IEEE -Inf bit pattern
-
 ! Fast integer rounding offset
-real, parameter :: round_bias = 1.5 * 2_int_kind**(digits(real_mold) - 1)
-  !< Binary offset used to trigger rounding of fractional values
-integer(int_kind), parameter :: round_bias_bits &
+real, parameter :: round_bias = 1.5 * 2_int_rsize**(digits(real_mold) - 1)
+  !< Binary offset used to trigger rounding of fractional values [nondim]
+integer(int_rsize), parameter :: round_bias_bits &
     = transfer(round_bias, int_mold)
   !< Bit representation of rounding bias
 
@@ -55,9 +31,8 @@ contains
 !!
 !! Compute exp(x) with bitwise reproducibility across platforms.
 module procedure exp_repro
-  ! ln2 estimates
-  real, parameter :: ln2 = 0.693147180559945309417232121458176568
-    !< ln2: 0.693147180559945309417232... [nondim]
+  !$omp declare target
+
   real, parameter :: I_ln2 = 1.44269504088896340735992468100189214
     !< 1 / ln2: 1.4426950408889634073599... [nondim]
 
@@ -69,16 +44,9 @@ module procedure exp_repro
       = real(minexponent(real_mold) - digits(real_mold) - 1) * ln2
     !< Smallest x value before exp(x) underflow [nondim]
 
-  ! Double-real precision of ln2 used in Cody-Waite range reduction
-  ! NOTE: This split assumes real64 precision.
-  real, parameter :: ln2_hi = 0.69314718036912381649017333984375
-    !< Upper 32 bits of ln2: 6.93147180369123816490e-01 [nondim]
-  real, parameter :: ln2_lo = 1.90821492927058770002e-10
-    !< Lower precision bits of ln2: 1.90821492927058770002e-10 [nondim]
-
   ! Subdivide [-ln2/2, ln2/2] into ndiv subintervals to reduce approximation range.
   ! This allows for a smaller polynomial at the cost of a lookup table.
-  ! ndiv and the lookup tables are imported from MOM_exp_data_r64.
+  ! ndiv and the lookup tables are imported from MOM_exp_data_n128.
   real, parameter :: I_ndiv = 1. / real(ndiv)
     !< 1 / ndiv [nondim]
   real, parameter :: n_ln2 = ndiv * I_ln2
@@ -87,10 +55,10 @@ module procedure exp_repro
     !< Upper 32 bits of ln2 / ndiv [nondim]
   real, parameter :: ln2_ndiv_lo = I_ndiv * ln2_lo
     !< Lower precision bits of ln2 / ndiv [nondim]
-  integer(int_kind), parameter :: idiv_mask = int(ndiv - 1, int_kind)
+  integer(int_rsize), parameter :: idiv_mask = int(ndiv - 1, int_rsize)
     !< Used for fast modulo of ndiv
 
-  ! Range of K = nint(x / ln2) for which direct exponent scaling is safe.
+  ! Range of K for which direct exponent scaling is safe.
   ! Beyond this range, a bias is applied to handle subnormals and overflow.
   ! NOTE: Fortran exponent is defined as one less than IEEE exponent.
   integer, parameter :: Kmin = minexponent(real_mold) + 1
@@ -99,26 +67,26 @@ module procedure exp_repro
   integer, parameter :: Kmax = maxexponent(real_mold) - 2
     !< Maximum K before overflow scaling is needed
     !! Kmax = (maxexponent() - 1) - 0 (max exp(r)) (-1 safety buffer)
-  integer(kind=int_kind), parameter :: Kbias = maxexponent(real_mold) - 2
+  integer(kind=int_rsize), parameter :: Kbias = maxexponent(real_mold) - 2
     !< Exponent adjustment used for overflow and subnormal scaling
     !! Any bias which rescales 2**K exp(r) to O(1) works here.
 
   ! Nonfinite testing
   logical :: nonfinite
     ! True if input is a nonfinite float (+/-Inf, NaN)
-  integer(kind=int_kind) :: xb
+  integer(kind=int_rsize) :: xb
     ! Bit representation of x
 
   ! Range-reduction variables
 
   real :: xc
     ! x clamped between xmin and xmax [nondim]
-  integer(kind=int_kind) :: K
+  integer(kind=int_rsize) :: K
     ! Nearest IEEE-rounded integer to x/ln2 [nondim]
   real :: Z
-    ! Nearest integer to ndiv * K + idiv for ndiv subdivisions
+    ! Nearest integer to ndiv * K + idiv for ndiv subdivisions [nondim]
     ! NOTE: Z is stored as real to avoid int-real type conversions.
-  integer(kind=int_kind) :: Zi
+  integer(kind=int_rsize) :: Zi
     ! Integer representation of Z
   integer :: idiv
     ! Subdivision index
@@ -138,14 +106,12 @@ module procedure exp_repro
 
   ! Descaling and subnormal handling
 
-  integer(kind=int_kind) :: eb
+  integer(kind=int_rsize) :: eb
     ! Bit representations of e
-  integer(kind=int_kind) :: j
+  integer(kind=int_rsize) :: j
     ! Bias added to K to compensate for exponent K beyond {-1022,..,+1023}.
-  integer(kind=int_kind) :: fb
+  integer(kind=int_rsize) :: fb
     ! Bit representation 2**j, the K exponent rescale
-
-  !$omp declare target
 
   ! 1. Nonfinite handling
   ! ---------------------
@@ -178,7 +144,7 @@ module procedure exp_repro
 
   ! Compute the subdivision index and integer offset K
   idiv = iand(Zi, idiv_mask)
-  K = (Zi - int(idiv, int_kind)) / ndiv
+  K = (Zi - int(idiv, int_rsize)) / ndiv
 
   ! Since Z ~ x N / ln2, the terms in r will nearly cancel and there is some
   ! expected loss of precision.  To compensate, we use a Cody-Waite correction.
@@ -208,7 +174,7 @@ module procedure exp_repro
   ! Determine if K is outside the supported exponent range.
   ! If so, then apply a bias j to normalize the exponent.
   ! Kbias is chosen so that the exponent is "something near 1".
-  j = merge(Kbias, 0_int_kind, K < Kmin) + merge(-Kbias, 0_int_kind, K > Kmax)
+  j = merge(Kbias, 0_int_rsize, K < Kmin) + merge(-Kbias, 0_int_rsize, K > Kmax)
 
   ! Get the bit representation of e
   eb = transfer(e, int_mold)
@@ -222,7 +188,7 @@ module procedure exp_repro
   ! - For subnormals, this will force subnormal estimation (if enabled).
   ! - For resolvable K beyond this range, it triggers an over/underflow.
   ! - Extreme values of K have already been filtered out by the min/max step.
-  fb = ishft(int(expbias, int_kind) - j, expbit)
+  fb = ishft(int(expbias, int_rsize) - j, expbit)
   a = a * transfer(fb, real_mold)
 end procedure exp_repro
 
@@ -278,9 +244,9 @@ end function exp_remez_expm1_estrin_4
 !! unset, then ieee_rint() is used.
 pure function fast_rint(x) result(n)
   real, intent(in) :: x
-    !< Real value to be rounded to the nearest integer
+    !< Real value to be rounded to the nearest integer [nondim]
   real :: n
-    !< Nearest integer to x, stored as a real
+    !< Nearest integer to x, stored as a real [nondim]
 
   n = (x + round_bias) - round_bias
 end function fast_rint

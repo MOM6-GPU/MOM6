@@ -7,11 +7,11 @@
 module MOM_intrinsic_functions
 
 use iso_fortran_env, only : stdout => output_unit, stderr => error_unit
-use iso_fortran_env, only : int64
+use iso_fortran_env, only : int32, int64
 
 implicit none ; private
 
-public :: invcosh, cuberoot, nth_root, exp_repro
+public :: invcosh, cuberoot, nth_root, exp_repro, log_repro
 public :: intrinsic_functions_unit_tests
 
 interface
@@ -20,36 +20,70 @@ interface
   !! Compute exp(x) with bitwise reproducibility across platforms.
   !! Implemented in submodule MOM_exp
   elemental module function exp_repro(x) result(a)
+    !$omp declare target
+    real, intent(in) :: x
+      !< Input value [nondim]
+    real :: a
+      !< exp(x) [nondim]
+  end function exp_repro
+
+  !> Reproducible natural logarithm function
+  !!
+  !! Compute log(x) with bitwise reproducibility across platforms.
+  !! Implemented in submodule MOM_log
+  elemental module function log_repro(x) result(a)
+    !$omp declare target
     real, intent(in) :: x
       !< Input value
     real :: a
-      !< exp(x)
-    !$omp declare target
-  end function exp_repro
+      !< log(x)
+  end function log_repro
 end interface
 
-! Floating point model, if bit layout from high to low is (sign, exp, frac)
+real, parameter :: real_mold = 0.
+  !< Real mold for numerical format queries [nondim]
+integer, parameter :: int_rsize &
+    = merge(int64, int32, storage_size(real_mold) > storage_size(0_int32))
+  !< Integer kind with the same storage size as default real
+integer(kind=int_rsize), parameter :: int_mold = 0
+  !< Integer mold value
 
-integer, parameter :: bias = maxexponent(1.) - 1
-  !< The double precision exponent offset
-integer, parameter :: signbit = storage_size(1.) - 1
-  !< Position of sign bit
-integer, parameter :: explen = 1 + ceiling(log(real(bias))/log(2.))
-  !< Bit size of exponent
-integer, parameter :: expbit = signbit - explen
+! Floating point layout
+integer, parameter :: expbit = digits(real_mold) - 1
   !< Position of lowest exponent bit
-integer, parameter :: fraclen = expbit
-  !< Length of fractional part
+integer, parameter :: signbit = storage_size(real_mold) - 1
+  !< Position of sign bit
+integer, parameter :: expwidth = signbit - expbit
+  !< Number of exponent bits
+integer, parameter :: expbias = maxexponent(real_mold) - 1
+  !< Exponent bias
+integer(kind=int_rsize), parameter :: signmask = ibset(0_int_rsize, signbit)
+  !< Sign bit mask
+integer(kind=int_rsize), parameter :: expmax = 2_int_rsize**expwidth - 1
+  !< Maximum encoded exponent value; reserved for infinity and NaN
+integer(kind=int_rsize), parameter :: expmask = ishft(expmax, expbit)
+  !< Exponent field mask
+integer(kind=int_rsize), parameter :: expstep = 2_int_rsize**expbit
+  !< Step between encoded exponent values.
+  !! Also the smallest (non-subnormal) representable value.
+
+! Mathematical constants (assuming real64)
+real, parameter :: ln2 = 0.693147180559945309417232121458176568
+  !< Natural logarithm of 2 [nondim]
+real, parameter :: ln2_hi = 0.69314718036912381649017333984375
+  !< Upper 32 bits of ln2 [nondim]
+real, parameter :: ln2_lo = 1.90821492927058770002e-10
+  !< Remaining bits of ln2 [nondim]
 
 contains
 
 !> Evaluate the inverse cosh, either using a math library or an
 !! equivalent expression
 pure function invcosh(x)
+  !$omp declare target
   real, intent(in) :: x !< The argument of the inverse of cosh [nondim].  NaNs will
                         !! occur if x<1, but there is no error checking
   real :: invcosh  ! The inverse of cosh of x [nondim]
-  !$omp declare target
 
 #ifdef __INTEL_COMPILER
   invcosh = acosh(x)
@@ -213,7 +247,7 @@ pure subroutine rescale_cbrt(a, x, e_r, s_a)
   ! Pack bits of a into xb and extract its exponent and sign.
   xb = transfer(a, 1_int64)
   s_a = ibits(xb, signbit, 1)
-  e_a = ibits(xb, expbit, explen) - bias
+  e_a = ibits(xb, expbit, expwidth) - expbias
 
   ! The floating-point form of `a` with exponent `e` is
   !
@@ -251,7 +285,7 @@ pure subroutine rescale_cbrt(a, x, e_r, s_a)
 
   ! Insert the new 11-bit exponent into xb and write to x and extend the
   ! bitcount to 12, so that the sign bit is zero and x is always positive.
-  call mvbits(e_x + bias, 0, explen + 1, xb, fraclen)
+  call mvbits(e_x + expbias, 0, expwidth + 1, xb, expbit)
   x = transfer(xb, 1.)
 end subroutine rescale_cbrt
 
@@ -275,8 +309,8 @@ pure function descale(x, e_a, s_a) result(a)
 
   ! Apply the corrected exponent and sign to x.
   xb = transfer(x, 1_int64)
-  e_x = ibits(xb, expbit, explen)
-  call mvbits(e_a + e_x, 0, explen, xb, expbit)
+  e_x = ibits(xb, expbit, expwidth)
+  call mvbits(e_a + e_x, 0, expwidth, xb, expbit)
   call mvbits(s_a, 0, 1, xb, signbit)
   a = transfer(xb, 1.)
 end function descale
