@@ -2931,8 +2931,13 @@ subroutine MOM_temp_salt_initialize_from_Z(h, tv, depth_tot, G, GV, US, PF, just
 
       call regridding_preadjust_reqs(regridCS, do_conv_adj, ignore)
       if (do_conv_adj) call convective_adjustment(G, GV_loc, h1, tv_loc)
+      ! The z* grid is generated on the device.  h may already be mapped by an outer scope.
+      !$omp target enter data map(to: h1, dz_interface) map(alloc: h)
+      !$omp target update to(h)
       call regridding_main( remapCS, regridCS, G, GV_loc, US, h1, tv_loc, h, dz_interface, &
                             frac_shelf_h=frac_shelf_h )
+      !$omp target update from(h)
+      !$omp target exit data map(release: h) map(delete: h1, dz_interface)
 
       deallocate( dz_interface )
 

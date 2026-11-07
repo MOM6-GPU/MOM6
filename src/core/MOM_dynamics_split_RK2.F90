@@ -1449,17 +1449,22 @@ subroutine remap_dyn_split_RK2_aux_vars(G, GV, CS, h_old_u, h_old_v, h_new_u, h_
                                                               !! velocity points [H ~> m or kg m-2]
   type(ALE_CS),                     pointer       :: ALE_CSp  !< ALE control structure to use when remapping
 
+  ! Local variables
+  type(group_pass_type) :: pass_aux ! A group halo pass for the remapped variables
+
   if (.not.CS%remap_aux) return
 
+  ! The thicknesses and the auxiliary variables are current on the device, where they are remapped.
   if (CS%store_CAu) then
     call ALE_remap_velocities(ALE_CSp, G, GV, h_old_u, h_old_v, h_new_u, h_new_v, CS%u_av, CS%v_av)
-    call pass_vector(CS%u_av, CS%v_av, G%Domain, complete=.false.)
+    call create_group_pass(pass_aux, CS%u_av, CS%v_av, G%Domain)
     call ALE_remap_velocities(ALE_CSp, G, GV, h_old_u, h_old_v, h_new_u, h_new_v, CS%CAu_pred, CS%CAv_pred)
-    call pass_vector(CS%CAu_pred, CS%CAv_pred, G%Domain, complete=.false.)
+    call create_group_pass(pass_aux, CS%CAu_pred, CS%CAv_pred, G%Domain)
   endif
 
   call ALE_remap_velocities(ALE_CSp, G, GV, h_old_u, h_old_v, h_new_u, h_new_v, CS%diffu, CS%diffv)
-  call pass_vector(CS%diffu, CS%diffv, G%Domain, complete=.true.)
+  call create_group_pass(pass_aux, CS%diffu, CS%diffv, G%Domain)
+  call do_group_pass(pass_aux, G%Domain, omp_offload=.true.)
 
 end subroutine remap_dyn_split_RK2_aux_vars
 

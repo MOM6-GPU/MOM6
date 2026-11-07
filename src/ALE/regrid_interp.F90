@@ -13,7 +13,7 @@ use regrid_edge_values, only : edge_values_explicit_h4cw
 use regrid_edge_values, only : edge_values_implicit_h4, edge_values_implicit_h6
 use regrid_edge_values, only : edge_slopes_implicit_h3, edge_slopes_implicit_h5
 
-use PLM_functions, only : PLM_reconstruction, PLM_boundary_extrapolation
+use PLM_functions, only : PLM_reconstruction, PLM_boundary_extrapolation, PLM_max_cells
 use PPM_functions, only : PPM_reconstruction, PPM_boundary_extrapolation
 use PPM_functions, only : PPM_monotonicity
 use PQM_functions, only : PQM_reconstruction, PQM_boundary_extrapolation_v1
@@ -146,6 +146,10 @@ subroutine regridding_set_ppolys(CS, densities, n0, h0, ppoly0_E, ppoly0_S, &
 
     case ( INTERPOLATION_PLM )
       degree = DEGREE_1
+#ifdef __NVCOMPILER_OPENMP_GPU
+      if (n0 > PLM_max_cells) call MOM_error(FATAL, "regridding_set_ppolys: GPU builds of "//&
+          "PLM_reconstruction handle no more than PLM_max_cells cells in a column.")
+#endif
       call PLM_reconstruction( n0, h0, densities, ppoly0_E, ppoly0_coefs, h_neglect )
       if (extrapolate) then
         call PLM_boundary_extrapolation( n0, h0, densities, ppoly0_E, ppoly0_coefs, h_neglect )
