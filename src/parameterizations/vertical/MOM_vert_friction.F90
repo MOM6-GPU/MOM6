@@ -2501,14 +2501,13 @@ subroutine find_coupling_coef(a_cpl, hvel, do_ij, h_harm, bbl_thick, kv_bbl, z_i
   do_shelf = .false. ; if (present(shelf)) do_shelf = shelf
 
   do_OBCs = .false.
-  ! The column code that this replaces only took open boundaries into account under ice shelves.
-  if (do_shelf) then ; if (associated(OBC)) then
+  if (associated(OBC)) then
     if (work_on_u) then
       do_OBCs = OBC%u_E_OBCs_on_PE .or. OBC%u_W_OBCs_on_PE
     else
       do_OBCs = OBC%v_N_OBCs_on_PE .or. OBC%v_S_OBCs_on_PE
     endif
-  endif ; endif
+  endif
 
   I_Hmix = 0.
   if (CS%Kvml_invZ2 > 0. .and. .not. do_shelf) I_Hmix = 1. / (CS%Hmix + h_neglect)
