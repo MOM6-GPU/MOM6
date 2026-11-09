@@ -1740,14 +1740,14 @@ subroutine vertvisc_coef(u, v, h, dz, forces, visc, tv, dt, G, GV, US, CS, OBC, 
     endif
 
     ! Diagnose total Kv at u-points
-    if (CS%id_Kv_u > 0) then
+    if (allocated(Kv_u)) then
       do k=1,nz
         Kv_u(I,j,k) = 0.5 * (CS%a_u(I,j,K) + CS%a_u(I,j,K+1)) * CS%h_u(I,j,k)
       enddo
     endif
 
     ! Diagnose GL90 Kv at u-points
-    if (CS%id_Kv_gl90_u > 0) then
+    if (allocated(Kv_gl90_u)) then
       do k=1,nz
         Kv_gl90_u(I,j,k) = 0.5 * (CS%a_u_gl90(I,j,K) + CS%a_u_gl90(I,j,K+1)) * CS%h_u(I,j,k)
       enddo
@@ -2043,14 +2043,14 @@ subroutine vertvisc_coef(u, v, h, dz, forces, visc, tv, dt, G, GV, US, CS, OBC, 
     endif
 
     ! Diagnose total Kv at v-points
-    if (CS%id_Kv_v > 0) then
+    if (allocated(Kv_v)) then
       do k=1,nz
         Kv_v(i,J,k) = 0.5 * (CS%a_v(i,J,K) + CS%a_v(i,J,K+1)) * CS%h_v(i,J,k)
       enddo
     endif
 
     ! Diagnose GL90 Kv at v-points
-    if (CS%id_Kv_gl90_v > 0) then
+    if (allocated(Kv_gl90_v)) then
       do k=1,nz
         Kv_gl90_v(i,J,k) = 0.5 * (CS%a_v_gl90(i,J,K) + CS%a_v_gl90(i,J,K+1)) * CS%h_v(i,J,k)
       enddo
@@ -2058,7 +2058,7 @@ subroutine vertvisc_coef(u, v, h, dz, forces, visc, tv, dt, G, GV, US, CS, OBC, 
   endif ; enddo ; enddo
 
   !$omp target exit data map(delete: z_i, z_i_gl90, dz_harm, hvel, dz_vel, a_cpl, a_cpl_gl90, &
-  !$omp& tv, hvel_shelf, dz_vel_shelf, a_shelf, hml_u, kv_u, kv_gl90_u)
+  !$omp& tv, hvel_shelf, dz_vel_shelf, a_shelf)
 
   ! These are used in diagnostics, so they need to be mapped back and forth
   !$omp target exit data map(from: hML_u, kv_u, kv_gl90_u )
@@ -2066,8 +2066,14 @@ subroutine vertvisc_coef(u, v, h, dz, forces, visc, tv, dt, G, GV, US, CS, OBC, 
 
   !$omp target exit data map(delete: Ustar_2d)
 
+  !$omp target update from(CS%h_u) if (CS%debug .or. (CS%id_h_u > 0))
+  !$omp target update from(CS%h_v) if (CS%debug .or. (CS%id_h_v > 0))
+  !$omp target update from(CS%a_u) if (CS%debug .or. (CS%id_au_vv > 0))
+  !$omp target update from(CS%a_v) if (CS%debug .or. (CS%id_av_vv > 0))
+  !$omp target update from(CS%a_u_gl90) if (CS%id_au_gl90_vv > 0)
+  !$omp target update from(CS%a_v_gl90) if (CS%id_av_gl90_vv > 0)
+
   if (CS%debug) then
-    !$omp target update from(CS%h_u, CS%h_v, CS%a_u, CS%a_v)
     call uvchksum("loop vertvisc_coef h_[uv]", CS%h_u, CS%h_v, G%HI, haloshift=0, &
                   unscale=GV%H_to_m, scalar_pair=.true.)
     call uvchksum("vertvisc_coef a_[uv]", CS%a_u, CS%a_v, G%HI, haloshift=0, &
