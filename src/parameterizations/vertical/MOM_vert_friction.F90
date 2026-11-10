@@ -783,9 +783,11 @@ subroutine vertvisc(u, v, h, forces, visc, dt, OBC, ADp, CDp, G, GV, US, CS, &
     enddo
 
     if (allocated(visc%Ray_u)) then
-      do k=1,nz
-        do concurrent (j=G%jsc:G%jec, I=Isq:Ieq)
-          taux_bot(I,j) = taux_bot(I,j) + GV%H_to_RZ * (visc%Ray_u(I,j,k) * u(I,j,k))
+      do concurrent (j=G%jsc:G%jec)
+        do k=1,nz
+          do concurrent (I=Isq:Ieq)
+            taux_bot(I,j) = taux_bot(I,j) + GV%H_to_RZ * (visc%Ray_u(I,j,k) * u(I,j,k))
+          enddo
         enddo
       enddo
     endif
@@ -893,9 +895,11 @@ subroutine vertvisc(u, v, h, forces, visc, dt, OBC, ADp, CDp, G, GV, US, CS, &
     enddo
 
     if (allocated(visc%Ray_v)) then
-      do k=1,nz
-        do concurrent (J=Jsq:Jeq, i=is:ie)
-          tauy_bot(i,J) = tauy_bot(i,J) + GV%H_to_RZ * (visc%Ray_v(i,J,k)*v(i,J,k))
+      do concurrent (J=Jsq:Jeq)
+        do k=1,nz
+          do concurrent (i=is:ie)
+            tauy_bot(i,J) = tauy_bot(i,J) + GV%H_to_RZ * (visc%Ray_v(i,J,k)*v(i,J,k))
+          enddo
         enddo
       enddo
     endif
