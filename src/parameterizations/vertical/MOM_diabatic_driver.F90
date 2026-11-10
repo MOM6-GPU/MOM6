@@ -321,6 +321,7 @@ subroutine diabatic(u, v, h, tv, BLD, fluxes, visc, ADp, CDp, dt, Time_end, &
   real :: H_to_RL2_T2  ! A conversion factor from thicknesses in H to pressure [R L2 T-2 H-1 ~> Pa m-1 or Pa m2 kg-1]
   integer :: i, j, k, is, ie, js, je, nz
   logical :: showCallTree ! If true, show the call tree
+  logical :: state_on_device ! If true, tv and fluxes stay mapped from the first make_frazil to the second.
 
   real, allocatable, dimension(:,:,:)    :: h_in  ! thickness before thermodynamics [H ~> m or kg m-2]
   real, allocatable, dimension(:,:,:)    :: t_in  ! temperature before thermodynamics [C ~> degC]
@@ -378,6 +379,24 @@ subroutine diabatic(u, v, h, tv, BLD, fluxes, visc, ADp, CDp, dt, Time_end, &
   call set_BBL_TKE(u, v, h, tv, fluxes, visc, G, GV, US, CS%set_diff_CSp, OBC=OBC)
   call cpu_clock_end(id_clock_set_diffusivity)
 
+  !   The other paths change tv on the host and rely on their own maps to copy it to the device,
+  ! so only the legacy ALE path keeps it resident.
+  state_on_device = CS%useALEalgorithm .and. CS%use_legacy_diabatic
+  if (state_on_device) then
+    ! Mapping tv%eqn_of_state alone with an if clause crashes gfortran 16.2, so map it with tv.
+    !$omp target enter data map(to: tv, tv%eqn_of_state) if (associated(tv%eqn_of_state))
+    !$omp target enter data map(to: tv, tv%T, tv%S)
+    !$omp target enter data map(to: tv%frazil) if(associated(tv%frazil))
+    !$omp target enter data map(to: tv%p_surf) if(associated(tv%p_surf))
+    !$omp target enter data map(to: tv%SpV_avg) if(allocated(tv%SpV_avg))
+    !$omp target enter data map(to: tv%TempxPmE) if(associated(tv%TempxPmE))
+    !$omp target enter data map(to: tv%internal_heat) if(associated(tv%internal_heat))
+    call extract_fluxes_enter_data(fluxes)
+    !$omp target enter data map(to: fluxes%netMassOut, fluxes%netMassIn)
+    !$omp target enter data map(to: fluxes%salt_left_behind) if(associated(fluxes%salt_left_behind))
+    !$omp target enter data map(to: visc%h_ML_param) if(associated(visc%h_ML_param))
+  endif
+
   ! Frazil formation keeps the temperature above the freezing point.
   ! make_frazil is deliberately called at both the beginning and at
   ! the end of the diabatic processes.
@@ -390,7 +409,7 @@ subroutine diabatic(u, v, h, tv, BLD, fluxes, visc, ADp, CDp, dt, Time_end, &
       enddo ; enddo ; enddo
     endif
 
-    !$omp target enter data map(to: tv, tv%T, tv%frazil, tv%S)
+    !$omp target enter data map(to: tv, tv%T, tv%frazil, tv%S) if(.not.state_on_device)
     !$omp target update to( h )
     if (associated(fluxes%p_surf_full)) then
       !$omp target enter data map(to: fluxes%p_surf_full )
@@ -399,19 +418,26 @@ subroutine diabatic(u, v, h, tv, BLD, fluxes, visc, ADp, CDp, dt, Time_end, &
     else
       call make_frazil(h, tv, G, GV, US, CS%diabatic_aux_CSp, halo=CS%halo_TS_diff)
     endif
-    !$omp target update from( tv%frazil, tv%T )
-    !$omp target exit data map(release: tv%T, tv%S, tv%frazil, tv)
+    if (.not.state_on_device) then
+      !$omp target update from( tv%frazil, tv%T )
+      !$omp target exit data map(release: tv%T, tv%S, tv%frazil, tv)
+    endif
     if (showCallTree) call callTree_waypoint("done with 1st make_frazil (diabatic)")
 
     if (CS%frazil_tendency_diag) then
+      !$omp target update from(tv%T)
       call diagnose_frazil_tendency(tv, h, temp_diag, 0.5*dt, G, GV, US, CS)
       if (CS%id_frazil_h > 0) call post_data(CS%id_frazil_h, h, CS%diag)
     endif
     call disable_averaging(CS%diag)
   endif ! associated(tv%T) .AND. associated(tv%frazil)
-  if (CS%debugConservation) call MOM_state_stats('1st make_frazil', u, v, h, tv%T, tv%S, G, GV, US)
+  if (CS%debugConservation) then
+    !$omp target update from(tv%T)
+    call MOM_state_stats('1st make_frazil', u, v, h, tv%T, tv%S, G, GV, US)
+  endif
 
   if (CS%use_int_tides) then
+    !$omp target update from(tv%T)
     ! This block provides an interface for the unresolved low-mode internal tide module.
     call set_int_tide_input(u, v, h, tv, fluxes, CS%int_tide_input, dt, G, GV, US, &
                             CS%int_tide_input_CSp)
@@ -424,29 +450,8 @@ subroutine diabatic(u, v, h, tv, BLD, fluxes, visc, ADp, CDp, dt, Time_end, &
 
   if (CS%useALEalgorithm .and. CS%use_legacy_diabatic) then
     !$omp target update to(h)
-    ! Mapping tv%eqn_of_state alone with an if clause crashes gfortran 16.2, so map it with tv.
-    !$omp target enter data map(to: tv, tv%eqn_of_state) if (associated(tv%eqn_of_state))
-    !$omp target enter data map(to: tv, tv%T, tv%S)
-    !$omp target enter data map(to: tv%p_surf) if(associated(tv%p_surf))
-    !$omp target enter data map(to: tv%SpV_avg) if(allocated(tv%SpV_avg))
-    !$omp target enter data map(to: tv%TempxPmE) if(associated(tv%TempxPmE))
-    !$omp target enter data map(to: tv%internal_heat) if(associated(tv%internal_heat))
-    call extract_fluxes_enter_data(fluxes)
-    !$omp target enter data map(to: fluxes%netMassOut, fluxes%netMassIn)
-    !$omp target enter data map(to: fluxes%salt_left_behind) if(associated(fluxes%salt_left_behind))
-    !$omp target enter data map(to: visc%h_ML_param) if(associated(visc%h_ML_param))
     call diabatic_ALE_legacy(u, v, h, tv, BLD, fluxes, visc, ADp, CDp, dt, Time_end, &
                       G, GV, US, CS, stoch_CS, Waves)
-    !$omp target exit data map(release: visc%h_ML_param) if(associated(visc%h_ML_param))
-    !$omp target exit data map(release: fluxes%salt_left_behind) if(associated(fluxes%salt_left_behind))
-    !$omp target exit data map(release: fluxes%netMassOut, fluxes%netMassIn)
-    call extract_fluxes_exit_data(fluxes)
-    !$omp target exit data map(release: tv%internal_heat) if(associated(tv%internal_heat))
-    !$omp target exit data map(release: tv%TempxPmE) if(associated(tv%TempxPmE))
-    !$omp target exit data map(release: tv%SpV_avg) if(allocated(tv%SpV_avg))
-    !$omp target exit data map(release: tv%p_surf) if(associated(tv%p_surf))
-    !$omp target exit data map(release: tv%S, tv%T, tv)
-    !$omp target exit data map(release: tv%eqn_of_state, tv) if (associated(tv%eqn_of_state))
   elseif (CS%useALEalgorithm) then
     call diabatic_ALE(u, v, h, tv, BLD, fluxes, visc, ADp, CDp, dt, Time_end, &
                       G, GV, US, CS, stoch_CS, Waves)
@@ -473,12 +478,13 @@ subroutine diabatic(u, v, h, tv, BLD, fluxes, visc, ADp, CDp, dt, Time_end, &
   if (associated(tv%T) .AND. associated(tv%frazil)) then
     call enable_averages(0.5*dt, Time_end, CS%diag)
     if (CS%frazil_tendency_diag) then
+      !$omp target update from(tv%T)
       do k=1,nz ; do j=js,je ; do i=is,ie
         temp_diag(i,j,k) = tv%T(i,j,k)
       enddo ; enddo ; enddo
     endif
 
-    !$omp target enter data map(to: tv, tv%T, tv%frazil, tv%S)
+    !$omp target enter data map(to: tv, tv%T, tv%frazil, tv%S) if(.not.state_on_device)
     !$omp target update to( h )
     if (associated(fluxes%p_surf_full)) then
       !$omp target enter data map(to: fluxes%p_surf_full)
@@ -487,19 +493,45 @@ subroutine diabatic(u, v, h, tv, BLD, fluxes, visc, ADp, CDp, dt, Time_end, &
     else
       call make_frazil(h, tv, G, GV, US, CS%diabatic_aux_CSp)
     endif
-    !$omp target update from( tv%frazil, tv%T )
-    !$omp target exit data map(release: tv, tv%T, tv%frazil, tv%S)
+    if (.not.state_on_device) then
+      !$omp target update from( tv%frazil, tv%T )
+      !$omp target exit data map(release: tv, tv%T, tv%frazil, tv%S)
+    endif
 
     if (CS%frazil_tendency_diag) then
+      !$omp target update from(tv%T)
       call diagnose_frazil_tendency(tv, h, temp_diag, 0.5*dt, G, GV, US, CS)
       if (CS%id_frazil_h > 0 ) call post_data(CS%id_frazil_h, h, CS%diag)
     endif
 
     if (showCallTree) call callTree_waypoint("done with 2nd make_frazil (diabatic)")
-    if (CS%debugConservation) call MOM_state_stats('2nd make_frazil', u, v, h, tv%T, tv%S, G, GV, US)
+    if (CS%debugConservation) then
+      !$omp target update from(tv%T)
+      call MOM_state_stats('2nd make_frazil', u, v, h, tv%T, tv%S, G, GV, US)
+    endif
     call disable_averaging(CS%diag)
 
   endif  ! endif for frazil
+
+  if (state_on_device) then
+    !$omp target update from(tv%T, tv%S)
+    !$omp target update from(tv%frazil) if(associated(tv%frazil))
+    !$omp target update from(tv%TempxPmE) if(associated(tv%TempxPmE))
+    !$omp target update from(tv%internal_heat) if(associated(tv%internal_heat))
+    !$omp target update from(fluxes%netMassIn, fluxes%netMassOut)
+    call extract_fluxes_update_host(fluxes)
+    !$omp target exit data map(release: visc%h_ML_param) if(associated(visc%h_ML_param))
+    !$omp target exit data map(release: fluxes%salt_left_behind) if(associated(fluxes%salt_left_behind))
+    !$omp target exit data map(release: fluxes%netMassOut, fluxes%netMassIn)
+    call extract_fluxes_exit_data(fluxes)
+    !$omp target exit data map(release: tv%internal_heat) if(associated(tv%internal_heat))
+    !$omp target exit data map(release: tv%TempxPmE) if(associated(tv%TempxPmE))
+    !$omp target exit data map(release: tv%SpV_avg) if(allocated(tv%SpV_avg))
+    !$omp target exit data map(release: tv%p_surf) if(associated(tv%p_surf))
+    !$omp target exit data map(release: tv%frazil) if(associated(tv%frazil))
+    !$omp target exit data map(release: tv%S, tv%T, tv)
+    !$omp target exit data map(release: tv%eqn_of_state, tv) if (associated(tv%eqn_of_state))
+  endif
 
   if (stoch_CS%do_sppt) then
     ! perturb diabatic tendencies.
@@ -712,11 +744,13 @@ subroutine diabatic_ALE_legacy(u, v, h, tv, BLD, fluxes, visc, ADp, CDp, dt, Tim
   ! structure indicates it is necessary. If these arrays are allocated, they will store
   ! a copy of tv%T & tv%S before this subroutine modifies the tv structure.
   if (allocated(CS%prediabatic_T)) then
+    !$omp target update from(tv%T)
     do k=1,nz ; do j=js,je ; do i=is,ie
       CS%prediabatic_T(i,j,k) = tv%T(i,j,k)
     enddo ; enddo ; enddo
   endif
   if (allocated(CS%prediabatic_S)) then
+    !$omp target update from(tv%S)
     do k=1,nz ; do j=js,je ; do i=is,ie
       CS%prediabatic_S(i,j,k) = tv%S(i,j,k)
     enddo ; enddo ; enddo
@@ -1371,6 +1405,7 @@ subroutine diabatic_ALE_legacy(u, v, h, tv, BLD, fluxes, visc, ADp, CDp, dt, Tim
   if (CS%use_sponge .and. associated(CS%ALE_sponge_CSp)) then
     call cpu_clock_begin(id_clock_sponge)
     call apply_ALE_sponge(h, tv, dt, G, GV, US, CS%ALE_sponge_CSp, CS%Time)
+    !$omp target update to(tv%T, tv%S)
     call cpu_clock_end(id_clock_sponge)
     if (CS%debug) then
       call MOM_state_chksum("apply_sponge ", u, v, h, G, GV, US, haloshift=0)
@@ -1383,6 +1418,7 @@ subroutine diabatic_ALE_legacy(u, v, h, tv, BLD, fluxes, visc, ADp, CDp, dt, Tim
     call MOM_mesg("Starting ODA_INCUPD legacy ", 5)
     call cpu_clock_begin(id_clock_oda_incupd)
     call apply_oda_incupd(h, tv, u, v, dt, G, GV, US, CS%oda_incupd_CSp)
+    !$omp target update to(tv%T, tv%S)
     call cpu_clock_end(id_clock_oda_incupd)
     if (CS%debug) then
       call MOM_state_chksum("apply_oda_incupd ", u, v, h, G, GV, US, haloshift=0)
