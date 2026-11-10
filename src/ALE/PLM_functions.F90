@@ -8,11 +8,24 @@ module PLM_functions
 implicit none ; private
 
 public PLM_boundary_extrapolation
+public PLM_reconstruction_columns
 public PLM_extrapolate_slope
 public PLM_monotonized_slope
 public PLM_reconstruction
 public PLM_slope_wa
 public PLM_slope_cw
+public PLM_max_cells
+
+!> The largest number of cells in a column that PLM_reconstruction can handle on GPU builds, where its
+!! work arrays have this fixed declared extent because automatic arrays with a runtime size would be
+!! allocated on the device heap.  Callers of PLM_reconstruction check their columns against it.
+integer, parameter :: PLM_max_cells = 128
+
+#ifdef __NVCOMPILER_OPENMP_GPU
+#define WSZK_(n)  PLM_max_cells
+#else
+#define WSZK_(n)  n
+#endif
 
 contains
 
@@ -187,13 +200,14 @@ end function PLM_extrapolate_slope
 !!
 !! It is assumed that the size of the array 'u' is equal to the number of cells
 !! defining 'grid' and 'ppoly'. No consistency check is performed here.
-subroutine PLM_reconstruction( N, h, u, edge_values, ppoly_coef, h_neglect )
+pure subroutine PLM_reconstruction( N, h, u, edge_values, ppoly_coef, h_neglect )
+  !$omp declare target
   integer,              intent(in)    :: N !< Number of cells
-  real, dimension(:),   intent(in)    :: h !< cell widths (size N) [H]
-  real, dimension(:),   intent(in)    :: u !< cell averages (size N) in arbitrary units [A]
-  real, dimension(:,:), intent(inout) :: edge_values !< edge values of piecewise polynomials,
+  real, dimension(N),   intent(in)    :: h !< cell widths (size N) [H]
+  real, dimension(N),   intent(in)    :: u !< cell averages (size N) in arbitrary units [A]
+  real, dimension(N,2), intent(inout) :: edge_values !< edge values of piecewise polynomials,
                                            !! with the same units as u [A].
-  real, dimension(:,:), intent(inout) :: ppoly_coef !< coefficients of piecewise polynomials, mainly
+  real, dimension(N,2), intent(inout) :: ppoly_coef !< coefficients of piecewise polynomials, mainly
                                            !! with the same units as u [A].
   real,                 intent(in)    :: h_neglect !< A negligibly small width for
                                            !! the purpose of cell reconstructions
@@ -206,8 +220,8 @@ subroutine PLM_reconstruction( N, h, u, edge_values, ppoly_coef, h_neglect )
   real          :: e_r         ! The edge value in the neighboring cell [A]
   real          :: edge        ! The projected edge value in the cell [A]
   real          :: almost_one  ! A value that is slightly smaller than 1 [nondim]
-  real, dimension(N) :: slp    ! The first guess at the normalized tracer slopes [A]
-  real, dimension(N) :: mslp   ! The monotonized normalized tracer slopes [A]
+  real, dimension(WSZK_(N)) :: slp  ! The first guess at the normalized tracer slopes [A]
+  real, dimension(WSZK_(N)) :: mslp ! The monotonized normalized tracer slopes [A]
 
   almost_one = 1. - epsilon(slope)
 
@@ -266,13 +280,14 @@ end subroutine PLM_reconstruction
 !!
 !! It is assumed that the size of the array 'u' is equal to the number of cells
 !! defining 'grid' and 'ppoly'. No consistency check is performed here.
-subroutine PLM_boundary_extrapolation( N, h, u, edge_values, ppoly_coef, h_neglect )
+pure subroutine PLM_boundary_extrapolation( N, h, u, edge_values, ppoly_coef, h_neglect )
+  !$omp declare target
   integer,              intent(in)    :: N !< Number of cells
-  real, dimension(:),   intent(in)    :: h !< cell widths (size N) [H]
-  real, dimension(:),   intent(in)    :: u !< cell averages (size N) in arbitrary units [A]
-  real, dimension(:,:), intent(inout) :: edge_values !< edge values of piecewise polynomials,
+  real, dimension(N),   intent(in)    :: h !< cell widths (size N) [H]
+  real, dimension(N),   intent(in)    :: u !< cell averages (size N) in arbitrary units [A]
+  real, dimension(N,2), intent(inout) :: edge_values !< edge values of piecewise polynomials,
                                            !! with the same units as u [A].
-  real, dimension(:,:), intent(inout) :: ppoly_coef !< coefficients of piecewise polynomials, mainly
+  real, dimension(N,2), intent(inout) :: ppoly_coef !< coefficients of piecewise polynomials, mainly
                                            !! with the same units as u [A].
   real,                 intent(in)    :: h_neglect !< A negligibly small width for
                                            !! the purpose of cell reconstructions
@@ -299,6 +314,78 @@ subroutine PLM_boundary_extrapolation( N, h, u, edge_values, ppoly_coef, h_negle
   ppoly_coef(N,2) = edge_values(N,2) - edge_values(N,1)
 
 end subroutine PLM_boundary_extrapolation
+
+!> Reconstruction by linear polynomials in a block of columns, each with N cells, using
+!! PLM_reconstruction and, if boundary_extrapolation is true, PLM_boundary_extrapolation.
+!! The block arrays have the column index last, so that neighboring columns are adjacent in memory.
+!! The input and output arrays must be current on the device.
+subroutine PLM_reconstruction_columns( N, nib, njb, iie, jje, active, h, u, edge_values, ppoly_coef, h_neglect, &
+                                       boundary_extrapolation )
+  integer, intent(in) :: N   !< Number of cells in each column
+  integer, intent(in) :: nib !< The i-size of the block arrays
+  integer, intent(in) :: njb !< The j-size of the block arrays
+  integer, intent(in) :: iie !< The number of valid columns in the i-direction
+  integer, intent(in) :: jje !< The number of valid columns in the j-direction
+  logical, dimension(nib,njb),  intent(in)    :: active !< True for the columns to reconstruct
+  real, dimension(nib,njb,N),   intent(in)    :: h !< cell widths [H]
+  real, dimension(nib,njb,N),   intent(in)    :: u !< cell averages in arbitrary units [A]
+  real, dimension(nib,njb,N,2), intent(inout) :: edge_values !< edge values of piecewise polynomials,
+                                           !! with the same units as u [A].
+  real, dimension(nib,njb,N,2), intent(inout) :: ppoly_coef !< coefficients of piecewise polynomials, mainly
+                                           !! with the same units as u [A].
+  real,                 intent(in)    :: h_neglect !< A negligibly small width for
+                                           !! the purpose of cell reconstructions
+                                           !! in the same units as h [H]
+  logical,              intent(in)    :: boundary_extrapolation !< If true, extrapolate in the boundary cells
+  ! Local variables
+  integer :: ii, jj
+
+  do concurrent (jj=1:jje, ii=1:iie, active(ii,jj))
+    call PLM_block_column( N, nib, njb, ii, jj, h, u, edge_values, ppoly_coef, h_neglect, boundary_extrapolation )
+  enddo
+
+end subroutine PLM_reconstruction_columns
+
+!> Applies PLM_reconstruction and, if boundary_extrapolation is true, PLM_boundary_extrapolation to
+!! the column (ii,jj) of the block arrays used by PLM_reconstruction_columns, using contiguous copies
+!! of the column.
+pure subroutine PLM_block_column( N, nib, njb, ii, jj, h, u, edge_values, ppoly_coef, h_neglect, &
+                                  boundary_extrapolation )
+  !$omp declare target
+  integer, intent(in) :: N   !< Number of cells in each column
+  integer, intent(in) :: nib !< The i-size of the block arrays
+  integer, intent(in) :: njb !< The j-size of the block arrays
+  integer, value      :: ii  !< The block-local i index of the column
+  integer, value      :: jj  !< The block-local j index of the column
+  real, dimension(nib,njb,N),   intent(in)    :: h !< cell widths [H]
+  real, dimension(nib,njb,N),   intent(in)    :: u !< cell averages in arbitrary units [A]
+  real, dimension(nib,njb,N,2), intent(inout) :: edge_values !< edge values of piecewise polynomials,
+                                           !! with the same units as u [A].
+  real, dimension(nib,njb,N,2), intent(inout) :: ppoly_coef !< coefficients of piecewise polynomials, mainly
+                                           !! with the same units as u [A].
+  real,                 intent(in)    :: h_neglect !< A negligibly small width for
+                                           !! the purpose of cell reconstructions
+                                           !! in the same units as h [H]
+  logical,              intent(in)    :: boundary_extrapolation !< If true, extrapolate in the boundary cells
+  ! Local variables
+  ! These have a fixed size on GPU builds; see the note on PLM_max_cells.  The (N,2) arrays of
+  ! PLM_reconstruction are stored contiguously in the first 2*N elements of E_col and coef_col.
+  real :: h_col(WSZK_(N))      ! A contiguous copy of the column of h [H]
+  real :: u_col(WSZK_(N))      ! A contiguous copy of the column of u [A]
+  real :: E_col(2*WSZK_(N))    ! The edge values of the column [A]
+  real :: coef_col(2*WSZK_(N)) ! The polynomial coefficients of the column [A]
+  integer :: k
+
+  do k=1,N ; h_col(k) = h(ii,jj,k) ; u_col(k) = u(ii,jj,k) ; enddo
+  call PLM_reconstruction( N, h_col, u_col, E_col, coef_col, h_neglect )
+  if (boundary_extrapolation) &
+    call PLM_boundary_extrapolation( N, h_col, u_col, E_col, coef_col, h_neglect )
+  do k=1,N
+    edge_values(ii,jj,k,1) = E_col(k) ; edge_values(ii,jj,k,2) = E_col(N+k)
+    ppoly_coef(ii,jj,k,1) = coef_col(k) ; ppoly_coef(ii,jj,k,2) = coef_col(N+k)
+  enddo
+
+end subroutine PLM_block_column
 
 !> \namespace plm_functions
 !!
