@@ -683,16 +683,17 @@ subroutine vertvisc(u, v, h, forces, visc, dt, OBC, ADp, CDp, G, GV, US, CS, &
     endif ; enddo ; enddo ; enddo
   endif
 
-  if (associated(ADp%du_dt_visc)) then
-    do k=1,nz ; do j=G%jsc,G%jec ; do I=Isq,Ieq
-      ADp%du_dt_visc(I,j,k) = u(I,j,k)
-    enddo ; enddo ; enddo
-  endif
-
   !$omp target enter data map(to: ADp)
   !$omp target enter data map(alloc: surface_stress)
   !$omp target enter data map(alloc: ADp%dv_dt_str)
   !$omp target enter data map(alloc: ADp%du_dt_str)
+
+  ! The velocities are updated on the device, so they must be copied there rather than from the host.
+  if (associated(ADp%du_dt_visc)) then
+    do concurrent (k=1:nz, j=G%jsc:G%jec, I=Isq:Ieq)
+      ADp%du_dt_visc(I,j,k) = u(I,j,k)
+    enddo
+  endif
 
   if (associated(ADp%du_dt_visc_gl90)) then
     do concurrent (k=1:nz, j=G%jsc:G%jec, I=Isq:Ieq)
@@ -874,9 +875,9 @@ subroutine vertvisc(u, v, h, forces, visc, dt, OBC, ADp, CDp, G, GV, US, CS, &
   endif
 
   if (associated(ADp%dv_dt_visc_gl90)) then
-    do k=1,nz ; do J=Jsq,Jeq ; do i=is,ie
+    do concurrent (k=1:nz, J=Jsq:Jeq, i=is:ie)
       ADp%dv_dt_visc_gl90(i,J,k) = v(i,J,k)
-    enddo ; enddo ; enddo
+    enddo
   endif
 
   if (associated(ADp%dv_dt_str)) then
