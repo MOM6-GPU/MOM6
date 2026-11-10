@@ -3623,8 +3623,8 @@ subroutine set_visc_init(Time, G, GV, US, param_file, diag, visc, CS, restart_CS
     allocate(visc%ustar_bbl(isd:ied,jsd:jed), source=0.0)
     allocate(visc%BBL_meanKE_loss(isd:ied,jsd:jed), source=0.0)
     allocate(visc%BBL_meanKE_loss_sqrtCd(isd:ied,jsd:jed), source=0.0)
-    !   Set on the host by set_BBL_TKE and read on the device by add_drag_diffusivity and
-    ! add_LOTW_BBL_diffusivity; set_BBL_TKE refreshes the device copies when it has written them.
+    !   Set on the device by set_BBL_TKE and read there by add_drag_diffusivity and
+    ! add_LOTW_BBL_diffusivity.
     !$omp target enter data map(to: visc%ustar_BBL, visc%BBL_meanKE_loss, &
     !$omp   visc%BBL_meanKE_loss_sqrtCd)
 

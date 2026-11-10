@@ -1915,12 +1915,6 @@ subroutine step_MOM_thermo(CS, G, GV, US, u, v, h, tv, fluxes, dtdia, &
 
   call cpu_clock_begin(id_clock_thermo)
   if (.not.CS%adiabatic) then
-    !$omp target update from(CS%visc%Ray_u) if (allocated(CS%visc%Ray_u))
-    !$omp target update from(CS%visc%Ray_v) if (allocated(CS%visc%Ray_v))
-    !$omp target update from(CS%visc%bbl_thick_u) if (allocated(CS%visc%bbl_thick_u))
-    !$omp target update from(CS%visc%bbl_thick_v) if (allocated(CS%visc%bbl_thick_v))
-    !$omp target update from(CS%visc%Kv_bbl_u) if (allocated(CS%visc%Kv_bbl_u))
-    !$omp target update from(CS%visc%Kv_bbl_v) if (allocated(CS%visc%Kv_bbl_v))
     if (CS%debug) then
       !$omp target update from(CS%uhtr, CS%vhtr)
       call uvchksum("Pre-diabatic [uv]", u, v, G%HI, haloshift=2, unscale=US%L_T_to_m_s)

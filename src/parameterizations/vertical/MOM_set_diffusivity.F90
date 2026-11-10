@@ -896,18 +896,21 @@ subroutine set_diffusivity(u, v, h, u_h, v_h, tv, fluxes, optics, visc, dt, Kd_i
     endif
 
     if (allocated(visc%kv_bbl_u) .and. allocated(visc%kv_bbl_v)) then
+      !$omp target update from(visc%kv_bbl_u, visc%kv_bbl_v)
       call uvchksum("BBL Kv_bbl_[uv]", visc%kv_bbl_u, visc%kv_bbl_v, G%HI, &
                     haloshift=0, symmetric=.true., unscale=GV%HZ_T_to_m2_s, &
                     scalar_pair=.true.)
     endif
 
     if (allocated(visc%bbl_thick_u) .and. allocated(visc%bbl_thick_v)) then
+      !$omp target update from(visc%bbl_thick_u, visc%bbl_thick_v)
       call uvchksum("BBL bbl_thick_[uv]", visc%bbl_thick_u, visc%bbl_thick_v, &
                     G%HI, haloshift=0, symmetric=.true., unscale=US%Z_to_m, &
                     scalar_pair=.true.)
     endif
 
     if (allocated(visc%Ray_u) .and. allocated(visc%Ray_v)) then
+      !$omp target update from(visc%Ray_u, visc%Ray_v)
       call uvchksum("Ray_[uv]", visc%Ray_u, visc%Ray_v, G%HI, 0, &
           symmetric=.true., unscale=GV%H_to_m*US%s_to_T, scalar_pair=.true.)
     endif
@@ -2303,33 +2306,68 @@ subroutine set_BBL_TKE(u, v, h, tv, fluxes, visc, G, GV, US, CS, OBC)
   type(set_diffusivity_CS), intent(in)    :: CS   !< Diffusivity control structure
   type(ocean_OBC_type),     pointer       :: OBC  !< Open boundaries control structure.
 
+  integer :: nii ! i block size for array calculations [nondim]
+  integer :: njj ! j block size for array calculations [nondim]
+
+  nii = CS%niblock ; njj = CS%njblock
+  if (nii == 0) nii = G%iec-G%isc+1
+  if (njj == 0) njj = G%jec-G%jsc+1
+
+  call set_BBL_TKE_block(u, v, h, tv, fluxes, visc, G, GV, US, CS, OBC, nii, njj)
+
+end subroutine set_BBL_TKE
+
+!> Calculates several properties related to bottom boundary layer turbulence, working over
+!! i/j blocks of size nii by njj.
+subroutine set_BBL_TKE_block(u, v, h, tv, fluxes, visc, G, GV, US, CS, OBC, nii, njj)
+  type(ocean_grid_type),    intent(in)    :: G    !< The ocean's grid structure
+  type(verticalGrid_type),  intent(in)    :: GV   !< The ocean's vertical grid structure
+  type(unit_scale_type),    intent(in)    :: US   !< A dimensional unit scaling type
+  real, dimension(SZIB_(G),SZJ_(G),SZK_(GV)), &
+                            intent(in)    :: u    !< The zonal velocity [L T-1 ~> m s-1]
+  real, dimension(SZI_(G),SZJB_(G),SZK_(GV)), &
+                            intent(in)    :: v    !< The meridional velocity [L T-1 ~> m s-1]
+  real, dimension(SZI_(G),SZJ_(G),SZK_(GV)), &
+                            intent(in)    :: h    !< Layer thicknesses [H ~> m or kg m-2]
+  type(thermo_var_ptrs),    intent(in)    :: tv   !< Structure with pointers to thermodynamic fields
+  type(forcing),            intent(in)    :: fluxes !< A structure of thermodynamic surface fluxes
+  type(vertvisc_type),      intent(inout) :: visc !< Structure containing vertical viscosities, bottom
+                                                  !! boundary layer properties and related fields.
+  type(set_diffusivity_CS), intent(in)    :: CS   !< Diffusivity control structure
+  type(ocean_OBC_type),     pointer       :: OBC  !< Open boundaries control structure.
+  integer,                  intent(in)    :: nii  !< Size of the i-block [nondim].
+  integer,                  intent(in)    :: njj  !< Size of the j-block [nondim].
+
   ! This subroutine calculates several properties related to bottom
   ! boundary layer turbulence.
 
-  real, dimension(SZI_(G)) :: &
-    htot          ! Running sum of the depth in the BBL [Z ~> m].
-
-  real, dimension(SZIB_(G)) :: &
-    uhtot, &      ! running integral of u in the BBL [Z L T-1 ~> m2 s-1]
+  real, dimension(0:nii,njj) :: &
     ustar, &      ! bottom boundary layer piston velocity [H T-1 ~> m s-1 or kg m-2 s-1].
     u2_bbl        ! square of the mean zonal velocity in the BBL [L2 T-2 ~> m2 s-2]
 
-  real :: vhtot(SZI_(G)) ! running integral of v in the BBL [Z L T-1 ~> m2 s-1]
-
-  real, dimension(SZI_(G),SZJB_(G)) :: &
+  real, dimension(nii,0:njj) :: &
     vstar, & ! ustar at at v-points [H T-1 ~> m s-1 or kg m-2 s-1].
     v2_bbl   ! square of average meridional velocity in BBL [L2 T-2 ~> m2 s-2]
   real, dimension(SZI_(G),SZJ_(G),SZK_(GV)) :: &
     dz       ! The vertical distance between interfaces around a layer [Z ~> m]
+  integer :: OBC_dir_u(SZIB_(G),SZJ_(G))  ! An integer indicating where there are open u OBCs: +1 for
+                                 ! eastern OBCs, -1 for western OBCs and 0 at points with no open OBCs.
+  integer :: OBC_dir_v(SZI_(G),SZJB_(G))  ! An integer indicating where there are open v OBCs: +1 for
+                                 ! northern OBCs, -1 for southern OBCs and 0 at points with no open OBCs.
 
+  real :: htot        ! Running sum of the depth in the BBL [Z ~> m].
+  real :: uhtot       ! running integral of u in the BBL [Z L T-1 ~> m2 s-1]
+  real :: vhtot       ! running integral of v in the BBL [Z L T-1 ~> m2 s-1]
   real :: cdrag_sqrt  ! Square root of the drag coefficient [nondim]
   real :: hvel        ! thickness at velocity points [Z ~> m]
 
-  logical :: domore, do_i(SZI_(G))
+  logical :: do_col   ! If true, this column has not yet been filled to the BBL thickness.
+  logical :: use_Kv_bbl_v, use_bbl_thick_u
   integer :: i, j, k, is, ie, js, je, nz
+  integer :: isb, ieb, jsb, jeb, ii, jj, iie, jje
   integer :: l_seg
+  integer :: obc_dir  ! The direction of an open OBC at a velocity point, or 0 [nondim]
   logical :: local_open_u_BC, local_open_v_BC
-  logical :: has_obc
 
   local_open_u_BC = .false.
   local_open_v_BC = .false.
@@ -2346,154 +2384,163 @@ subroutine set_BBL_TKE(u, v, h, tv, fluxes, visc, G, GV, US, CS, OBC)
   if (.not.CS%bottomdraglaw .or. (CS%BBL_effic<=0.0 .and. CS%ePBL_BBL_effic<=0.0 .and. &
       (.not.CS%ePBL_BBL_mstar))) then
     if (allocated(visc%ustar_BBL)) then
-      do j=js,je ; do i=is,ie ; visc%ustar_BBL(i,j) = 0.0 ; enddo ; enddo
+      do concurrent (j=js:je, i=is:ie) ; visc%ustar_BBL(i,j) = 0.0 ; enddo
     endif
     if (allocated(visc%BBL_meanKE_loss)) then
-      do j=js,je ; do i=is,ie ; visc%BBL_meanKE_loss(i,j) = 0.0 ; enddo ; enddo
+      do concurrent (j=js:je, i=is:ie) ; visc%BBL_meanKE_loss(i,j) = 0.0 ; enddo
     endif
     if (allocated(visc%BBL_meanKE_loss_sqrtCd)) then
-      do j=js,je ; do i=is,ie ; visc%BBL_meanKE_loss_sqrtCd(i,j) = 0.0 ; enddo ; enddo
+      do concurrent (j=js:je, i=is:ie) ; visc%BBL_meanKE_loss_sqrtCd(i,j) = 0.0 ; enddo
     endif
-    !$omp target update to(visc%ustar_BBL) if (allocated(visc%ustar_BBL))
-    !$omp target update to(visc%BBL_meanKE_loss) if (allocated(visc%BBL_meanKE_loss))
-    !$omp target update to(visc%BBL_meanKE_loss_sqrtCd) if (allocated(visc%BBL_meanKE_loss_sqrtCd))
     return
   endif
 
   cdrag_sqrt = sqrt(CS%cdrag)
+  use_Kv_bbl_v = allocated(visc%Kv_bbl_v)
+  use_bbl_thick_u = allocated(visc%bbl_thick_u)
+
+  !$omp target enter data map(alloc: dz, OBC_dir_u, OBC_dir_v, ustar, u2_bbl, vstar, v2_bbl)
 
   ! Find the vertical distances across layers.
-  call thickness_to_dz(h, tv, dz, G, GV, US, halo_size=1)
+  call thickness_to_dz(h, tv, dz, G, GV, US, halo_size=1, do_offload=.true.)
 
-  !$OMP parallel default(shared) private(do_i,vhtot,htot,domore,hvel,uhtot,ustar,u2_bbl)
-  !$OMP do
-  do J=js-1,je
+  ! The open state of the OBC segments is only available on the host.
+  if (local_open_v_BC) then
+    do J=js-1,je ; do i=is,ie
+      OBC_dir_v(i,J) = 0
+      l_seg = abs(OBC%segnum_v(i,J))
+      if (l_seg /= 0) then ; if (OBC%segment(l_seg)%open) then
+        if (OBC%segnum_v(i,J) > 0) then ! OBC_DIRECTION_N
+          OBC_dir_v(i,J) = 1
+        else
+          OBC_dir_v(i,J) = -1
+        endif
+      endif ; endif
+    enddo ; enddo
+    !$omp target update to(OBC_dir_v)
+  endif
+  if (local_open_u_BC) then
+    do j=js,je ; do I=is-1,ie
+      OBC_dir_u(I,j) = 0
+      l_seg = abs(OBC%segnum_u(I,j))
+      if (l_seg /= 0) then ; if (OBC%segment(l_seg)%open) then
+        if (OBC%segnum_u(I,j) > 0) then !  OBC_DIRECTION_E
+          OBC_dir_u(I,j) = 1
+        else
+          OBC_dir_u(I,j) = -1
+        endif
+      endif ; endif
+    enddo ; enddo
+    !$omp target update to(OBC_dir_u)
+  endif
+
+  do jsb=js,je,njj ; do isb=is,ie,nii
+    jeb = min(je, jsb + njj - 1) ; ieb = min(ie, isb + nii - 1)
+    jje = jeb-jsb+1 ; iie = ieb-isb+1
+
     ! Determine ustar and the square magnitude of the velocity in the bottom boundary layer.
     ! Together these give the TKE source and vertical decay scale.
-    do i=is,ie
-      do_i(i) = .false. ; vstar(i,J) = 0.0 ; vhtot(i) = 0.0 ; htot(i) = 0.0
-    enddo
-    if (allocated(visc%Kv_bbl_v)) then
-      do i=is,ie ; if ((G%mask2dCv(i,J) > 0.0) .and. (cdrag_sqrt*visc%bbl_thick_v(i,J) > 0.0)) then
-        do_i(i) = .true.
-        vstar(i,J) = visc%Kv_bbl_v(i,J) / (cdrag_sqrt*visc%bbl_thick_v(i,J))
-      endif ; enddo
-    endif
-    !### What about terms from visc%Ray?
-
-    do k=nz,1,-1
-      domore = .false.
-      do i=is,ie ; if (do_i(i)) then
-        ! Determine if grid point is an OBC
-        has_obc = .false.
-        if (local_open_v_BC) then
-          l_seg = abs(OBC%segnum_v(i,J))
-          if (l_seg /= 0) has_obc = OBC%segment(l_seg)%open
+    do concurrent (jj=0:jje, ii=1:iie) DO_LOCALITY(local(i, j, k, do_col, vhtot, htot, hvel, obc_dir))
+      i = isb + ii - 1 ; J = jsb + jj - 1
+      do_col = .false. ; vstar(ii,jj) = 0.0 ; vhtot = 0.0 ; htot = 0.0
+      if (use_Kv_bbl_v) then
+        if ((G%mask2dCv(i,J) > 0.0) .and. (cdrag_sqrt*visc%bbl_thick_v(i,J) > 0.0)) then
+          do_col = .true.
+          vstar(ii,jj) = visc%Kv_bbl_v(i,J) / (cdrag_sqrt*visc%bbl_thick_v(i,J))
         endif
+      endif
+      !### What about terms from visc%Ray?
 
+      do k=nz,1,-1
+        if (.not.do_col) exit
         ! Compute h based on OBC state
-        if (has_obc) then
-          if (OBC%segnum_v(i,J) > 0) then ! OBC_DIRECTION_N
-            hvel = dz(i,j,k)
-          else
-            hvel = dz(i,j+1,k)
-          endif
+        obc_dir = 0 ; if (local_open_v_BC) obc_dir = OBC_dir_v(i,J)
+        if (obc_dir == 1) then ! OBC_DIRECTION_N
+          hvel = dz(i,j,k)
+        elseif (obc_dir == -1) then ! OBC_DIRECTION_S
+          hvel = dz(i,j+1,k)
         else
           hvel = 0.5*(dz(i,j,k) + dz(i,j+1,k))
         endif
 
-        if ((htot(i) + hvel) >= visc%bbl_thick_v(i,J)) then
-          vhtot(i) = vhtot(i) + (visc%bbl_thick_v(i,J) - htot(i))*v(i,J,k)
-          htot(i) = visc%bbl_thick_v(i,J)
-          do_i(i) = .false.
+        if ((htot + hvel) >= visc%bbl_thick_v(i,J)) then
+          vhtot = vhtot + (visc%bbl_thick_v(i,J) - htot)*v(i,J,k)
+          htot = visc%bbl_thick_v(i,J)
+          do_col = .false.
         else
-          vhtot(i) = vhtot(i) + hvel*v(i,J,k)
-          htot(i) = htot(i) + hvel
-          domore = .true.
+          vhtot = vhtot + hvel*v(i,J,k)
+          htot = htot + hvel
         endif
-      endif ; enddo
-      if (.not.domore) exit
+      enddo
+      if ((G%mask2dCv(i,J) > 0.0) .and. (htot > 0.0)) then
+        v2_bbl(ii,jj) = (vhtot*vhtot) / (htot*htot)
+      else
+        v2_bbl(ii,jj) = 0.0
+      endif
     enddo
-    do i=is,ie ; if ((G%mask2dCv(i,J) > 0.0) .and. (htot(i) > 0.0)) then
-      v2_bbl(i,J) = (vhtot(i)*vhtot(i)) / (htot(i)*htot(i))
-    else
-      v2_bbl(i,J) = 0.0
-    endif ; enddo
-  enddo
-  !$OMP do
-  do j=js,je
-    do I=is-1,ie
-      do_i(I) = .false. ; ustar(I) = 0.0 ; uhtot(I) = 0.0 ; htot(I) = 0.0
-    enddo
-    if (allocated(visc%bbl_thick_u)) then
-      do I=is-1,ie ; if ((G%mask2dCu(I,j) > 0.0) .and. (cdrag_sqrt*visc%bbl_thick_u(I,j) > 0.0))  then
-        do_i(I) = .true.
-        ustar(I) = visc%Kv_bbl_u(I,j) / (cdrag_sqrt*visc%bbl_thick_u(I,j))
-      endif ; enddo
-    endif
 
-    do k=nz,1,-1 ; domore = .false.
-      do I=is-1,ie ; if (do_i(I)) then
-        ! Determine if grid point is an OBC
-        has_obc = .false.
-        if (local_open_u_BC) then
-          l_seg = abs(OBC%segnum_u(I,j))
-          if (l_seg /= 0)  has_obc = OBC%segment(l_seg)%open
+    do concurrent (jj=1:jje, ii=0:iie) DO_LOCALITY(local(i, j, k, do_col, uhtot, htot, hvel, obc_dir))
+      I = isb + ii - 1 ; j = jsb + jj - 1
+      do_col = .false. ; ustar(ii,jj) = 0.0 ; uhtot = 0.0 ; htot = 0.0
+      if (use_bbl_thick_u) then
+        if ((G%mask2dCu(I,j) > 0.0) .and. (cdrag_sqrt*visc%bbl_thick_u(I,j) > 0.0))  then
+          do_col = .true.
+          ustar(ii,jj) = visc%Kv_bbl_u(I,j) / (cdrag_sqrt*visc%bbl_thick_u(I,j))
         endif
+      endif
 
+      do k=nz,1,-1
+        if (.not.do_col) exit
         ! Compute h based on OBC state
-        if (has_obc) then
-          if (OBC%segnum_u(I,j) > 0) then !  OBC_DIRECTION_E
-            hvel = dz(i,j,k)
-          else ! OBC_DIRECTION_W
-            hvel = dz(i+1,j,k)
-          endif
+        obc_dir = 0 ; if (local_open_u_BC) obc_dir = OBC_dir_u(I,j)
+        if (obc_dir == 1) then !  OBC_DIRECTION_E
+          hvel = dz(i,j,k)
+        elseif (obc_dir == -1) then ! OBC_DIRECTION_W
+          hvel = dz(i+1,j,k)
         else
           hvel = 0.5*(dz(i,j,k) + dz(i+1,j,k))
         endif
 
-        if ((htot(I) + hvel) >= visc%bbl_thick_u(I,j)) then
-          uhtot(I) = uhtot(I) + (visc%bbl_thick_u(I,j) - htot(I))*u(I,j,k)
-          htot(I) = visc%bbl_thick_u(I,j)
-          do_i(I) = .false.
+        if ((htot + hvel) >= visc%bbl_thick_u(I,j)) then
+          uhtot = uhtot + (visc%bbl_thick_u(I,j) - htot)*u(I,j,k)
+          htot = visc%bbl_thick_u(I,j)
+          do_col = .false.
         else
-          uhtot(I) = uhtot(I) + hvel*u(I,j,k)
-          htot(I) = htot(I) + hvel
-          domore = .true.
+          uhtot = uhtot + hvel*u(I,j,k)
+          htot = htot + hvel
         endif
-      endif ; enddo
-      if (.not.domore) exit
+      enddo
+      if ((G%mask2dCu(I,j) > 0.0) .and. (htot > 0.0)) then
+        u2_bbl(ii,jj) = (uhtot*uhtot) / (htot*htot)
+      else
+        u2_bbl(ii,jj) = 0.0
+      endif
     enddo
-    do I=is-1,ie ; if ((G%mask2dCu(I,j) > 0.0) .and. (htot(i) > 0.0)) then
-      u2_bbl(I) = (uhtot(I)*uhtot(I)) / (htot(I)*htot(I))
-    else
-      u2_bbl(I) = 0.0
-    endif ; enddo
 
-    do i=is,ie
+    do concurrent (jj=1:jje, ii=1:iie) DO_LOCALITY(local(i, j))
+      i = isb + ii - 1 ; j = jsb + jj - 1
       visc%ustar_BBL(i,j) = sqrt(0.5*G%IareaT(i,j) * &
-                (((G%areaCu(I-1,j)*(ustar(I-1)*ustar(I-1))) + &
-                  (G%areaCu(I,j)*(ustar(I)*ustar(I)))) + &
-                 ((G%areaCv(i,J-1)*(vstar(i,J-1)*vstar(i,J-1))) + &
-                  (G%areaCv(i,J)*(vstar(i,J)*vstar(i,J)))) ) )
+                (((G%areaCu(I-1,j)*(ustar(ii-1,jj)*ustar(ii-1,jj))) + &
+                  (G%areaCu(I,j)*(ustar(ii,jj)*ustar(ii,jj)))) + &
+                 ((G%areaCv(i,J-1)*(vstar(ii,jj-1)*vstar(ii,jj-1))) + &
+                  (G%areaCv(i,J)*(vstar(ii,jj)*vstar(ii,jj)))) ) )
       visc%BBL_meanKE_loss(i,j) = cdrag_sqrt * &
-                 ((((G%areaCu(I-1,j)*(ustar(I-1)*u2_bbl(I-1))) + &
-                    (G%areaCu(I,j) * (ustar(I)*u2_bbl(I)))) + &
-                   ((G%areaCv(i,J-1)*(vstar(i,J-1)*v2_bbl(i,J-1))) + &
-                    (G%areaCv(i,J) * (vstar(i,J)*v2_bbl(i,J)))) )*G%IareaT(i,j))
+                 ((((G%areaCu(I-1,j)*(ustar(ii-1,jj)*u2_bbl(ii-1,jj))) + &
+                    (G%areaCu(I,j) * (ustar(ii,jj)*u2_bbl(ii,jj)))) + &
+                   ((G%areaCv(i,J-1)*(vstar(ii,jj-1)*v2_bbl(ii,jj-1))) + &
+                    (G%areaCv(i,J) * (vstar(ii,jj)*v2_bbl(ii,jj)))) )*G%IareaT(i,j))
       ! The following line could be omitted if SET_DIFF_ANSWER_DATE > 20250301 and EPBL_BBL_EFFIC_BUG is false.
       visc%BBL_meanKE_loss_sqrtCd(i,j) = &
-                 ((((G%areaCu(I-1,j)*(ustar(I-1)*u2_bbl(I-1))) + &
-                    (G%areaCu(I,j) * (ustar(I)*u2_bbl(I)))) + &
-                   ((G%areaCv(i,J-1)*(vstar(i,J-1)*v2_bbl(i,J-1))) + &
-                    (G%areaCv(i,J) * (vstar(i,J)*v2_bbl(i,J)))) )*G%IareaT(i,j))
+                 ((((G%areaCu(I-1,j)*(ustar(ii-1,jj)*u2_bbl(ii-1,jj))) + &
+                    (G%areaCu(I,j) * (ustar(ii,jj)*u2_bbl(ii,jj)))) + &
+                   ((G%areaCv(i,J-1)*(vstar(ii,jj-1)*v2_bbl(ii,jj-1))) + &
+                    (G%areaCv(i,J) * (vstar(ii,jj)*v2_bbl(ii,jj)))) )*G%IareaT(i,j))
     enddo
-  enddo
-  !$OMP end parallel
+  enddo ; enddo
 
-  !$omp target update to(visc%ustar_BBL, visc%BBL_meanKE_loss, visc%BBL_meanKE_loss_sqrtCd)
+  !$omp target exit data map(delete: dz, OBC_dir_u, OBC_dir_v, ustar, u2_bbl, vstar, v2_bbl)
 
-end subroutine set_BBL_TKE
+end subroutine set_BBL_TKE_block
 
 subroutine set_density_ratios(h, tv, kb, G, GV, US, CS, isb, ieb, jsb, jeb, nii, njj, &
                               ds_dsp1, rho_0)

@@ -1014,6 +1014,8 @@ subroutine diabatic_ALE_legacy(u, v, h, tv, BLD, fluxes, visc, ADp, CDp, dt, Tim
 
     call find_uv_at_h(u, v, h, u_h, v_h, G, GV, US)
     !$omp target update from(u_h, v_h)
+    !$omp target update from(visc%ustar_BBL, visc%BBL_meanKE_loss, visc%BBL_meanKE_loss_sqrtCd) &
+    !$omp   if (allocated(visc%ustar_BBL))
     call energetic_PBL(h, u_h, v_h, tv, fluxes, visc, dt, Kd_ePBL, G, GV, US, &
                        CS%ePBL, stoch_CS, dSV_dT, dSV_dS, cTKE, SkinBuoyFlux, BBL_BuoyFlux, waves=waves)
 
@@ -1777,6 +1779,8 @@ subroutine diabatic_ALE(u, v, h, tv, BLD, fluxes, visc, ADp, CDp, dt, Time_end, 
     endif
 
     call find_uv_at_h(u, v, h, u_h, v_h, G, GV, US)
+    !$omp target update from(visc%ustar_BBL, visc%BBL_meanKE_loss, visc%BBL_meanKE_loss_sqrtCd) &
+    !$omp   if (allocated(visc%ustar_BBL))
     call energetic_PBL(h, u_h, v_h, tv, fluxes, visc, dt, Kd_ePBL, G, GV, US, &
                        CS%ePBL, stoch_CS, dSV_dT, dSV_dS, cTKE, SkinBuoyFlux, BBL_BuoyFlux, waves=waves)
 
