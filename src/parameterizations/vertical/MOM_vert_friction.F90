@@ -592,15 +592,6 @@ subroutine vertvisc(u, v, h, forces, visc, dt, OBC, ADp, CDp, G, GV, US, CS, &
 
   ! Local variables
 
-  real :: b1
-    ! A variable used by the tridiagonal solver [H-1 ~> m-1 or m2 kg-1].
-  real :: c1(SZK_(GV))
-    ! A variable used by the tridiagonal solver [nondim].
-  real :: d1
-    ! d1=1-c1 is used by the tridiagonal solver [nondim].
-  real :: b_denom_1
-    ! The first term in the denominator of b1 [H ~> m or kg m-2].
-
   real :: Hmix             ! The mixed layer thickness over which stress
                            ! is applied with direct_stress [H ~> m or kg m-2].
   real :: I_Hmix           ! The inverse of Hmix [H-1 ~> m-1 or m2 kg-1].
@@ -641,6 +632,7 @@ subroutine vertvisc(u, v, h, forces, visc, dt, OBC, ADp, CDp, G, GV, US, CS, &
     allocate(KE_u(G%IsdB:G%IedB,G%jsd:G%jed,GV%ke), source=0.0)
     allocate(KE_v(G%isd:G%ied,G%JsdB:G%JedB,GV%ke), source=0.0)
     allocate(KE_term(G%isd:G%ied,G%jsd:G%jed,GV%ke), source=0.0)
+    !$omp target enter data map(to: KE_u, KE_v)
     if (.not.G%symmetric) &
       call create_group_pass(CS%pass_KE_uv, KE_u, KE_v, G%Domain, To_North+To_East)
   endif
@@ -687,6 +679,7 @@ subroutine vertvisc(u, v, h, forces, visc, dt, OBC, ADp, CDp, G, GV, US, CS, &
   !$omp target enter data map(alloc: surface_stress)
   !$omp target enter data map(alloc: ADp%dv_dt_str)
   !$omp target enter data map(alloc: ADp%du_dt_str)
+  !$omp target enter data map(to: ADp%du_dt_visc, ADp%du_dt_visc_gl90, ADp%dv_dt_visc, ADp%dv_dt_visc_gl90)
 
   ! The velocities are updated on the device, so they must be copied there rather than from the host.
   if (associated(ADp%du_dt_visc)) then
@@ -762,52 +755,10 @@ subroutine vertvisc(u, v, h, forces, visc, dt, OBC, ADp, CDp, G, GV, US, CS, &
 
   ! compute vertical velocity tendency that arises from GL90 viscosity;
   ! follow tridiagonal solve method as above; to avoid corrupting u,
-  ! use ADp%du_dt_visc_gl90 as a placeholder for updated u (due to GL90) until last do loop
+  ! use ADp%du_dt_visc_gl90 as a placeholder for updated u (due to GL90) until the last step
   if ((CS%id_du_dt_visc_gl90 > 0) .or. (CS%id_GLwork > 0)) then
     if (associated(ADp%du_dt_visc_gl90)) then
-      do j=G%jsc,G%jec ; do I=Isq,Ieq ; if (G%mask2dCu(I,j) > 0.) then
-        b_denom_1 = CS%h_u(I,j,1)  ! CS%a_u_gl90(I,j,1) is zero
-        b1 = 1.0 / (b_denom_1 + dt * CS%a_u_gl90(I,j,2))
-        d1 = b_denom_1 * b1
-
-        ADp%du_dt_visc_gl90(I,j,1) = b1 * (CS%h_u(I,j,1) * ADp%du_dt_visc_gl90(I,j,1))
-
-        do k=2,nz
-          c1(k) = dt * CS%a_u_gl90(I,j,K) * b1
-          b_denom_1 = CS%h_u(I,j,k) + dt * (CS%a_u_gl90(I,j,K)*d1)
-          b1 = 1.0 / (b_denom_1 + dt * CS%a_u_gl90(I,j,K+1))
-          d1 = b_denom_1 * b1
-
-          ADp%du_dt_visc_gl90(I,j,k) = (CS%h_u(I,j,k) * ADp%du_dt_visc_gl90(I,j,k) &
-              + dt * CS%a_u_gl90(I,j,K) * ADp%du_dt_visc_gl90(I,j,k-1)) * b1
-        enddo
-
-        ! back substitute to solve for new velocities, held by ADp%du_dt_visc_gl90
-        do k=nz-1,1,-1
-          ADp%du_dt_visc_gl90(I,j,k) = &
-              ADp%du_dt_visc_gl90(I,j,k) + c1(k+1) * ADp%du_dt_visc_gl90(I,j,k+1)
-        enddo
-
-        do k=1,nz
-          ! now fill ADp%du_dt_visc_gl90(I,j,k) with actual velocity tendency due to GL90;
-          ! note that on RHS: ADp%du_dt_visc(I,j,k) holds the original velocity value u(I,j,k)
-          ! and ADp%du_dt_visc_gl90(I,j,k) the updated velocity due to GL90
-          ADp%du_dt_visc_gl90(I,j,k) = &
-              (ADp%du_dt_visc_gl90(I,j,k) - ADp%du_dt_visc(I,j,k)) * Idt
-
-          if (abs(ADp%du_dt_visc_gl90(I,j,k)) < accel_underflow) then
-            ADp%du_dt_visc_gl90(I,j,k) = 0.0
-          endif
-        enddo
-
-        ! to compute energetics, we need to multiply by u*h, where u is original velocity before
-        ! velocity update; note that ADp%du_dt_visc(I,j,k) holds the original velocity value u(I,j,k)
-        if (CS%id_GLwork > 0) then
-          do k=1,nz
-            KE_u(I,j,k) = ADp%du_dt_visc(I,j,k) * CS%h_u(I,j,k) * G%areaCu(I,j) * ADp%du_dt_visc_gl90(I,j,k)
-          enddo
-        endif
-      endif ; enddo ; enddo
+      call vertvisc_gl90_u(ADp, KE_u, dt, Idt, accel_underflow, (CS%id_GLwork > 0), G, GV, CS, nIIB, njj)
     endif
   endif
 
@@ -915,52 +866,10 @@ subroutine vertvisc(u, v, h, forces, visc, dt, OBC, ADp, CDp, G, GV, US, CS, &
 
   ! compute vertical velocity tendency that arises from GL90 viscosity;
   ! follow tridiagonal solve method as above; to avoid corrupting v,
-  ! use ADp%dv_dt_visc_gl90 as a placeholder for updated v (due to GL90) until last do loop
+  ! use ADp%dv_dt_visc_gl90 as a placeholder for updated v (due to GL90) until the last step
   if ((CS%id_dv_dt_visc_gl90 > 0) .or. (CS%id_GLwork > 0)) then
     if (associated(ADp%dv_dt_visc_gl90)) then
-      do J=Jsq,Jeq ; do i=is,ie ; if (G%mask2dCv(i,J) > 0.) then
-        b_denom_1 = CS%h_v(i,J,1)  ! CS%a_v_gl90(i,J,1) is zero
-        b1 = 1.0 / (b_denom_1 + dt*CS%a_v_gl90(i,J,2))
-        d1 = b_denom_1 * b1
-        ADp%dv_dt_visc_gl90(I,J,1) = b1 * (CS%h_v(i,J,1) * ADp%dv_dt_visc_gl90(i,J,1))
-
-        do k=2,nz
-          c1(k) = dt * CS%a_v_gl90(i,J,K) * b1
-          b_denom_1 = CS%h_v(i,J,k) + dt * (CS%a_v_gl90(i,J,K) * d1)
-          b1 = 1.0 / (b_denom_1 + dt * CS%a_v_gl90(i,J,K+1))
-          d1 = b_denom_1 * b1
-          ADp%dv_dt_visc_gl90(i,J,k) = (CS%h_v(i,J,k) * ADp%dv_dt_visc_gl90(i,J,k) &
-              + dt * CS%a_v_gl90(i,J,K) * ADp%dv_dt_visc_gl90(i,J,k-1)) * b1
-        enddo
-
-        ! back substitute to solve for new velocities, held by ADp%dv_dt_visc_gl90
-        do k=nz-1,1,-1
-          ADp%dv_dt_visc_gl90(i,J,k) = ADp%dv_dt_visc_gl90(i,J,k) + c1(k+1) * ADp%dv_dt_visc_gl90(i,J,k+1)
-        enddo
-      endif ; enddo ; enddo
-
-      do k=1,nz
-        do J=Jsq,Jeq ; do i=is,ie ; if (G%mask2dCv(i,J) > 0.) then
-          ! now fill ADp%dv_dt_visc_gl90(i,J,k) with actual velocity tendency due to GL90;
-          ! note that on RHS: ADp%dv_dt_visc(i,J,k) holds the original velocity value v(i,J,k)
-          ! and ADp%dv_dt_visc_gl90(i,J,k) the updated velocity due to GL90
-          ADp%dv_dt_visc_gl90(i,J,k) = (ADp%dv_dt_visc_gl90(i,J,k) - ADp%dv_dt_visc(i,J,k)) * Idt
-
-          if (abs(ADp%dv_dt_visc_gl90(i,J,k)) < accel_underflow) &
-            ADp%dv_dt_visc_gl90(i,J,k) = 0.0
-        endif ; enddo ; enddo
-      enddo
-
-      ! to compute energetics, we need to multiply by v*h, where u is original velocity before
-      ! velocity update; note that ADp%dv_dt_visc(I,j,k) holds the original velocity value v(i,J,k)
-      if (CS%id_GLwork > 0) then
-        do k=1,nz
-          do J=Jsq,Jeq ; do i=is,ie ; if (G%mask2dCv(i,J) > 0.) then
-            ! note that on RHS: ADp%dv_dt_visc(I,j,k) holds the original velocity value v(I,j,k)
-            KE_v(I,j,k) = ADp%dv_dt_visc(i,J,k) * CS%h_v(i,J,k) * G%areaCv(i,J) * ADp%dv_dt_visc_gl90(i,J,k)
-          endif ; enddo ; enddo
-        enddo
-      endif
+      call vertvisc_gl90_v(ADp, KE_v, dt, Idt, accel_underflow, (CS%id_GLwork > 0), G, GV, CS, nii, nJJB)
     endif
   endif
 
@@ -1011,6 +920,7 @@ subroutine vertvisc(u, v, h, forces, visc, dt, OBC, ADp, CDp, G, GV, US, CS, &
   ! and thicknesses used in the vertical solver, but rather uses a time-mean
   ! barotropic transport [uv]h.
   if (CS%id_GLwork > 0) then
+    !$omp target exit data map(from: KE_u, KE_v)
     if (.not.G%symmetric) &
       call do_group_pass(CS%pass_KE_uv, G%domain)
     do k=1,nz
@@ -1024,7 +934,8 @@ subroutine vertvisc(u, v, h, forces, visc, dt, OBC, ADp, CDp, G, GV, US, CS, &
 
   call vertvisc_limit_vel(u, v, h, ADp, CDp, forces, visc, dt, G, GV, US, CS)
 
-  !$omp target exit data map(from: ADp%du_dt_str, ADp%dv_dt_str)
+  !$omp target exit data map(from: ADp%du_dt_str, ADp%dv_dt_str, ADp%du_dt_visc, ADp%du_dt_visc_gl90, &
+  !$omp                            ADp%dv_dt_visc, ADp%dv_dt_visc_gl90)
   !$omp target exit data map(delete: ADp)
   !$omp target exit data map(delete: surface_stress)
 
@@ -1499,6 +1410,272 @@ subroutine vertvisc_solve_u(u, surface_stress, visc, ADp, dt, Idt, accel_underfl
 
   !$omp target exit data map(release: c1, b1, d1, do_ij)
 end subroutine vertvisc_solve_u
+
+!> Find the acceleration at meridional velocity points that arises from the GL90 vertical viscosity, by
+!! solving the same tridiagonal system as vertvisc_solve_v but with only the GL90 coupling coefficients.
+!! On input ADp%dv_dt_visc_gl90 holds the meridional velocity before viscosity is applied, and ADp%dv_dt_visc
+!! holds the same velocity.  ADp%dv_dt_visc_gl90 is used as a placeholder for the velocity updated by GL90
+!! until the final step, so that v itself is not corrupted.  On output ADp%dv_dt_visc_gl90 holds the
+!! acceleration due to GL90 and, if do_KE is true, KE_v holds the area-integrated kinetic energy source.
+!! The columns are processed in blocks of nii by nJJB points.
+subroutine vertvisc_gl90_v(ADp, KE_v, dt, Idt, accel_underflow, do_KE, G, GV, CS, nii, nJJB)
+  type(ocean_grid_type),   intent(in)    :: G      !< Ocean grid structure
+  type(verticalGrid_type), intent(in)    :: GV     !< Ocean vertical grid structure
+  type(accel_diag_ptrs),   intent(in)    :: ADp    !< Accelerations in the momentum equations for diagnostics
+  real, allocatable, dimension(:,:,:), &
+                           intent(inout) :: KE_v   !< The area integral of a kinetic energy term in a layer at
+                                                   !! v-points [H L4 T-3 ~> m5 s-3 or kg m2 s-3], if allocated
+  real,                    intent(in)    :: dt     !< Time increment [T ~> s]
+  real,                    intent(in)    :: Idt    !< The inverse of the time step [T-1 ~> s-1]
+  real,                    intent(in)    :: accel_underflow !< An acceleration magnitude that is so small that
+                                                   !! values that are less than this are diagnosed as 0
+                                                   !! [L T-2 ~> m s-2]
+  logical,                 intent(in)    :: do_KE  !< If true, calculate the kinetic energy source in KE_v
+  type(vertvisc_CS),       intent(in)    :: CS     !< Vertical viscosity control structure
+  integer,                 intent(in)    :: nii    !< i block size for array calculations
+  integer,                 intent(in)    :: nJJB   !< J block size for array calculations
+
+  ! Local variables
+
+  ! The block-sized work arrays below are dimensioned (nii,nJJB[,nz]).  Their first (nii) block
+  ! index is at the tracer-column (i) points, while the second (nJJB) block index is at the
+  ! meridional velocity (v, C-grid J) points.
+  real, dimension(nii,nJJB,SZK_(GV)) :: &
+    c1          ! A variable used by the tridiagonal solver [nondim].
+  real, dimension(nii,nJJB) :: &
+    b1, &       ! A variable used by the tridiagonal solver [H-1 ~> m-1 or m2 kg-1].
+    d1, &       ! d1=1-c1 is used by the tridiagonal solver [nondim].
+    u_below     ! The velocity updated by GL90 in the layer below the one being solved for [L T-1 ~> m s-1].
+  logical, dimension(nii,nJJB) :: &
+    do_ij       ! True at the block points that are being worked on.
+  real :: b_denom_1 ! The first term in the denominator of b1 [H ~> m or kg m-2].
+  integer :: i, j, k, is, ie, Jsq, Jeq, nz
+  integer :: isb, ieb, JsbB, JebB, ii, JJ, iie, JJe
+
+  is = G%isc ; ie = G%iec ; Jsq = G%JscB ; Jeq = G%JecB ; nz = GV%ke
+
+  !$omp target enter data map(alloc: c1, b1, d1, u_below, do_ij)
+
+  do JsbB=Jsq,Jeq,nJJB ; do isb=is,ie,nii
+    ieb = min(isb + nii - 1, ie)
+    JebB = min(JsbB + nJJB - 1, Jeq)
+    iie = ieb - isb + 1
+    JJe = JebB - JsbB + 1
+
+    ! Start the forward elimination with the topmost layer.
+    do concurrent (JJ=1:JJe, ii=1:iie) DO_LOCALITY(local(i,J,b_denom_1))
+      i = isb + ii - 1
+      J = JsbB + JJ - 1
+
+      do_ij(ii,JJ) = (G%mask2dCv(i,J) > 0.)
+
+      if (do_ij(ii,JJ)) then
+        b_denom_1 = CS%h_v(i,J,1)  ! CS%a_v_gl90(i,J,1) is zero
+        b1(ii,JJ) = 1.0 / (b_denom_1 + dt*CS%a_v_gl90(i,J,2))
+        d1(ii,JJ) = b_denom_1 * b1(ii,JJ)
+
+        ADp%dv_dt_visc_gl90(i,J,1) = b1(ii,JJ) * (CS%h_v(i,J,1) * ADp%dv_dt_visc_gl90(i,J,1))
+      endif
+    enddo
+
+    ! Forward elimination through the rest of the column.
+    do concurrent (JJ=1:JJe)
+      do k=2,nz
+        do concurrent (ii=1:iie, do_ij(ii,JJ)) DO_LOCALITY(local(i,J,b_denom_1))
+          i = isb + ii - 1
+          J = JsbB + JJ - 1
+
+          c1(ii,JJ,k) = dt * CS%a_v_gl90(i,J,K) * b1(ii,JJ)
+          b_denom_1 = CS%h_v(i,J,k) + dt * (CS%a_v_gl90(i,J,K) * d1(ii,JJ))
+          b1(ii,JJ) = 1.0 / (b_denom_1 + dt * CS%a_v_gl90(i,J,K+1))
+          d1(ii,JJ) = b_denom_1 * b1(ii,JJ)
+          ADp%dv_dt_visc_gl90(i,J,k) = (CS%h_v(i,J,k) * ADp%dv_dt_visc_gl90(i,J,k) &
+              + dt * CS%a_v_gl90(i,J,K) * ADp%dv_dt_visc_gl90(i,J,k-1)) * b1(ii,JJ)
+        enddo
+      enddo
+    enddo
+
+    ! Back substitute to solve for the new velocities, held by ADp%dv_dt_visc_gl90.  The updated
+    ! velocity of the layer below is carried in u_below, because the compiler does not reliably see the
+    ! update of the layer below when it is read back from ADp%dv_dt_visc_gl90.
+    do concurrent (JJ=1:JJe)
+      do concurrent (ii=1:iie, do_ij(ii,JJ)) DO_LOCALITY(local(i,J))
+        i = isb + ii - 1
+        J = JsbB + JJ - 1
+
+        u_below(ii,JJ) = ADp%dv_dt_visc_gl90(i,J,nz)
+      enddo
+
+      do k=nz-1,1,-1
+        do concurrent (ii=1:iie, do_ij(ii,JJ)) DO_LOCALITY(local(i,J))
+          i = isb + ii - 1
+          J = JsbB + JJ - 1
+
+          u_below(ii,JJ) = ADp%dv_dt_visc_gl90(i,J,k) + c1(ii,JJ,k+1) * u_below(ii,JJ)
+          ADp%dv_dt_visc_gl90(i,J,k) = u_below(ii,JJ)
+        enddo
+      enddo
+    enddo
+
+    ! Fill ADp%dv_dt_visc_gl90 with the actual velocity tendency due to GL90.  Note that on the right hand
+    ! side ADp%dv_dt_visc holds the original velocity value v and ADp%dv_dt_visc_gl90 holds the velocity
+    ! updated by GL90.
+    do concurrent (k=1:nz, JJ=1:JJe, ii=1:iie, do_ij(ii,JJ)) DO_LOCALITY(local(i,J))
+      i = isb + ii - 1
+      J = JsbB + JJ - 1
+
+      ADp%dv_dt_visc_gl90(i,J,k) = (ADp%dv_dt_visc_gl90(i,J,k) - ADp%dv_dt_visc(i,J,k)) * Idt
+
+      if (abs(ADp%dv_dt_visc_gl90(i,J,k)) < accel_underflow) ADp%dv_dt_visc_gl90(i,J,k) = 0.0
+    enddo
+
+    ! To compute energetics, we need to multiply by v*h, where v is the original velocity before the
+    ! velocity update, which is held in ADp%dv_dt_visc.
+    if (do_KE) then
+      do concurrent (k=1:nz, JJ=1:JJe, ii=1:iie, do_ij(ii,JJ)) DO_LOCALITY(local(i,J))
+        i = isb + ii - 1
+        J = JsbB + JJ - 1
+
+        KE_v(i,J,k) = ADp%dv_dt_visc(i,J,k) * CS%h_v(i,J,k) * G%areaCv(i,J) * ADp%dv_dt_visc_gl90(i,J,k)
+      enddo
+    endif
+  enddo ; enddo
+
+  !$omp target exit data map(release: c1, b1, d1, u_below, do_ij)
+end subroutine vertvisc_gl90_v
+
+!> Find the acceleration at zonal velocity points that arises from the GL90 vertical viscosity, by
+!! solving the same tridiagonal system as vertvisc_solve_u but with only the GL90 coupling coefficients.
+!! On input ADp%du_dt_visc_gl90 holds the zonal velocity before viscosity is applied, and ADp%du_dt_visc
+!! holds the same velocity.  ADp%du_dt_visc_gl90 is used as a placeholder for the velocity updated by GL90
+!! until the final step, so that u itself is not corrupted.  On output ADp%du_dt_visc_gl90 holds the
+!! acceleration due to GL90 and, if do_KE is true, KE_u holds the area-integrated kinetic energy source.
+!! The columns are processed in blocks of nIIB by njj points.
+subroutine vertvisc_gl90_u(ADp, KE_u, dt, Idt, accel_underflow, do_KE, G, GV, CS, nIIB, njj)
+  type(ocean_grid_type),   intent(in)    :: G      !< Ocean grid structure
+  type(verticalGrid_type), intent(in)    :: GV     !< Ocean vertical grid structure
+  type(accel_diag_ptrs),   intent(in)    :: ADp    !< Accelerations in the momentum equations for diagnostics
+  real, allocatable, dimension(:,:,:), &
+                           intent(inout) :: KE_u   !< The area integral of a kinetic energy term in a layer at
+                                                   !! u-points [H L4 T-3 ~> m5 s-3 or kg m2 s-3], if allocated
+  real,                    intent(in)    :: dt     !< Time increment [T ~> s]
+  real,                    intent(in)    :: Idt    !< The inverse of the time step [T-1 ~> s-1]
+  real,                    intent(in)    :: accel_underflow !< An acceleration magnitude that is so small that
+                                                   !! values that are less than this are diagnosed as 0
+                                                   !! [L T-2 ~> m s-2]
+  logical,                 intent(in)    :: do_KE  !< If true, calculate the kinetic energy source in KE_u
+  type(vertvisc_CS),       intent(in)    :: CS     !< Vertical viscosity control structure
+  integer,                 intent(in)    :: nIIB   !< I block size for array calculations
+  integer,                 intent(in)    :: njj    !< j block size for array calculations
+
+  ! Local variables
+
+  ! The block-sized work arrays below are dimensioned (nIIB,njj[,nz]).  Their first (nIIB) block
+  ! index is at the zonal velocity (u, C-grid I) points, while the second (njj) block index is
+  ! at the tracer-row (j) points.
+  real, dimension(nIIB,njj,SZK_(GV)) :: &
+    c1          ! A variable used by the tridiagonal solver [nondim].
+  real, dimension(nIIB,njj) :: &
+    b1, &       ! A variable used by the tridiagonal solver [H-1 ~> m-1 or m2 kg-1].
+    d1, &       ! d1=1-c1 is used by the tridiagonal solver [nondim].
+    u_below     ! The velocity updated by GL90 in the layer below the one being solved for [L T-1 ~> m s-1].
+  logical, dimension(nIIB,njj) :: &
+    do_ij       ! True at the block points that are being worked on.
+  real :: b_denom_1 ! The first term in the denominator of b1 [H ~> m or kg m-2].
+  integer :: i, j, k, js, je, Isq, Ieq, nz
+  integer :: IsbB, IebB, jsb, jeb, II, jj, IIe, jje
+
+  js = G%jsc ; je = G%jec ; Isq = G%IscB ; Ieq = G%IecB ; nz = GV%ke
+
+  !$omp target enter data map(alloc: c1, b1, d1, u_below, do_ij)
+
+  do jsb=js,je,njj ; do IsbB=Isq,Ieq,nIIB
+    IebB = min(IsbB + nIIB - 1, Ieq)
+    jeb = min(jsb + njj - 1, je)
+    IIe = IebB - IsbB + 1
+    jje = jeb - jsb + 1
+
+    ! Start the forward elimination with the topmost layer.
+    do concurrent (jj=1:jje, II=1:IIe) DO_LOCALITY(local(I,j,b_denom_1))
+      I = IsbB + II - 1
+      j = jsb + jj - 1
+
+      do_ij(II,jj) = (G%mask2dCu(I,j) > 0.)
+
+      if (do_ij(II,jj)) then
+        b_denom_1 = CS%h_u(I,j,1)  ! CS%a_u_gl90(I,j,1) is zero
+        b1(II,jj) = 1.0 / (b_denom_1 + dt*CS%a_u_gl90(I,j,2))
+        d1(II,jj) = b_denom_1 * b1(II,jj)
+
+        ADp%du_dt_visc_gl90(I,j,1) = b1(II,jj) * (CS%h_u(I,j,1) * ADp%du_dt_visc_gl90(I,j,1))
+      endif
+    enddo
+
+    ! Forward elimination through the rest of the column.
+    do concurrent (jj=1:jje)
+      do k=2,nz
+        do concurrent (II=1:IIe, do_ij(II,jj)) DO_LOCALITY(local(I,j,b_denom_1))
+          I = IsbB + II - 1
+          j = jsb + jj - 1
+
+          c1(II,jj,k) = dt * CS%a_u_gl90(I,j,K) * b1(II,jj)
+          b_denom_1 = CS%h_u(I,j,k) + dt * (CS%a_u_gl90(I,j,K) * d1(II,jj))
+          b1(II,jj) = 1.0 / (b_denom_1 + dt * CS%a_u_gl90(I,j,K+1))
+          d1(II,jj) = b_denom_1 * b1(II,jj)
+          ADp%du_dt_visc_gl90(I,j,k) = (CS%h_u(I,j,k) * ADp%du_dt_visc_gl90(I,j,k) &
+              + dt * CS%a_u_gl90(I,j,K) * ADp%du_dt_visc_gl90(I,j,k-1)) * b1(II,jj)
+        enddo
+      enddo
+    enddo
+
+    ! Back substitute to solve for the new velocities, held by ADp%du_dt_visc_gl90.  The updated
+    ! velocity of the layer below is carried in u_below, because the compiler does not reliably see the
+    ! update of the layer below when it is read back from ADp%du_dt_visc_gl90.
+    do concurrent (jj=1:jje)
+      do concurrent (II=1:IIe, do_ij(II,jj)) DO_LOCALITY(local(I,j))
+        I = IsbB + II - 1
+        j = jsb + jj - 1
+
+        u_below(II,jj) = ADp%du_dt_visc_gl90(I,j,nz)
+      enddo
+
+      do k=nz-1,1,-1
+        do concurrent (II=1:IIe, do_ij(II,jj)) DO_LOCALITY(local(I,j))
+          I = IsbB + II - 1
+          j = jsb + jj - 1
+
+          u_below(II,jj) = ADp%du_dt_visc_gl90(I,j,k) + c1(II,jj,k+1) * u_below(II,jj)
+          ADp%du_dt_visc_gl90(I,j,k) = u_below(II,jj)
+        enddo
+      enddo
+    enddo
+
+    ! Fill ADp%du_dt_visc_gl90 with the actual velocity tendency due to GL90.  Note that on the right hand
+    ! side ADp%du_dt_visc holds the original velocity value u and ADp%du_dt_visc_gl90 holds the velocity
+    ! updated by GL90.
+    do concurrent (k=1:nz, jj=1:jje, II=1:IIe, do_ij(II,jj)) DO_LOCALITY(local(I,j))
+      I = IsbB + II - 1
+      j = jsb + jj - 1
+
+      ADp%du_dt_visc_gl90(I,j,k) = (ADp%du_dt_visc_gl90(I,j,k) - ADp%du_dt_visc(I,j,k)) * Idt
+
+      if (abs(ADp%du_dt_visc_gl90(I,j,k)) < accel_underflow) ADp%du_dt_visc_gl90(I,j,k) = 0.0
+    enddo
+
+    ! To compute energetics, we need to multiply by u*h, where u is the original velocity before the
+    ! velocity update, which is held in ADp%du_dt_visc.
+    if (do_KE) then
+      do concurrent (k=1:nz, jj=1:jje, II=1:IIe, do_ij(II,jj)) DO_LOCALITY(local(I,j))
+        I = IsbB + II - 1
+        j = jsb + jj - 1
+
+        KE_u(I,j,k) = ADp%du_dt_visc(I,j,k) * CS%h_u(I,j,k) * G%areaCu(I,j) * ADp%du_dt_visc_gl90(I,j,k)
+      enddo
+    endif
+  enddo ; enddo
+
+  !$omp target exit data map(release: c1, b1, d1, u_below, do_ij)
+end subroutine vertvisc_gl90_u
 
 
 !> Calculate the coupling coefficients (CS%a_u, CS%a_v, CS%a_u_gl90, CS%a_v_gl90)
