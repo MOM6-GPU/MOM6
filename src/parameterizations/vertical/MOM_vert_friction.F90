@@ -1034,87 +1034,24 @@ subroutine vertvisc_remnant(visc, visc_rem_u, visc_rem_v, dt, G, GV, US, CS)
 
   ! Local variables
 
-  real :: b1
-    ! A variable used by the tridiagonal solver [H-1 ~> m-1 or m2 kg-1].
-  real :: c1(SZK_(GV))
-    ! A variable used by the tridiagonal solver [nondim].
-  real :: d1
-    ! d1=1-c1 is used by the tridiagonal solver [nondim].
-  real :: Ray
-    ! Ray is the Rayleigh-drag velocity [H T-1 ~> m s-1 or Pa s m-1]
-  real :: b_denom_1
-    ! The first term in the denominator of b1 [H ~> m or kg m-2].
-
-  integer :: i, j, k, is, ie, Isq, Ieq, Jsq, Jeq, nz
-  is = G%isc ; ie = G%iec
-  Isq = G%IscB ; Ieq = G%IecB ; Jsq = G%JscB ; Jeq = G%JecB ; nz = GV%ke
+  integer :: nIIB, njj ! The resolved I and j block sizes used by the zonal tridiagonal solve [nondim]
+  integer :: nii, nJJB ! The resolved i and J block sizes used by the meridional tridiagonal solve [nondim]
+  integer :: is, ie, js, je, Isq, Ieq, Jsq, Jeq
+  is = G%isc ; ie = G%iec ; js = G%jsc ; je = G%jec
+  Isq = G%IscB ; Ieq = G%IecB ; Jsq = G%JscB ; Jeq = G%JecB
 
   if (.not.CS%initialized) call MOM_error(FATAL,"MOM_vert_friction(remnant): "// &
          "Module must be initialized before it is used.")
 
   ! Find the zonal viscous remnant using a modification of a standard tridagonal solver.
-
-  !$omp target teams loop collapse(2) &
-  !$omp   private(b1, c1, d1, Ray, b_denom_1)
-  do j=G%jsc,G%jec ; do I=Isq,Ieq ; if (G%mask2dCu(I,j) > 0.) then
-    Ray = 0.
-    if (allocated(visc%Ray_u)) Ray = visc%Ray_u(I,j,1)
-
-    b_denom_1 = CS%h_u(I,j,1) + dt * (Ray + CS%a_u(I,j,1))
-    b1 = 1.0 / (b_denom_1 + dt * CS%a_u(I,j,2))
-    d1 = b_denom_1 * b1
-    visc_rem_u(I,j,1) = b1 * CS%h_u(I,j,1)
-
-    do k=2,nz
-      if (allocated(visc%Ray_u)) Ray = visc%Ray_u(I,j,k)
-
-      c1(k) = dt * CS%a_u(I,j,K) * b1
-      b_denom_1 = CS%h_u(I,j,k) + dt * (Ray + CS%a_u(I,j,K) * d1)
-      b1 = 1.0 / (b_denom_1 + dt * CS%a_u(I,j,K+1))
-      d1 = b_denom_1 * b1
-      visc_rem_u(I,j,k) = (CS%h_u(I,j,k) + dt * CS%a_u(I,j,K) * visc_rem_u(I,j,k-1)) * b1
-
-      !### Force FMA evaluation of b1 by blocking lookahead with an impossible branch.
-      ! XXX: Check GPU behavior
-      if (dt < 0) exit
-    enddo
-
-    do k=nz-1,1,-1
-      visc_rem_u(I,j,k) = visc_rem_u(I,j,k) + c1(k+1) * visc_rem_u(I,j,k+1)
-    enddo
-  endif ; enddo ; enddo
+  nIIB = CS%niblock ; if (nIIB == 0) nIIB = Ieq - Isq + 1
+  njj = CS%njblock ; if (njj == 0) njj = je - js + 1
+  call vertvisc_remnant_u(visc_rem_u, visc, dt, G, GV, CS, nIIB, njj)
 
   ! Now find the meridional viscous remnant using the robust tridiagonal solver.
-
-  !$omp target teams loop collapse(2) &
-  !$omp   private(b1, c1, d1, Ray, b_denom_1)
-  do J=Jsq,Jeq ; do i=is,ie ; if (G%mask2dCv(i,J) > 0.) then
-    Ray = 0.
-    if (allocated(visc%Ray_v)) Ray = visc%Ray_v(i,J,1)
-
-    b_denom_1 = CS%h_v(i,J,1) + dt * (Ray + CS%a_v(i,J,1))
-    b1 = 1.0 / (b_denom_1 + dt*CS%a_v(i,J,2))
-    d1 = b_denom_1 * b1
-    visc_rem_v(i,J,1) = b1 * CS%h_v(i,J,1)
-
-    do k=2,nz
-      if (allocated(visc%Ray_v)) Ray = visc%Ray_v(i,J,k)
-
-      c1(k) = dt * CS%a_v(i,J,K) * b1
-      b_denom_1 = CS%h_v(i,J,k) + dt * (Ray + CS%a_v(i,J,K) * d1)
-      b1 = 1.0 / (b_denom_1 + dt * CS%a_v(i,J,K+1))
-      d1 = b_denom_1 * b1
-      visc_rem_v(i,J,k) = (CS%h_v(i,J,k) + dt * CS%a_v(i,J,K) * visc_rem_v(i,J,k-1)) * b1
-
-      !### Force FMA evaluation of b1 by blocking lookahead with an impossible branch.
-      ! XXX: Check GPU behavior
-      if (dt < 0) exit
-    enddo
-
-    do k=nz-1,1,-1
-      visc_rem_v(i,J,k) = visc_rem_v(i,J,k) + c1(k+1) * visc_rem_v(i,J,k+1)
-    enddo
-  endif ; enddo ; enddo
+  nii = CS%niblock ; if (nii == 0) nii = ie - is + 1
+  nJJB = CS%njblock ; if (nJJB == 0) nJJB = Jeq - Jsq + 1
+  call vertvisc_remnant_v(visc_rem_v, visc, dt, G, GV, CS, nii, nJJB)
 
   if (CS%debug) then
     !$omp target update from(visc_rem_u, visc_rem_v)
@@ -1676,6 +1613,206 @@ subroutine vertvisc_gl90_u(ADp, KE_u, dt, Idt, accel_underflow, do_KE, G, GV, CS
 
   !$omp target exit data map(release: c1, b1, d1, u_below, do_ij)
 end subroutine vertvisc_gl90_u
+
+!> Find the viscous remnant at meridional velocity points, which is the fraction of a time-step's worth of
+!! a barotropic acceleration that a layer experiences after viscosity is applied, using the same robust
+!! tridiagonal solver as vertvisc_solve_v.  The columns are processed in blocks of nii by nJJB points, with
+!! the vertical recurrence carried out in serial and all of the columns of a block solved concurrently.
+subroutine vertvisc_remnant_v(visc_rem_v, visc, dt, G, GV, CS, nii, nJJB)
+  type(ocean_grid_type),   intent(in)    :: G      !< Ocean grid structure
+  type(verticalGrid_type), intent(in)    :: GV     !< Ocean vertical grid structure
+  real, dimension(SZI_(G),SZJB_(G),SZK_(GV)), &
+                           intent(inout) :: visc_rem_v !< Fraction of a time-step's worth of a barotropic
+                                                   !! acceleration that a layer experiences after viscosity
+                                                   !! is applied in the meridional direction [nondim]
+  type(vertvisc_type),     intent(in)    :: visc   !< Viscosities and bottom drag
+  real,                    intent(in)    :: dt     !< Time increment [T ~> s]
+  type(vertvisc_CS),       intent(in)    :: CS     !< Vertical viscosity control structure
+  integer,                 intent(in)    :: nii    !< i block size for array calculations
+  integer,                 intent(in)    :: nJJB   !< J block size for array calculations
+
+  ! Local variables
+
+  ! The block-sized work arrays below are dimensioned (nii,nJJB[,nz]).  Their first (nii) block
+  ! index is at the tracer-column (i) points, while the second (nJJB) block index is at the
+  ! meridional velocity (v, C-grid J) points.
+  real, dimension(nii,nJJB,SZK_(GV)) :: &
+    c1          ! A variable used by the tridiagonal solver [nondim].
+  real, dimension(nii,nJJB) :: &
+    b1, &       ! A variable used by the tridiagonal solver [H-1 ~> m-1 or m2 kg-1].
+    d1          ! d1=1-c1 is used by the tridiagonal solver [nondim].
+  logical, dimension(nii,nJJB) :: &
+    do_ij       ! True at the block points that are being worked on.
+  real :: Ray       ! The Rayleigh-drag velocity [H T-1 ~> m s-1 or Pa s m-1].
+  real :: b_denom_1 ! The first term in the denominator of b1 [H ~> m or kg m-2].
+  logical :: have_Ray ! True if the Rayleigh drag velocities are available.
+  integer :: i, j, k, is, ie, Jsq, Jeq, nz
+  integer :: isb, ieb, JsbB, JebB, ii, JJ, iie, JJe
+
+  is = G%isc ; ie = G%iec ; Jsq = G%JscB ; Jeq = G%JecB ; nz = GV%ke
+
+  have_Ray = allocated(visc%Ray_v)
+
+  !$omp target enter data map(alloc: c1, b1, d1, do_ij)
+
+  do JsbB=Jsq,Jeq,nJJB ; do isb=is,ie,nii
+    ieb = min(isb + nii - 1, ie)
+    JebB = min(JsbB + nJJB - 1, Jeq)
+    iie = ieb - isb + 1
+    JJe = JebB - JsbB + 1
+
+    ! Start the forward elimination with the topmost layer.
+    do concurrent (JJ=1:JJe, ii=1:iie) DO_LOCALITY(local(i,J,Ray,b_denom_1))
+      i = isb + ii - 1
+      J = JsbB + JJ - 1
+
+      do_ij(ii,JJ) = (G%mask2dCv(i,J) > 0.)
+
+      if (do_ij(ii,JJ)) then
+        Ray = 0.
+        if (have_Ray) Ray = visc%Ray_v(i,J,1)
+
+        b_denom_1 = CS%h_v(i,J,1) + dt * (Ray + CS%a_v(i,J,1))
+        b1(ii,JJ) = 1.0 / (b_denom_1 + dt*CS%a_v(i,J,2))
+        d1(ii,JJ) = b_denom_1 * b1(ii,JJ)
+        visc_rem_v(i,J,1) = b1(ii,JJ) * CS%h_v(i,J,1)
+      endif
+    enddo
+
+    ! Forward elimination through the rest of the column.
+    do concurrent (JJ=1:JJe)
+      do k=2,nz
+        do concurrent (ii=1:iie, do_ij(ii,JJ)) DO_LOCALITY(local(i,J,Ray,b_denom_1))
+          i = isb + ii - 1
+          J = JsbB + JJ - 1
+
+          Ray = 0.
+          if (have_Ray) Ray = visc%Ray_v(i,J,k)
+
+          c1(ii,JJ,k) = dt * CS%a_v(i,J,K) * b1(ii,JJ)
+          b_denom_1 = CS%h_v(i,J,k) + dt * (Ray + CS%a_v(i,J,K) * d1(ii,JJ))
+          b1(ii,JJ) = 1.0 / (b_denom_1 + dt * CS%a_v(i,J,K+1))
+          d1(ii,JJ) = b_denom_1 * b1(ii,JJ)
+          visc_rem_v(i,J,k) = (CS%h_v(i,J,k) + dt * CS%a_v(i,J,K) * visc_rem_v(i,J,k-1)) * b1(ii,JJ)
+        enddo
+      enddo
+    enddo
+
+    ! Back substitute to find the remnant.
+    do concurrent (JJ=1:JJe)
+      do k=nz-1,1,-1
+        do concurrent (ii=1:iie, do_ij(ii,JJ)) DO_LOCALITY(local(i,J))
+          i = isb + ii - 1
+          J = JsbB + JJ - 1
+
+          visc_rem_v(i,J,k) = visc_rem_v(i,J,k) + c1(ii,JJ,k+1) * visc_rem_v(i,J,k+1)
+        enddo
+      enddo
+    enddo
+  enddo ; enddo
+
+  !$omp target exit data map(release: c1, b1, d1, do_ij)
+end subroutine vertvisc_remnant_v
+
+!> Find the viscous remnant at zonal velocity points, which is the fraction of a time-step's worth of
+!! a barotropic acceleration that a layer experiences after viscosity is applied, using the same robust
+!! tridiagonal solver as vertvisc_solve_u.  The columns are processed in blocks of nIIB by njj points, with
+!! the vertical recurrence carried out in serial and all of the columns of a block solved concurrently.
+subroutine vertvisc_remnant_u(visc_rem_u, visc, dt, G, GV, CS, nIIB, njj)
+  type(ocean_grid_type),   intent(in)    :: G      !< Ocean grid structure
+  type(verticalGrid_type), intent(in)    :: GV     !< Ocean vertical grid structure
+  real, dimension(SZIB_(G),SZJ_(G),SZK_(GV)), &
+                           intent(inout) :: visc_rem_u !< Fraction of a time-step's worth of a barotropic
+                                                   !! acceleration that a layer experiences after viscosity
+                                                   !! is applied in the zonal direction [nondim]
+  type(vertvisc_type),     intent(in)    :: visc   !< Viscosities and bottom drag
+  real,                    intent(in)    :: dt     !< Time increment [T ~> s]
+  type(vertvisc_CS),       intent(in)    :: CS     !< Vertical viscosity control structure
+  integer,                 intent(in)    :: nIIB   !< I block size for array calculations
+  integer,                 intent(in)    :: njj    !< j block size for array calculations
+
+  ! Local variables
+
+  ! The block-sized work arrays below are dimensioned (nIIB,njj[,nz]).  Their first (nIIB) block
+  ! index is at the zonal velocity (u, C-grid I) points, while the second (njj) block index is
+  ! at the tracer-row (j) points.
+  real, dimension(nIIB,njj,SZK_(GV)) :: &
+    c1          ! A variable used by the tridiagonal solver [nondim].
+  real, dimension(nIIB,njj) :: &
+    b1, &       ! A variable used by the tridiagonal solver [H-1 ~> m-1 or m2 kg-1].
+    d1          ! d1=1-c1 is used by the tridiagonal solver [nondim].
+  logical, dimension(nIIB,njj) :: &
+    do_ij       ! True at the block points that are being worked on.
+  real :: Ray       ! The Rayleigh-drag velocity [H T-1 ~> m s-1 or Pa s m-1].
+  real :: b_denom_1 ! The first term in the denominator of b1 [H ~> m or kg m-2].
+  logical :: have_Ray ! True if the Rayleigh drag velocities are available.
+  integer :: i, j, k, js, je, Isq, Ieq, nz
+  integer :: IsbB, IebB, jsb, jeb, II, jj, IIe, jje
+
+  js = G%jsc ; je = G%jec ; Isq = G%IscB ; Ieq = G%IecB ; nz = GV%ke
+
+  have_Ray = allocated(visc%Ray_u)
+
+  !$omp target enter data map(alloc: c1, b1, d1, do_ij)
+
+  do jsb=js,je,njj ; do IsbB=Isq,Ieq,nIIB
+    IebB = min(IsbB + nIIB - 1, Ieq)
+    jeb = min(jsb + njj - 1, je)
+    IIe = IebB - IsbB + 1
+    jje = jeb - jsb + 1
+
+    ! Start the forward elimination with the topmost layer.
+    do concurrent (jj=1:jje, II=1:IIe) DO_LOCALITY(local(I,j,Ray,b_denom_1))
+      I = IsbB + II - 1
+      j = jsb + jj - 1
+
+      do_ij(II,jj) = (G%mask2dCu(I,j) > 0.)
+
+      if (do_ij(II,jj)) then
+        Ray = 0.
+        if (have_Ray) Ray = visc%Ray_u(I,j,1)
+
+        b_denom_1 = CS%h_u(I,j,1) + dt * (Ray + CS%a_u(I,j,1))
+        b1(II,jj) = 1.0 / (b_denom_1 + dt*CS%a_u(I,j,2))
+        d1(II,jj) = b_denom_1 * b1(II,jj)
+        visc_rem_u(I,j,1) = b1(II,jj) * CS%h_u(I,j,1)
+      endif
+    enddo
+
+    ! Forward elimination through the rest of the column.
+    do concurrent (jj=1:jje)
+      do k=2,nz
+        do concurrent (II=1:IIe, do_ij(II,jj)) DO_LOCALITY(local(I,j,Ray,b_denom_1))
+          I = IsbB + II - 1
+          j = jsb + jj - 1
+
+          Ray = 0.
+          if (have_Ray) Ray = visc%Ray_u(I,j,k)
+
+          c1(II,jj,k) = dt * CS%a_u(I,j,K) * b1(II,jj)
+          b_denom_1 = CS%h_u(I,j,k) + dt * (Ray + CS%a_u(I,j,K) * d1(II,jj))
+          b1(II,jj) = 1.0 / (b_denom_1 + dt * CS%a_u(I,j,K+1))
+          d1(II,jj) = b_denom_1 * b1(II,jj)
+          visc_rem_u(I,j,k) = (CS%h_u(I,j,k) + dt * CS%a_u(I,j,K) * visc_rem_u(I,j,k-1)) * b1(II,jj)
+        enddo
+      enddo
+    enddo
+
+    ! Back substitute to find the remnant.
+    do concurrent (jj=1:jje)
+      do k=nz-1,1,-1
+        do concurrent (II=1:IIe, do_ij(II,jj)) DO_LOCALITY(local(I,j))
+          I = IsbB + II - 1
+          j = jsb + jj - 1
+
+          visc_rem_u(I,j,k) = visc_rem_u(I,j,k) + c1(II,jj,k+1) * visc_rem_u(I,j,k+1)
+        enddo
+      enddo
+    enddo
+  enddo ; enddo
+
+  !$omp target exit data map(release: c1, b1, d1, do_ij)
+end subroutine vertvisc_remnant_u
 
 
 !> Calculate the coupling coefficients (CS%a_u, CS%a_v, CS%a_u_gl90, CS%a_v_gl90)
