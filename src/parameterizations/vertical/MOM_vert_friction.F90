@@ -598,8 +598,6 @@ subroutine vertvisc(u, v, h, forces, visc, dt, OBC, ADp, CDp, G, GV, US, CS, &
     ! A variable used by the tridiagonal solver [nondim].
   real :: d1
     ! d1=1-c1 is used by the tridiagonal solver [nondim].
-  real :: Ray
-    ! Ray is the Rayleigh-drag velocity [H T-1 ~> m s-1 or Pa s m-1]
   real :: b_denom_1
     ! The first term in the denominator of b1 [H ~> m or kg m-2].
 
@@ -630,6 +628,8 @@ subroutine vertvisc(u, v, h, forces, visc, dt, OBC, ADp, CDp, G, GV, US, CS, &
   logical :: DoStokesMixing
   logical :: lfpmix
 
+  integer :: nIIB, njj ! The resolved I and j block sizes used by the zonal tridiagonal solve [nondim]
+  integer :: nii, nJJB ! The resolved i and J block sizes used by the meridional tridiagonal solve [nondim]
   integer :: i, j, k, is, ie, js, je, Isq, Ieq, Jsq, Jeq, nz, n
   is = G%isc ; ie = G%iec ; js = G%jsc ; je = G%jec
   Isq = G%IscB ; Ieq = G%IecB ; Jsq = G%JscB ; Jeq = G%JecB ; nz = GV%ke
@@ -754,58 +754,10 @@ subroutine vertvisc(u, v, h, forces, visc, dt, OBC, ADp, CDp, G, GV, US, CS, &
   ! c1(k) is -c'_(k - 1)
   ! and the right-hand-side is destructively updated to be d'_k
 
-  !$omp target enter data map(alloc: c1)
-
-  !$omp target teams loop collapse(2) &
-  !$omp   private(b1, c1, d1, Ray, b_denom_1)
-  do j=G%jsc,G%jec ; do I=Isq,Ieq ; if (G%mask2dCu(I,j) > 0.) then
-    Ray = 0.
-    if (allocated(visc%Ray_u)) Ray = visc%Ray_u(I,j,1)
-
-    b_denom_1 = CS%h_u(I,j,1) + dt * (Ray + CS%a_u(I,j,1))
-    b1 = 1. / (b_denom_1 + dt * CS%a_u(I,j,2))
-    d1 = b_denom_1 * b1
-    u(I,j,1) = b1 * (CS%h_u(I,j,1) * u(I,j,1) + surface_stress(I,j))
-
-    if (associated(ADp%du_dt_str)) then
-      ADp%du_dt_str(I,j,1) = b1 * (CS%h_u(I,j,1) * ADp%du_dt_str(I,j,1) + surface_stress(I,j) * Idt)
-    endif
-
-    do k=2,nz
-      if (allocated(visc%Ray_u)) Ray = visc%Ray_u(I,j,k)
-
-      c1(k) = dt * CS%a_u(I,j,K) * b1
-      b_denom_1 = CS%h_u(I,j,k) + dt * (Ray + CS%a_u(I,j,K) * d1)
-      b1 = 1. / (b_denom_1 + dt * CS%a_u(I,j,K+1))
-      d1 = b_denom_1 * b1
-      u(I,j,k) = (CS%h_u(I,j,k) * u(I,j,k) + dt * CS%a_u(I,j,K) * u(I,j,k-1)) * b1
-
-      if (associated(ADp%du_dt_str)) then
-        ADp%du_dt_str(I,j,k) = (CS%h_u(I,j,k) * ADp%du_dt_str(I,j,k) &
-            + dt * CS%a_u(I,j,K) * ADp%du_dt_str(I,j,k-1)) * b1
-      endif
-
-      !### Force FMA evaluation of b1 by blocking lookahead with an impossible branch.
-      ! XXX: Check GPU behavior
-      if (dt < 0) exit
-    enddo
-
-    if (associated(ADp%du_dt_str)) then
-      if (abs(ADp%du_dt_str(I,j,nz)) < accel_underflow) &
-        ADp%du_dt_str(I,j,nz) = 0.
-    endif
-
-    do k=nz-1,1,-1
-      u(I,j,k) = u(I,j,k) + c1(k+1) * u(I,j,k+1)
-
-      if (associated(ADp%du_dt_str)) then
-        ADp%du_dt_str(I,j,k) = ADp%du_dt_str(I,j,k) + c1(k+1) * ADp%du_dt_str(I,j,k+1)
-
-        if (abs(ADp%du_dt_str(I,j,k)) < accel_underflow) &
-          ADp%du_dt_str(I,j,k) = 0.0
-      endif
-    enddo
-  endif ; enddo ; enddo
+  ! Solve the tridiagonal system for the new zonal velocities (and du_dt_str, if requested).
+  nIIB = CS%niblock ; if (nIIB == 0) nIIB = Ieq - Isq + 1
+  njj = CS%njblock ; if (njj == 0) njj = je - js + 1
+  call vertvisc_solve_u(u, surface_stress, visc, ADp, dt, Idt, accel_underflow, G, GV, CS, nIIB, njj)
 
   ! compute vertical velocity tendency that arises from GL90 viscosity;
   ! follow tridiagonal solve method as above; to avoid corrupting u,
@@ -859,13 +811,11 @@ subroutine vertvisc(u, v, h, forces, visc, dt, OBC, ADp, CDp, G, GV, US, CS, &
   endif
 
   if (associated(ADp%du_dt_visc)) then
-    do concurrent (j=G%jsc:G%jec, I=Isq:Ieq)
-      do k=1,nz
-        ADp%du_dt_visc(I,j,k) = (u(I,j,k) - ADp%du_dt_visc(I,j,k)) * Idt
+    do concurrent (k=1:nz, j=G%jsc:G%jec, I=Isq:Ieq)
+      ADp%du_dt_visc(I,j,k) = (u(I,j,k) - ADp%du_dt_visc(I,j,k)) * Idt
 
-        if (abs(ADp%du_dt_visc(I,j,k)) < accel_underflow) &
-          ADp%du_dt_visc(I,j,k) = 0.0
-      enddo
+      if (abs(ADp%du_dt_visc(I,j,k)) < accel_underflow) &
+        ADp%du_dt_visc(I,j,k) = 0.0
     enddo
   endif
 
@@ -881,8 +831,8 @@ subroutine vertvisc(u, v, h, forces, visc, dt, OBC, ADp, CDp, G, GV, US, CS, &
     enddo
 
     if (allocated(visc%Ray_u)) then
-      do concurrent (j=G%jsc:G%jec, I=Isq:Ieq)
-        do k=1,nz
+      do k=1,nz
+        do concurrent (j=G%jsc:G%jec, I=Isq:Ieq)
           taux_bot(I,j) = taux_bot(I,j) + GV%H_to_RZ * (visc%Ray_u(I,j,k) * u(I,j,k))
         enddo
       enddo
@@ -957,56 +907,10 @@ subroutine vertvisc(u, v, h, forces, visc, dt, OBC, ADp, CDp, G, GV, US, CS, &
     enddo
   endif
 
-  !$omp target teams loop collapse(2) &
-  !$omp   private(b1, c1, d1, Ray, b_denom_1)
-  do J=Jsq,Jeq ; do i=is,ie ; if (G%mask2dCv(i,J) > 0.) then
-    Ray = 0.
-    if (allocated(visc%Ray_v)) Ray = visc%Ray_v(i,J,1)
-
-    b_denom_1 = CS%h_v(i,J,1) + dt * (Ray + CS%a_v(i,J,1))
-    b1 = 1.0 / (b_denom_1 + dt*CS%a_v(i,J,2))
-    d1 = b_denom_1 * b1
-    v(i,J,1) = b1 * (CS%h_v(i,J,1) * v(i,J,1) + surface_stress(i,J))
-
-    if (associated(ADp%dv_dt_str)) then
-      ADp%dv_dt_str(i,J,1) = b1 * (CS%h_v(i,J,1) * ADp%dv_dt_str(i,J,1) + surface_stress(i,J) * Idt)
-    endif
-
-    do k=2,nz
-      if (allocated(visc%Ray_v)) Ray = visc%Ray_v(i,J,k)
-
-      c1(k) = dt * CS%a_v(i,J,K) * b1
-      b_denom_1 = CS%h_v(i,J,k) + dt * (Ray + CS%a_v(i,J,K) * d1)
-      b1 = 1. / (b_denom_1 + dt * CS%a_v(i,J,K+1))
-      d1 = b_denom_1 * b1
-      v(i,J,k) = (CS%h_v(i,J,k) * v(i,J,k) + dt * CS%a_v(i,J,K) * v(i,J,k-1)) * b1
-
-      if (associated(ADp%dv_dt_str)) then
-        ADp%dv_dt_str(i,J,k) = (CS%h_v(i,J,k) * ADp%dv_dt_str(i,J,k) &
-            + dt * CS%a_v(i,J,K) * ADp%dv_dt_str(i,J,k-1)) * b1
-      endif
-
-      !### Force FMA evaluation of b1 by blocking lookahead with an impossible branch.
-      ! XXX: Check GPU behavior
-      if (dt < 0) exit
-    enddo
-
-    if (associated(ADp%dv_dt_str)) then
-      if (abs(ADp%dv_dt_str(i,J,nz)) < accel_underflow) &
-        ADp%dv_dt_str(i,J,nz) = 0.0
-    endif
-
-    do k=nz-1,1,-1
-      v(i,J,k) = v(i,J,k) + c1(k+1) * v(i,J,k+1)
-
-      if (associated(ADp%dv_dt_str)) then
-        ADp%dv_dt_str(i,J,k) = ADp%dv_dt_str(i,J,k) + c1(k+1) * ADp%dv_dt_str(i,J,k+1)
-
-        if (abs(ADp%dv_dt_str(i,J,k)) < accel_underflow) &
-          ADp%dv_dt_str(i,J,k) = 0.0
-      endif
-    enddo
-  endif ; enddo ; enddo
+  ! Solve the tridiagonal system for the new meridional velocities (and dv_dt_str, if requested).
+  nii = CS%niblock ; if (nii == 0) nii = ie - is + 1
+  nJJB = CS%njblock ; if (nJJB == 0) nJJB = Jeq - Jsq + 1
+  call vertvisc_solve_v(v, surface_stress, visc, ADp, dt, Idt, accel_underflow, G, GV, CS, nii, nJJB)
 
   ! compute vertical velocity tendency that arises from GL90 viscosity;
   ! follow tridiagonal solve method as above; to avoid corrupting v,
@@ -1060,11 +964,9 @@ subroutine vertvisc(u, v, h, forces, visc, dt, OBC, ADp, CDp, G, GV, US, CS, &
   endif
 
   if (associated(ADp%dv_dt_visc)) then
-    do concurrent (J=Jsq:Jeq, i=is:ie)
-      do k=1,nz
-        ADp%dv_dt_visc(i,J,k) = (v(i,J,k) - ADp%dv_dt_visc(i,J,k))*Idt
-        if (abs(ADp%dv_dt_visc(i,J,k)) < accel_underflow) ADp%dv_dt_visc(i,J,k) = 0.0
-      enddo
+    do concurrent (k=1:nz, J=Jsq:Jeq, i=is:ie)
+      ADp%dv_dt_visc(i,J,k) = (v(i,J,k) - ADp%dv_dt_visc(i,J,k))*Idt
+      if (abs(ADp%dv_dt_visc(i,J,k)) < accel_underflow) ADp%dv_dt_visc(i,J,k) = 0.0
     enddo
   endif
 
@@ -1081,8 +983,8 @@ subroutine vertvisc(u, v, h, forces, visc, dt, OBC, ADp, CDp, G, GV, US, CS, &
     enddo
 
     if (allocated(visc%Ray_v)) then
-      do concurrent (J=Jsq:Jeq, i=is:ie)
-        do k=1,nz
+      do k=1,nz
+        do concurrent (J=Jsq:Jeq, i=is:ie)
           tauy_bot(i,J) = tauy_bot(i,J) + GV%H_to_RZ * (visc%Ray_v(i,J,k)*v(i,J,k))
         enddo
       enddo
@@ -1120,8 +1022,6 @@ subroutine vertvisc(u, v, h, forces, visc, dt, OBC, ADp, CDp, G, GV, US, CS, &
   endif
 
   call vertvisc_limit_vel(u, v, h, ADp, CDp, forces, visc, dt, G, GV, US, CS)
-
-  !$omp target exit data map(delete: c1)
 
   !$omp target exit data map(from: ADp%du_dt_str, ADp%dv_dt_str)
   !$omp target exit data map(delete: ADp)
@@ -1310,6 +1210,294 @@ subroutine vertvisc_remnant(visc, visc_rem_u, visc_rem_v, dt, G, GV, US, CS)
                   scalar_pair=.true.)
   endif
 end subroutine vertvisc_remnant
+
+!> Solve the tridiagonal system for the vertical viscosity at meridional velocity points, replacing v with
+!! its value after a time-step of viscosity.  If ADp%dv_dt_str is associated, the acceleration due to the
+!! surface stress that is applied as a body force is also solved for.  The columns are processed in blocks
+!! of nii by nJJB points, with the vertical recurrence carried out in serial and all of the columns of a
+!! block solved concurrently.
+subroutine vertvisc_solve_v(v, surface_stress, visc, ADp, dt, Idt, accel_underflow, G, GV, CS, nii, nJJB)
+  type(ocean_grid_type),   intent(in)    :: G      !< Ocean grid structure
+  type(verticalGrid_type), intent(in)    :: GV     !< Ocean vertical grid structure
+  real, dimension(SZI_(G),SZJB_(G),SZK_(GV)), &
+                           intent(inout) :: v      !< Meridional velocity [L T-1 ~> m s-1]
+  real, dimension(SZIB_(G),SZJB_(G)), &
+                           intent(in)    :: surface_stress !< The surface stress, which is the same as the stress
+                                                   !! unless it is applied as a body force
+                                                   !! [H L T-1 ~> m2 s-1 or kg m-1 s-1]
+  type(vertvisc_type),     intent(in)    :: visc   !< Viscosities and bottom drag
+  type(accel_diag_ptrs),   intent(in)    :: ADp    !< Accelerations in the momentum equations for diagnostics
+  real,                    intent(in)    :: dt     !< Time increment [T ~> s]
+  real,                    intent(in)    :: Idt    !< The inverse of the time step [T-1 ~> s-1]
+  real,                    intent(in)    :: accel_underflow !< An acceleration magnitude that is so small that
+                                                   !! values that are less than this are diagnosed as 0
+                                                   !! [L T-2 ~> m s-2]
+  type(vertvisc_CS),       intent(in)    :: CS     !< Vertical viscosity control structure
+  integer,                 intent(in)    :: nii    !< i block size for array calculations
+  integer,                 intent(in)    :: nJJB   !< J block size for array calculations
+
+  ! Local variables
+
+  ! The block-sized work arrays below are dimensioned (nii,nJJB[,nz]).  Their first (nii) block
+  ! index is at the tracer-column (i) points, while the second (nJJB) block index is at the
+  ! meridional velocity (v, C-grid J) points.
+  real, dimension(nii,nJJB,SZK_(GV)) :: &
+    c1          ! A variable used by the tridiagonal solver [nondim].
+  real, dimension(nii,nJJB) :: &
+    b1, &       ! A variable used by the tridiagonal solver [H-1 ~> m-1 or m2 kg-1].
+    d1          ! d1=1-c1 is used by the tridiagonal solver [nondim].
+  logical, dimension(nii,nJJB) :: &
+    do_ij       ! True at the block points that are being worked on.
+  real :: Ray       ! The Rayleigh-drag velocity [H T-1 ~> m s-1 or Pa s m-1].
+  real :: b_denom_1 ! The first term in the denominator of b1 [H ~> m or kg m-2].
+  logical :: have_Ray ! True if the Rayleigh drag velocities are available.
+  logical :: have_str ! True if the acceleration due to the surface stress is being found.
+  integer :: i, j, k, is, ie, Jsq, Jeq, nz
+  integer :: isb, ieb, JsbB, JebB, ii, JJ, iie, JJe
+
+  is = G%isc ; ie = G%iec ; Jsq = G%JscB ; Jeq = G%JecB ; nz = GV%ke
+
+  have_Ray = allocated(visc%Ray_v)
+  have_str = associated(ADp%dv_dt_str)
+
+  ! The forward elimination and back substitution below are the same as those in the original column-wise
+  ! form of this solver:
+  !
+  ! b1 is the denominator term 1 / (b_k + a_k c'_(k-1))
+  ! b_denom_1 is (b_k + a_k + c_k) - a_k(1 - c'_(k-1))
+  !            = (b_k + c_k + c'_(k-1))
+  ! this is done so that d1 = b1 * b_denom_1 = 1 - c'_(k-1)
+  ! c1(k) is -c'_(k - 1)
+  ! and the right-hand-side is destructively updated to be d'_k
+
+  !$omp target enter data map(alloc: c1, b1, d1, do_ij)
+
+  do JsbB=Jsq,Jeq,nJJB ; do isb=is,ie,nii
+    ieb = min(isb + nii - 1, ie)
+    JebB = min(JsbB + nJJB - 1, Jeq)
+    iie = ieb - isb + 1
+    JJe = JebB - JsbB + 1
+
+    ! Start the forward elimination with the topmost layer.
+    do concurrent (JJ=1:JJe, ii=1:iie) DO_LOCALITY(local(i,J,Ray,b_denom_1))
+      i = isb + ii - 1
+      J = JsbB + JJ - 1
+
+      do_ij(ii,JJ) = (G%mask2dCv(i,J) > 0.)
+
+      if (do_ij(ii,JJ)) then
+        Ray = 0.
+        if (have_Ray) Ray = visc%Ray_v(i,J,1)
+
+        b_denom_1 = CS%h_v(i,J,1) + dt * (Ray + CS%a_v(i,J,1))
+        b1(ii,JJ) = 1.0 / (b_denom_1 + dt*CS%a_v(i,J,2))
+        d1(ii,JJ) = b_denom_1 * b1(ii,JJ)
+        v(i,J,1) = b1(ii,JJ) * (CS%h_v(i,J,1) * v(i,J,1) + surface_stress(i,J))
+
+        if (have_str) then
+          ADp%dv_dt_str(i,J,1) = b1(ii,JJ) * (CS%h_v(i,J,1) * ADp%dv_dt_str(i,J,1) + surface_stress(i,J) * Idt)
+        endif
+      endif
+    enddo
+
+    ! Forward elimination through the rest of the column.
+    do concurrent (JJ=1:JJe)
+      do k=2,nz
+        do concurrent (ii=1:iie, do_ij(ii,JJ)) DO_LOCALITY(local(i,J,Ray,b_denom_1))
+          i = isb + ii - 1
+          J = JsbB + JJ - 1
+
+          Ray = 0.
+          if (have_Ray) Ray = visc%Ray_v(i,J,k)
+
+          c1(ii,JJ,k) = dt * CS%a_v(i,J,K) * b1(ii,JJ)
+          b_denom_1 = CS%h_v(i,J,k) + dt * (Ray + CS%a_v(i,J,K) * d1(ii,JJ))
+          b1(ii,JJ) = 1. / (b_denom_1 + dt * CS%a_v(i,J,K+1))
+          d1(ii,JJ) = b_denom_1 * b1(ii,JJ)
+          v(i,J,k) = (CS%h_v(i,J,k) * v(i,J,k) + dt * CS%a_v(i,J,K) * v(i,J,k-1)) * b1(ii,JJ)
+
+          if (have_str) then
+            ADp%dv_dt_str(i,J,k) = (CS%h_v(i,J,k) * ADp%dv_dt_str(i,J,k) &
+                + dt * CS%a_v(i,J,K) * ADp%dv_dt_str(i,J,k-1)) * b1(ii,JJ)
+          endif
+        enddo
+      enddo
+    enddo
+
+    ! Back substitute to solve for the new velocities.
+    do concurrent (JJ=1:JJe)
+      if (have_str) then
+        do concurrent (ii=1:iie, do_ij(ii,JJ)) DO_LOCALITY(local(i,J))
+          i = isb + ii - 1
+          J = JsbB + JJ - 1
+
+          if (abs(ADp%dv_dt_str(i,J,nz)) < accel_underflow) ADp%dv_dt_str(i,J,nz) = 0.0
+        enddo
+      endif
+
+      do k=nz-1,1,-1
+        do concurrent (ii=1:iie, do_ij(ii,JJ)) DO_LOCALITY(local(i,J))
+          i = isb + ii - 1
+          J = JsbB + JJ - 1
+
+          v(i,J,k) = v(i,J,k) + c1(ii,JJ,k+1) * v(i,J,k+1)
+
+          if (have_str) then
+            ADp%dv_dt_str(i,J,k) = ADp%dv_dt_str(i,J,k) + c1(ii,JJ,k+1) * ADp%dv_dt_str(i,J,k+1)
+
+            if (abs(ADp%dv_dt_str(i,J,k)) < accel_underflow) ADp%dv_dt_str(i,J,k) = 0.0
+          endif
+        enddo
+      enddo
+    enddo
+  enddo ; enddo
+
+  !$omp target exit data map(release: c1, b1, d1, do_ij)
+end subroutine vertvisc_solve_v
+
+!> Solve the tridiagonal system for the vertical viscosity at zonal velocity points, replacing u with
+!! its value after a time-step of viscosity.  If ADp%du_dt_str is associated, the acceleration due to the
+!! surface stress that is applied as a body force is also solved for.  The columns are processed in blocks
+!! of nIIB by njj points, with the vertical recurrence carried out in serial and all of the columns of a
+!! block solved concurrently.
+subroutine vertvisc_solve_u(u, surface_stress, visc, ADp, dt, Idt, accel_underflow, G, GV, CS, nIIB, njj)
+  type(ocean_grid_type),   intent(in)    :: G      !< Ocean grid structure
+  type(verticalGrid_type), intent(in)    :: GV     !< Ocean vertical grid structure
+  real, dimension(SZIB_(G),SZJ_(G),SZK_(GV)), &
+                           intent(inout) :: u      !< Zonal velocity [L T-1 ~> m s-1]
+  real, dimension(SZIB_(G),SZJB_(G)), &
+                           intent(in)    :: surface_stress !< The surface stress, which is the same as the stress
+                                                   !! unless it is applied as a body force
+                                                   !! [H L T-1 ~> m2 s-1 or kg m-1 s-1]
+  type(vertvisc_type),     intent(in)    :: visc   !< Viscosities and bottom drag
+  type(accel_diag_ptrs),   intent(in)    :: ADp    !< Accelerations in the momentum equations for diagnostics
+  real,                    intent(in)    :: dt     !< Time increment [T ~> s]
+  real,                    intent(in)    :: Idt    !< The inverse of the time step [T-1 ~> s-1]
+  real,                    intent(in)    :: accel_underflow !< An acceleration magnitude that is so small that
+                                                   !! values that are less than this are diagnosed as 0
+                                                   !! [L T-2 ~> m s-2]
+  type(vertvisc_CS),       intent(in)    :: CS     !< Vertical viscosity control structure
+  integer,                 intent(in)    :: nIIB   !< I block size for array calculations
+  integer,                 intent(in)    :: njj    !< j block size for array calculations
+
+  ! Local variables
+
+  ! The block-sized work arrays below are dimensioned (nIIB,njj[,nz]).  Their first (nIIB) block
+  ! index is at the zonal velocity (u, C-grid I) points, while the second (njj) block index is
+  ! at the tracer-row (j) points.
+  real, dimension(nIIB,njj,SZK_(GV)) :: &
+    c1          ! A variable used by the tridiagonal solver [nondim].
+  real, dimension(nIIB,njj) :: &
+    b1, &       ! A variable used by the tridiagonal solver [H-1 ~> m-1 or m2 kg-1].
+    d1          ! d1=1-c1 is used by the tridiagonal solver [nondim].
+  logical, dimension(nIIB,njj) :: &
+    do_ij       ! True at the block points that are being worked on.
+  real :: Ray       ! The Rayleigh-drag velocity [H T-1 ~> m s-1 or Pa s m-1].
+  real :: b_denom_1 ! The first term in the denominator of b1 [H ~> m or kg m-2].
+  logical :: have_Ray ! True if the Rayleigh drag velocities are available.
+  logical :: have_str ! True if the acceleration due to the surface stress is being found.
+  integer :: i, j, k, js, je, Isq, Ieq, nz
+  integer :: IsbB, IebB, jsb, jeb, II, jj, IIe, jje
+
+  js = G%jsc ; je = G%jec ; Isq = G%IscB ; Ieq = G%IecB ; nz = GV%ke
+
+  have_Ray = allocated(visc%Ray_u)
+  have_str = associated(ADp%du_dt_str)
+
+  ! The forward elimination and back substitution below are the same as those in the original column-wise
+  ! form of this solver:
+  !
+  ! b1 is the denominator term 1 / (b_k + a_k c'_(k-1))
+  ! b_denom_1 is (b_k + a_k + c_k) - a_k(1 - c'_(k-1))
+  !            = (b_k + c_k + c'_(k-1))
+  ! this is done so that d1 = b1 * b_denom_1 = 1 - c'_(k-1)
+  ! c1(k) is -c'_(k - 1)
+  ! and the right-hand-side is destructively updated to be d'_k
+
+  !$omp target enter data map(alloc: c1, b1, d1, do_ij)
+
+  do jsb=js,je,njj ; do IsbB=Isq,Ieq,nIIB
+    IebB = min(IsbB + nIIB - 1, Ieq)
+    jeb = min(jsb + njj - 1, je)
+    IIe = IebB - IsbB + 1
+    jje = jeb - jsb + 1
+
+    ! Start the forward elimination with the topmost layer.
+    do concurrent (jj=1:jje, II=1:IIe) DO_LOCALITY(local(I,j,Ray,b_denom_1))
+      I = IsbB + II - 1
+      j = jsb + jj - 1
+
+      do_ij(II,jj) = (G%mask2dCu(I,j) > 0.)
+
+      if (do_ij(II,jj)) then
+        Ray = 0.
+        if (have_Ray) Ray = visc%Ray_u(I,j,1)
+
+        b_denom_1 = CS%h_u(I,j,1) + dt * (Ray + CS%a_u(I,j,1))
+        b1(II,jj) = 1.0 / (b_denom_1 + dt*CS%a_u(I,j,2))
+        d1(II,jj) = b_denom_1 * b1(II,jj)
+        u(I,j,1) = b1(II,jj) * (CS%h_u(I,j,1) * u(I,j,1) + surface_stress(I,j))
+
+        if (have_str) then
+          ADp%du_dt_str(I,j,1) = b1(II,jj) * (CS%h_u(I,j,1) * ADp%du_dt_str(I,j,1) + surface_stress(I,j) * Idt)
+        endif
+      endif
+    enddo
+
+    ! Forward elimination through the rest of the column.
+    do concurrent (jj=1:jje)
+      do k=2,nz
+        do concurrent (II=1:IIe, do_ij(II,jj)) DO_LOCALITY(local(I,j,Ray,b_denom_1))
+          I = IsbB + II - 1
+          j = jsb + jj - 1
+
+          Ray = 0.
+          if (have_Ray) Ray = visc%Ray_u(I,j,k)
+
+          c1(II,jj,k) = dt * CS%a_u(I,j,K) * b1(II,jj)
+          b_denom_1 = CS%h_u(I,j,k) + dt * (Ray + CS%a_u(I,j,K) * d1(II,jj))
+          b1(II,jj) = 1. / (b_denom_1 + dt * CS%a_u(I,j,K+1))
+          d1(II,jj) = b_denom_1 * b1(II,jj)
+          u(I,j,k) = (CS%h_u(I,j,k) * u(I,j,k) + dt * CS%a_u(I,j,K) * u(I,j,k-1)) * b1(II,jj)
+
+          if (have_str) then
+            ADp%du_dt_str(I,j,k) = (CS%h_u(I,j,k) * ADp%du_dt_str(I,j,k) &
+                + dt * CS%a_u(I,j,K) * ADp%du_dt_str(I,j,k-1)) * b1(II,jj)
+          endif
+        enddo
+      enddo
+    enddo
+
+    ! Back substitute to solve for the new velocities.
+    do concurrent (jj=1:jje)
+      if (have_str) then
+        do concurrent (II=1:IIe, do_ij(II,jj)) DO_LOCALITY(local(I,j))
+          I = IsbB + II - 1
+          j = jsb + jj - 1
+
+          if (abs(ADp%du_dt_str(I,j,nz)) < accel_underflow) ADp%du_dt_str(I,j,nz) = 0.0
+        enddo
+      endif
+
+      do k=nz-1,1,-1
+        do concurrent (II=1:IIe, do_ij(II,jj)) DO_LOCALITY(local(I,j))
+          I = IsbB + II - 1
+          j = jsb + jj - 1
+
+          u(I,j,k) = u(I,j,k) + c1(II,jj,k+1) * u(I,j,k+1)
+
+          if (have_str) then
+            ADp%du_dt_str(I,j,k) = ADp%du_dt_str(I,j,k) + c1(II,jj,k+1) * ADp%du_dt_str(I,j,k+1)
+
+            if (abs(ADp%du_dt_str(I,j,k)) < accel_underflow) ADp%du_dt_str(I,j,k) = 0.0
+          endif
+        enddo
+      enddo
+    enddo
+  enddo ; enddo
+
+  !$omp target exit data map(release: c1, b1, d1, do_ij)
+end subroutine vertvisc_solve_u
 
 
 !> Calculate the coupling coefficients (CS%a_u, CS%a_v, CS%a_u_gl90, CS%a_v_gl90)
@@ -3466,11 +3654,13 @@ subroutine vertvisc_init(MIS, Time, G, GV, US, param_file, diag, ADp, dirs, &
                  "the age of the universe.", units="m s-1", default=0.0, scale=US%m_s_to_L_T)
   call get_param(param_file, mdl, "VERT_FRICTION_NIBLOCK", CS%niblock, &
                  "The i-direction block size used in the vertical viscosity coefficient "//&
-                 "calculations. A value of 0 uses the full computational i-domain extent.", &
+                 "calculations and tridiagonal solves. A value of 0 uses the full computational "//&
+                 "i-domain extent.", &
                  default=default_niblock, layoutParam=.true.)
   call get_param(param_file, mdl, "VERT_FRICTION_NJBLOCK", CS%njblock, &
                  "The j-direction block size used in the vertical viscosity coefficient "//&
-                 "calculations. A value of 0 uses the full computational j-domain extent.", &
+                 "calculations and tridiagonal solves. A value of 0 uses the full computational "//&
+                 "j-domain extent.", &
                  default=default_njblock, layoutParam=.true.)
   if (CS%niblock < 0) &
     call MOM_error(FATAL, "VERT_FRICTION_NIBLOCK must be nonnegative; "//&
