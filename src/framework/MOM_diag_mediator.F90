@@ -68,6 +68,7 @@ public diag_get_volume_cell_measure_dm_id
 public diag_set_state_ptrs, diag_update_remap_grids
 public diag_grid_storage_init, diag_grid_storage_end
 public diag_copy_diag_to_storage, diag_copy_storage_to_diag
+public diag_fields_in_use
 public diag_save_grids, diag_restore_grids
 public found_in_diagtable
 
@@ -2234,6 +2235,16 @@ function query_averaging_enabled(diag_cs, time_int, time_end)
   if (present(time_end)) time_end = diag_cs%time_end
   query_averaging_enabled = diag_cs%ave_enabled
 end function query_averaging_enabled
+
+!> This function returns true if any diagnostic fields are being diagnosed, in which case posting them
+!! can read the model state.  A field only receives a diagnostic ID if it is requested in the diag_table
+!! (or if diagnostics are being written as checksums), so this is false if nothing is being diagnosed.
+function diag_fields_in_use(diag_cs)
+  type(diag_ctrl), intent(in) :: diag_CS  !< Structure used to regulate diagnostic output
+  logical :: diag_fields_in_use           !< True if any diagnostic fields are being diagnosed
+
+  diag_fields_in_use = (diag_cs%next_free_diag_id > 1)
+end function diag_fields_in_use
 
 !> This function returns the valid end time for use with diagnostics that are
 !! handled outside of the MOM6 diagnostics infrastructure.

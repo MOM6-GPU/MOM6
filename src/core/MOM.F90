@@ -27,6 +27,7 @@ use MOM_diag_mediator,        only : set_masks_for_axes
 use MOM_diag_mediator,        only : diag_grid_storage, diag_grid_storage_init
 use MOM_diag_mediator,        only : diag_save_grids, diag_restore_grids
 use MOM_diag_mediator,        only : diag_copy_storage_to_diag, diag_copy_diag_to_storage
+use MOM_diag_mediator,        only : diag_fields_in_use
 use MOM_domains,              only : MOM_domains_init, MOM_domain_type
 use MOM_domains,              only : sum_across_PEs, pass_var, pass_vector
 use MOM_domains,              only : clone_MOM_domain, deallocate_MOM_domain
@@ -957,7 +958,8 @@ subroutine step_MOM(forces_in, fluxes_in, sfc_state, Time_start, time_int_in, CS
       ! advective tendencies.  If there are more than one dynamics steps per advective
       ! step (i.e DT_THERM > DT), this needs to be stored at the first dynamics call.
       if (.not.CS%preadv_h_stored .and. (CS%t_dyn_rel_adv == 0.)) then
-        !$omp target update from(h)
+        ! Copy h to the host only if diagnostics are in use and there are diagnostic grids to store it for.
+        !$omp target update from(h) if (diag_fields_in_use(CS%diag) .and. (CS%diag_pre_dyn%num_diag_coords >= 1))
         call diag_copy_diag_to_storage(CS%diag_pre_dyn, h, CS%diag)
         CS%preadv_h_stored = .true.
       endif
@@ -1111,7 +1113,9 @@ subroutine step_MOM(forces_in, fluxes_in, sfc_state, Time_start, time_int_in, CS
     ! Calculate diagnostics at the end of the time step if the state is self-consistent.
     if (MOM_state_is_synchronized(CS)) then
     !### Perhaps this should be if (CS%t_dyn_rel_thermo == 0.0)
-      !$omp target update from(u, v, h, CS%uhtr, CS%vhtr)
+      ! Copy the state to the host only if the diagnostics, debugging or ensemble code read it.
+      !$omp target update from(u, v, h, CS%uhtr, CS%vhtr) &
+      !$omp   if (diag_fields_in_use(CS%diag) .or. CS%debug .or. CS%ensemble_ocean)
       call cpu_clock_begin(id_clock_other) ; call cpu_clock_begin(id_clock_diagnostics)
       ! Diagnostics that require the complete state to be up-to-date can be calculated.
 
@@ -4998,7 +5002,13 @@ subroutine save_MOM_restart(CS, directory, time, G, time_stamped, filename, &
     !< If present and true, initial conditions are being written
 
   logical :: showCallTree
+  logical :: state_from_device ! If true, copy the state from the device before writing it.
   showCallTree = callTree_showQuery()
+
+  ! Copy the state from the device, except when writing the initial conditions, which uses the host copies.
+  state_from_device = .true.
+  if (present(write_IC)) state_from_device = .not.write_IC
+  !$omp target update from(CS%u, CS%v, CS%h, CS%uhtr, CS%vhtr) if (state_from_device)
 
   call cpu_clock_begin(id_clock_ocean) ; call cpu_clock_begin(id_clock_save_restart)
   if (showCallTree) call callTree_waypoint("About to call save_restart (step_MOM)")
