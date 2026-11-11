@@ -932,10 +932,12 @@ subroutine vertvisc(u, v, h, forces, visc, dt, OBC, ADp, CDp, G, GV, US, CS, &
     call post_data(CS%id_GLwork, KE_term, CS%diag)
   endif
 
+  ! The viscous accelerations are needed on the host by the reports from vertvisc_limit_vel.
+  !$omp target exit data map(from: ADp%du_dt_visc, ADp%du_dt_visc_gl90, ADp%dv_dt_visc, ADp%dv_dt_visc_gl90)
+
   call vertvisc_limit_vel(u, v, h, ADp, CDp, forces, visc, dt, G, GV, US, CS)
 
-  !$omp target exit data map(from: ADp%du_dt_str, ADp%dv_dt_str, ADp%du_dt_visc, ADp%du_dt_visc_gl90, &
-  !$omp                            ADp%dv_dt_visc, ADp%dv_dt_visc_gl90)
+  !$omp target exit data map(from: ADp%du_dt_str, ADp%dv_dt_str)
   !$omp target exit data map(delete: ADp)
   !$omp target exit data map(delete: surface_stress)
 
@@ -3515,52 +3517,113 @@ subroutine vertvisc_limit_vel(u, v, h, ADp, CDp, forces, visc, dt, G, GV, US, CS
   real :: vel_report(SZIB_(G),SZJB_(G))   ! The velocity to report [L T-1 ~> m s-1]
   real :: u_old(SZIB_(G),SZJ_(G),SZK_(GV)) ! The previous u-velocity [L T-1 ~> m s-1]
   real :: v_old(SZI_(G),SZJB_(G),SZK_(GV)) ! The previous v-velocity [L T-1 ~> m s-1]
-  logical :: trunc_any_array(SZI_(G),SZJB_(G),SZK_(GV))
-  logical :: trunc_any, dowrite(SZIB_(G),SZJB_(G))
-  logical :: do_any_write
+  logical :: dowrite(SZIB_(G),SZJB_(G))
+  logical :: trunc_col(SZIB_(G),SZJB_(G)) ! True where the CFL number at a velocity point exceeds the
+                                          ! truncation threshold
+  logical :: do_any_write   ! True if any velocity point in the domain should be reported
+  logical :: trunc_blk, write_blk ! True if any point of a block exceeds the truncation threshold or
+                                  ! should be reported
   integer :: ntrunc         ! Thread-safe truncation counter
+  integer :: ntrunc_blk     ! The number of truncations in a block
+  integer :: nIIB, njj      ! The resolved I and j block sizes at the zonal velocity points
+  integer :: nii, nJJB      ! The resolved i and J block sizes at the meridional velocity points
+  ! The block bounds, block-local indices and block extents of the sweeps at zonal (I,j) and meridional
+  ! (i,J) velocity points.  Fortran is not case sensitive, so the block-local indices and extents II and
+  ! ii, jj and JJ, IIe and iie, and jje and JJe are the same variables.
+  integer :: IsbB, IebB, jsb, jeb, isb, ieb, JsbB, JebB, ii, JJ, iie, JJe
   integer :: i, j, k, is, ie, js, je, Isq, Ieq, Jsq, Jeq, nz
   is = G%isc ; ie = G%iec ; js = G%jsc ; je = G%jec ; nz = GV%ke
   Isq = G%IscB ; Ieq = G%IecB ; Jsq = G%JscB ; Jeq = G%JecB
 
   H_report = 3.0 * GV%Angstrom_H
 
-  !$omp target enter data map(alloc: dowrite, vel_report)
+  !$omp target enter data map(alloc: dowrite, vel_report, trunc_col)
   !$omp target enter data map(alloc: u_old, v_old)
 
-  if (len_trim(CS%u_trunc_file) > 0) then
-    do_any_write = .false.
-    trunc_any = .false.
+  ! Limit the zonal velocities, working in blocks of nIIB by njj points.
+  nIIB = CS%niblock ; if (nIIB == 0) nIIB = Ieq - Isq + 1
+  njj = CS%njblock ; if (njj == 0) njj = je - js + 1
 
-    do concurrent (j=js:je, I=Isq:Ieq)
-      dowrite(I,j) = .false.
-      vel_report(I,j) = 3.0e8 * US%m_s_to_L_T
-    enddo
+  do_any_write = .false.
+  ntrunc = 0
+  do jsb=js,je,njj ; do IsbB=Isq,Ieq,nIIB
+    IebB = min(IsbB + nIIB - 1, Ieq)
+    jeb = min(jsb + njj - 1, je)
+    IIe = IebB - IsbB + 1
+    jje = jeb - jsb + 1
 
-    do concurrent (k=1:nz, j=js:je, I=Isq:Ieq) &
-        DO_LOCALITY(reduce(.or.: trunc_any, do_any_write))
-      if (abs(u(I,j,k)) < CS%vel_underflow) u(I,j,k) = 0.0
-      if (u(I,j,k) < 0.0) then
-        CFL = (-u(I,j,k) * dt) * (G%dy_Cu(I,j) * G%IareaT(i+1,j))
-      else
-        CFL = (u(I,j,k) * dt) * (G%dy_Cu(I,j) * G%IareaT(i,j))
-      endif
-      if (CFL > CS%CFL_trunc) trunc_any = .true.
-      if (CFL > CS%CFL_report) then
-        dowrite(I,j) = .true.
+    if (len_trim(CS%u_trunc_file) > 0) then
+      do concurrent (jj=1:jje, II=1:IIe) DO_LOCALITY(local(I,j))
+        I = IsbB + II - 1
+        j = jsb + jj - 1
+
+        dowrite(I,j) = .false.
+        trunc_col(I,j) = .false.
+        vel_report(I,j) = 3.0e8 * US%m_s_to_L_T
+      enddo
+
+      do concurrent (jj=1:jje)
+        do k=1,nz
+          do concurrent (II=1:IIe) DO_LOCALITY(local(I,j,CFL))
+            I = IsbB + II - 1
+            j = jsb + jj - 1
+
+            if (abs(u(I,j,k)) < CS%vel_underflow) u(I,j,k) = 0.0
+            if (u(I,j,k) < 0.0) then
+              CFL = (-u(I,j,k) * dt) * (G%dy_Cu(I,j) * G%IareaT(i+1,j))
+            else
+              CFL = (u(I,j,k) * dt) * (G%dy_Cu(I,j) * G%IareaT(i,j))
+            endif
+            if (CFL > CS%CFL_trunc) trunc_col(I,j) = .true.
+            if (CFL > CS%CFL_report) then
+              dowrite(I,j) = .true.
+              vel_report(I,j) = min(vel_report(I,j), abs(u(I,j,k)))
+            endif
+          enddo
+        enddo
+      enddo
+
+      trunc_blk = .false. ; write_blk = .false.
+      do concurrent (jj=1:jje, II=1:IIe) DO_LOCALITY(reduce(.or.: trunc_blk, write_blk))
+        if (trunc_col(IsbB+II-1,jsb+jj-1)) trunc_blk = .true.
+        if (dowrite(IsbB+II-1,jsb+jj-1)) write_blk = .true.
+      enddo
+
+      if (write_blk) then
         do_any_write = .true.
-        vel_report(I,j) = min(vel_report(I,j), abs(u(I,j,k)))
+        do concurrent (k=1:nz, jj=1:jje, II=1:IIe, dowrite(IsbB+II-1,jsb+jj-1)) DO_LOCALITY(local(I,j))
+          I = IsbB + II - 1
+          j = jsb + jj - 1
+
+          u_old(I,j,k) = u(I,j,k)
+        enddo
       endif
-    enddo
 
-    do concurrent (j=js:je, I=Isq:Ieq, dowrite(I,j))
-      u_old(I,j,:) = u(I,j,:)
-    enddo
+      if (trunc_blk) then
+        ntrunc_blk = 0
+        do concurrent (k=1:nz, jj=1:jje, II=1:IIe) DO_LOCALITY(local(I,j) reduce(+: ntrunc_blk))
+          I = IsbB + II - 1
+          j = jsb + jj - 1
 
-    if (trunc_any) then
-      ntrunc = 0
-      do concurrent (k=1:nz, j=js:je, I=Isq:Ieq) DO_LOCALITY(reduce(+: ntrunc))
-        if ((u(I,j,k) * (dt * G%dy_Cu(I,j))) * G%IareaT(i+1,j) < -CS%CFL_trunc) then
+          if ((u(I,j,k) * (dt * G%dy_Cu(I,j))) * G%IareaT(i+1,j) < -CS%CFL_trunc) then
+            u(I,j,k) = (-0.9*CS%CFL_trunc) * (G%areaT(i+1,j) / (dt * G%dy_Cu(I,j)))
+            if (((I >= G%isc) .and. (I <= G%iec) .and. (j >= G%jsc) .and. (j <= G%jec)) .and. &
+                (CS%h_u(I,j,k) > H_report)) ntrunc_blk = ntrunc_blk + 1
+          elseif ((u(I,j,k) * (dt * G%dy_Cu(I,j))) * G%IareaT(i,j) > CS%CFL_trunc) then
+            u(I,j,k) = (0.9*CS%CFL_trunc) * (G%areaT(i,j) / (dt * G%dy_Cu(I,j)))
+            if (((I >= G%isc) .and. (I <= G%iec) .and. (j >= G%jsc) .and. (j <= G%jec)) .and. &
+                (CS%h_u(I,j,k) > H_report)) ntrunc_blk = ntrunc_blk + 1
+          endif
+        enddo
+        ntrunc = ntrunc + ntrunc_blk
+      endif
+    else  ! Do not report accelerations leading to large velocities.
+      do concurrent (k=1:nz, jj=1:jje, II=1:IIe) DO_LOCALITY(local(I,j) reduce(+: ntrunc))
+        I = IsbB + II - 1
+        j = jsb + jj - 1
+
+        if (abs(u(I,j,k)) < CS%vel_underflow) then ; u(I,j,k) = 0.0
+        elseif ((u(I,j,k) * (dt * G%dy_Cu(I,j))) * G%IareaT(i+1,j) < -CS%CFL_trunc) then
           u(I,j,k) = (-0.9*CS%CFL_trunc) * (G%areaT(i+1,j) / (dt * G%dy_Cu(I,j)))
           if (((I >= G%isc) .and. (I <= G%iec) .and. (j >= G%jsc) .and. (j <= G%jec)) .and. &
               (CS%h_u(I,j,k) > H_report)) ntrunc = ntrunc + 1
@@ -3570,67 +3633,104 @@ subroutine vertvisc_limit_vel(u, v, h, ADp, CDp, forces, visc, dt, G, GV, US, CS
               (CS%h_u(I,j,k) > H_report)) ntrunc = ntrunc + 1
         endif
       enddo
-      CS%ntrunc = CS%ntrunc + ntrunc
     endif
+  enddo ; enddo
+  CS%ntrunc = CS%ntrunc + ntrunc
 
-    if (do_any_write) then
-      !$omp target update from (u_old, vel_report)
-      do j=js,je ; do I=Isq,Ieq ; if (dowrite(I,j)) then
-        ! Call a diagnostic reporting subroutines are called if unphysically large values are found.
-        call write_u_accel(I, j, u_old, h, ADp, CDp, dt, G, GV, US, CS%PointAccel_CSp, &
-                           vel_report(I,j), forces%taux(I,j), a=CS%a_u, hv=CS%h_u)
-      endif ; enddo ; enddo
-    endif
-  else  ! Do not report accelerations leading to large velocities.
-    ntrunc = 0
-    do concurrent (k=1:nz, j=js:je, I=Isq:Ieq) DO_LOCALITY(reduce(+: ntrunc))
-      if (abs(u(I,j,k)) < CS%vel_underflow) then ; u(I,j,k) = 0.0
-      elseif ((u(I,j,k) * (dt * G%dy_Cu(I,j))) * G%IareaT(i+1,j) < -CS%CFL_trunc) then
-        u(I,j,k) = (-0.9*CS%CFL_trunc) * (G%areaT(i+1,j) / (dt * G%dy_Cu(I,j)))
-        if (((I >= G%isc) .and. (I <= G%iec) .and. (j >= G%jsc) .and. (j <= G%jec)) .and. &
-            (CS%h_u(I,j,k) > H_report)) ntrunc = ntrunc + 1
-      elseif ((u(I,j,k) * (dt * G%dy_Cu(I,j))) * G%IareaT(i,j) > CS%CFL_trunc) then
-        u(I,j,k) = (0.9*CS%CFL_trunc) * (G%areaT(i,j) / (dt * G%dy_Cu(I,j)))
-        if (((I >= G%isc) .and. (I <= G%iec) .and. (j >= G%jsc) .and. (j <= G%jec)) .and. &
-            (CS%h_u(I,j,k) > H_report)) ntrunc = ntrunc + 1
-      endif
-    enddo
-    CS%ntrunc = CS%ntrunc + ntrunc
+  if (do_any_write) then
+    !$omp target update from (u_old, vel_report, dowrite)
+    do j=js,je ; do I=Isq,Ieq ; if (dowrite(I,j)) then
+      ! Call a diagnostic reporting subroutines are called if unphysically large values are found.
+      call write_u_accel(I, j, u_old, h, ADp, CDp, dt, G, GV, US, CS%PointAccel_CSp, &
+                         vel_report(I,j), forces%taux(I,j), a=CS%a_u, hv=CS%h_u)
+    endif ; enddo ; enddo
   endif
 
-  if (len_trim(CS%v_trunc_file) > 0) then
-    do_any_write =.false.
-    trunc_any = .false.
 
-    do concurrent (J=Jsq:Jeq, i=is:ie)
-      dowrite(i,J) = .false.
-      vel_report(i,J) = 3.0e8 * US%m_s_to_L_T
-    enddo
+  ! Limit the meridional velocities, working in blocks of nii by nJJB points.
+  nii = CS%niblock ; if (nii == 0) nii = ie - is + 1
+  nJJB = CS%njblock ; if (nJJB == 0) nJJB = Jeq - Jsq + 1
 
-    do concurrent (k=1:nz, J=Jsq:Jeq, i=is:ie) &
-        DO_LOCALITY(reduce(.or.: trunc_any, do_any_write))
-      if (abs(v(i,J,k)) < CS%vel_underflow) v(i,J,k) = 0.0
-      if (v(i,J,k) < 0.0) then
-        CFL = (-v(i,J,k) * dt) * (G%dx_Cv(i,J) * G%IareaT(i,j+1))
-      else
-        CFL = (v(i,J,k) * dt) * (G%dx_Cv(i,J) * G%IareaT(i,j))
-      endif
-      if (CFL > CS%CFL_trunc) trunc_any = .true.
-      if (CFL > CS%CFL_report) then
-        dowrite(i,J) = .true.
+  do_any_write = .false.
+  ntrunc = 0
+  do JsbB=Jsq,Jeq,nJJB ; do isb=is,ie,nii
+    ieb = min(isb + nii - 1, ie)
+    JebB = min(JsbB + nJJB - 1, Jeq)
+    iie = ieb - isb + 1
+    JJe = JebB - JsbB + 1
+
+    if (len_trim(CS%v_trunc_file) > 0) then
+      do concurrent (JJ=1:JJe, ii=1:iie) DO_LOCALITY(local(i,J))
+        i = isb + ii - 1
+        J = JsbB + JJ - 1
+
+        dowrite(i,J) = .false.
+        trunc_col(i,J) = .false.
+        vel_report(i,J) = 3.0e8 * US%m_s_to_L_T
+      enddo
+
+      do concurrent (JJ=1:JJe)
+        do k=1,nz
+          do concurrent (ii=1:iie) DO_LOCALITY(local(i,J,CFL))
+            i = isb + ii - 1
+            J = JsbB + JJ - 1
+
+            if (abs(v(i,J,k)) < CS%vel_underflow) v(i,J,k) = 0.0
+            if (v(i,J,k) < 0.0) then
+              CFL = (-v(i,J,k) * dt) * (G%dx_Cv(i,J) * G%IareaT(i,j+1))
+            else
+              CFL = (v(i,J,k) * dt) * (G%dx_Cv(i,J) * G%IareaT(i,j))
+            endif
+            if (CFL > CS%CFL_trunc) trunc_col(i,J) = .true.
+            if (CFL > CS%CFL_report) then
+              dowrite(i,J) = .true.
+              vel_report(i,J) = min(vel_report(i,J), abs(v(i,J,k)))
+            endif
+          enddo
+        enddo
+      enddo
+
+      trunc_blk = .false. ; write_blk = .false.
+      do concurrent (JJ=1:JJe, ii=1:iie) DO_LOCALITY(reduce(.or.: trunc_blk, write_blk))
+        if (trunc_col(isb+ii-1,JsbB+JJ-1)) trunc_blk = .true.
+        if (dowrite(isb+ii-1,JsbB+JJ-1)) write_blk = .true.
+      enddo
+
+      if (write_blk) then
         do_any_write = .true.
-        vel_report(i,J) = min(vel_report(i,J), abs(v(i,J,k)))
+        do concurrent (k=1:nz, JJ=1:JJe, ii=1:iie, dowrite(isb+ii-1,JsbB+JJ-1)) DO_LOCALITY(local(i,J))
+          i = isb + ii - 1
+          J = JsbB + JJ - 1
+
+          v_old(i,J,k) = v(i,J,k)
+        enddo
       endif
-    enddo
 
-    do concurrent (J=Jsq:Jeq, i=is:ie, dowrite(i,J))
-      v_old(i,J,:) = v(i,J,:)
-    enddo
+      if (trunc_blk) then
+        ntrunc_blk = 0
+        do concurrent (k=1:nz, JJ=1:JJe, ii=1:iie) DO_LOCALITY(local(i,J) reduce(+: ntrunc_blk))
+          i = isb + ii - 1
+          J = JsbB + JJ - 1
 
-    if (trunc_any) then
-      ntrunc = 0
-      do concurrent (k=1:nz, J=Jsq:Jeq, i=is:ie) DO_LOCALITY(reduce(+: ntrunc))
-        if ((v(i,J,k) * (dt * G%dx_Cv(i,J))) * G%IareaT(i,j+1) < -CS%CFL_trunc) then
+          if ((v(i,J,k) * (dt * G%dx_Cv(i,J))) * G%IareaT(i,j+1) < -CS%CFL_trunc) then
+            v(i,J,k) = (-0.9*CS%CFL_trunc) * (G%areaT(i,j+1) / (dt * G%dx_Cv(i,J)))
+            if (((i >= G%isc) .and. (i <= G%iec) .and. (J >= G%jsc) .and. (J <= G%jec)) .and. &
+                (CS%h_v(i,J,k) > H_report)) ntrunc_blk = ntrunc_blk + 1
+          elseif ((v(i,J,k) * (dt * G%dx_Cv(i,J))) * G%IareaT(i,j) > CS%CFL_trunc) then
+            v(i,J,k) = (0.9*CS%CFL_trunc) * (G%areaT(i,j) / (dt * G%dx_Cv(i,J)))
+            if (((i >= G%isc) .and. (i <= G%iec) .and. (J >= G%jsc) .and. (J <= G%jec)) .and. &
+                (CS%h_v(i,J,k) > H_report)) ntrunc_blk = ntrunc_blk + 1
+          endif
+        enddo
+        ntrunc = ntrunc + ntrunc_blk
+      endif
+    else  ! Do not report accelerations leading to large velocities.
+      do concurrent (k=1:nz, JJ=1:JJe, ii=1:iie) DO_LOCALITY(local(i,J) reduce(+: ntrunc))
+        i = isb + ii - 1
+        J = JsbB + JJ - 1
+
+        if (abs(v(i,J,k)) < CS%vel_underflow) then ; v(i,J,k) = 0.0
+        elseif ((v(i,J,k) * (dt * G%dx_Cv(i,J))) * G%IareaT(i,j+1) < -CS%CFL_trunc) then
           v(i,J,k) = (-0.9*CS%CFL_trunc) * (G%areaT(i,j+1) / (dt * G%dx_Cv(i,J)))
           if (((i >= G%isc) .and. (i <= G%iec) .and. (J >= G%jsc) .and. (J <= G%jec)) .and. &
               (CS%h_v(i,J,k) > H_report)) ntrunc = ntrunc + 1
@@ -3640,35 +3740,20 @@ subroutine vertvisc_limit_vel(u, v, h, ADp, CDp, forces, visc, dt, G, GV, US, CS
               (CS%h_v(i,J,k) > H_report)) ntrunc = ntrunc + 1
         endif
       enddo
-      CS%ntrunc = CS%ntrunc + ntrunc
     endif
+  enddo ; enddo
+  CS%ntrunc = CS%ntrunc + ntrunc
 
-    if (do_any_write) then
-      !$omp target update from(v_old, vel_report)
-      do J=Jsq,Jeq ; do i=is,ie ; if (dowrite(i,J)) then
-        ! Call a diagnostic reporting subroutines are called if unphysically large values are found.
-        call write_v_accel(i, J, v_old, h, ADp, CDp, dt, G, GV, US, CS%PointAccel_CSp, &
-                           vel_report(i,J), forces%tauy(i,J), a=CS%a_v, hv=CS%h_v)
-      endif ; enddo ; enddo
-    endif
-  else  ! Do not report accelerations leading to large velocities.
-    ntrunc = 0
-    do concurrent (k=1:nz, J=Jsq:Jeq, i=is:ie) DO_LOCALITY(reduce(+: ntrunc))
-      if (abs(v(i,J,k)) < CS%vel_underflow) then ; v(i,J,k) = 0.0
-      elseif ((v(i,J,k) * (dt * G%dx_Cv(i,J))) * G%IareaT(i,j+1) < -CS%CFL_trunc) then
-        v(i,J,k) = (-0.9*CS%CFL_trunc) * (G%areaT(i,j+1) / (dt * G%dx_Cv(i,J)))
-        if (((i >= G%isc) .and. (i <= G%iec) .and. (J >= G%jsc) .and. (J <= G%jec)) .and. &
-            (CS%h_v(i,J,k) > H_report)) ntrunc = ntrunc + 1
-      elseif ((v(i,J,k) * (dt * G%dx_Cv(i,J))) * G%IareaT(i,j) > CS%CFL_trunc) then
-        v(i,J,k) = (0.9*CS%CFL_trunc) * (G%areaT(i,j) / (dt * G%dx_Cv(i,J)))
-        if (((i >= G%isc) .and. (i <= G%iec) .and. (J >= G%jsc) .and. (J <= G%jec)) .and. &
-            (CS%h_v(i,J,k) > H_report)) ntrunc = ntrunc + 1
-      endif
-    enddo
-    CS%ntrunc = CS%ntrunc + ntrunc
+  if (do_any_write) then
+    !$omp target update from (v_old, vel_report, dowrite)
+    do J=Jsq,Jeq ; do i=is,ie ; if (dowrite(i,J)) then
+      ! Call a diagnostic reporting subroutines are called if unphysically large values are found.
+      call write_v_accel(i, J, v_old, h, ADp, CDp, dt, G, GV, US, CS%PointAccel_CSp, &
+                         vel_report(i,J), forces%tauy(i,J), a=CS%a_v, hv=CS%h_v)
+    endif ; enddo ; enddo
   endif
 
-  !$omp target exit data map(release: u_old, v_old, dowrite, vel_report)
+  !$omp target exit data map(release: u_old, v_old, dowrite, vel_report, trunc_col)
 end subroutine vertvisc_limit_vel
 
 
