@@ -3812,8 +3812,19 @@ subroutine diag_update_remap_grids(diag_cs, alt_h, alt_T, alt_S, update_intensiv
   real, dimension(diag_cs%G%isd:diag_cS%G%ied, diag_cs%G%jsd:diag_cS%G%jed, diag_cs%GV%ke) :: &
     dz_diag     ! Layer vertical extents for remapping [Z ~> m]
   logical :: update_intensive_local, update_extensive_local, dz_diag_needed
+  logical :: any_configured ! True if any diagnostic vertical coordinate is in use
 
   if (diag_cs%show_call_tree) call callTree_enter("diag_update_remap_grids()")
+
+  ! Skip remapped grid update if no diagnostic requests them
+  any_configured = .false.
+  do m=1,diag_cs%num_diag_coords
+    if (diag_remap_axes_configured(diag_cs%diag_remap_cs(m))) any_configured = .true.
+  enddo
+  if (.not.any_configured) then
+    if (diag_cs%show_call_tree) call callTree_leave("diag_update_remap_grids()")
+    return
+  endif
 
   ! Set values based on optional input arguments
   if (present(alt_h)) then
