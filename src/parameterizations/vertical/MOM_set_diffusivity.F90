@@ -2309,9 +2309,13 @@ subroutine set_BBL_TKE(u, v, h, tv, fluxes, visc, G, GV, US, CS, OBC)
   integer :: nii ! i block size for array calculations [nondim]
   integer :: njj ! j block size for array calculations [nondim]
 
+  !   Consecutive blocks overlap by one velocity face, so nii by njj faces cover only nii-1 by njj-1
+  ! tracer cells.  The default 0 therefore resolves to one more than the domain, and a size of 1 is
+  ! raised to 2 so that each block covers at least one tracer cell.
   nii = CS%niblock ; njj = CS%njblock
-  if (nii == 0) nii = G%iec-G%isc+1
-  if (njj == 0) njj = G%jec-G%jsc+1
+  if (nii == 0) nii = G%iec-G%isc+2
+  if (njj == 0) njj = G%jec-G%jsc+2
+  nii = max(nii, 2) ; njj = max(njj, 2)
 
   call set_BBL_TKE_block(u, v, h, tv, fluxes, visc, G, GV, US, CS, OBC, nii, njj)
 
@@ -2335,17 +2339,15 @@ subroutine set_BBL_TKE_block(u, v, h, tv, fluxes, visc, G, GV, US, CS, OBC, nii,
                                                   !! boundary layer properties and related fields.
   type(set_diffusivity_CS), intent(in)    :: CS   !< Diffusivity control structure
   type(ocean_OBC_type),     pointer       :: OBC  !< Open boundaries control structure.
-  integer,                  intent(in)    :: nii  !< Size of the i-block [nondim].
-  integer,                  intent(in)    :: njj  !< Size of the j-block [nondim].
+  integer,                  intent(in)    :: nii  !< Size of the i-block in u faces, at least 2 [nondim].
+  integer,                  intent(in)    :: njj  !< Size of the j-block in v faces, at least 2 [nondim].
 
   ! This subroutine calculates several properties related to bottom
   ! boundary layer turbulence.
 
-  real, dimension(0:nii,njj) :: &
+  real, dimension(nii,njj) :: &
     ustar, &      ! bottom boundary layer piston velocity [H T-1 ~> m s-1 or kg m-2 s-1].
-    u2_bbl        ! square of the mean zonal velocity in the BBL [L2 T-2 ~> m2 s-2]
-
-  real, dimension(nii,0:njj) :: &
+    u2_bbl, &     ! square of the mean zonal velocity in the BBL [L2 T-2 ~> m2 s-2]
     vstar, & ! ustar at at v-points [H T-1 ~> m s-1 or kg m-2 s-1].
     v2_bbl   ! square of average meridional velocity in BBL [L2 T-2 ~> m2 s-2]
   real, dimension(SZI_(G),SZJ_(G),SZK_(GV)) :: &
@@ -2404,7 +2406,9 @@ subroutine set_BBL_TKE_block(u, v, h, tv, fluxes, visc, G, GV, US, CS, OBC, nii,
   ! Find the vertical distances across layers.
   call thickness_to_dz(h, tv, dz, G, GV, US, halo_size=1, do_offload=.true.)
 
-  ! The open state of the OBC segments is only available on the host.
+  !   These open OBC directions were once found inside the velocity loops below, but OBC%segment is
+  ! not on the device, so they are found here on the host.  If the segments become device-resident,
+  ! this logic could move back into those loops and OBC_dir_u and OBC_dir_v could be removed.
   if (local_open_v_BC) then
     do J=js-1,je ; do i=is,ie
       OBC_dir_v(i,J) = 0
@@ -2434,14 +2438,15 @@ subroutine set_BBL_TKE_block(u, v, h, tv, fluxes, visc, G, GV, US, CS, OBC, nii,
     !$omp target update to(OBC_dir_u)
   endif
 
-  do jsb=js,je,njj ; do isb=is,ie,nii
-    jeb = min(je, jsb + njj - 1) ; ieb = min(ie, isb + nii - 1)
+  ! Stride by nii-1 and njj-1 so that the faces on both sides of each tracer cell are in the block.
+  do jsb=js,je,njj-1 ; do isb=is,ie,nii-1
+    jeb = min(je, jsb + njj - 2) ; ieb = min(ie, isb + nii - 2)
     jje = jeb-jsb+1 ; iie = ieb-isb+1
 
     ! Determine ustar and the square magnitude of the velocity in the bottom boundary layer.
     ! Together these give the TKE source and vertical decay scale.
-    do concurrent (jj=0:jje, ii=1:iie) DO_LOCALITY(local(i, j, k, do_col, vhtot, htot, hvel, obc_dir))
-      i = isb + ii - 1 ; J = jsb + jj - 1
+    do concurrent (jj=1:jje+1, ii=1:iie) DO_LOCALITY(local(i, j, k, do_col, vhtot, htot, hvel, obc_dir))
+      i = isb + ii - 1 ; J = jsb + jj - 2
       do_col = .false. ; vstar(ii,jj) = 0.0 ; vhtot = 0.0 ; htot = 0.0
       if (use_Kv_bbl_v) then
         if ((G%mask2dCv(i,J) > 0.0) .and. (cdrag_sqrt*visc%bbl_thick_v(i,J) > 0.0)) then
@@ -2479,8 +2484,8 @@ subroutine set_BBL_TKE_block(u, v, h, tv, fluxes, visc, G, GV, US, CS, OBC, nii,
       endif
     enddo
 
-    do concurrent (jj=1:jje, ii=0:iie) DO_LOCALITY(local(i, j, k, do_col, uhtot, htot, hvel, obc_dir))
-      I = isb + ii - 1 ; j = jsb + jj - 1
+    do concurrent (jj=1:jje, ii=1:iie+1) DO_LOCALITY(local(i, j, k, do_col, uhtot, htot, hvel, obc_dir))
+      I = isb + ii - 2 ; j = jsb + jj - 1
       do_col = .false. ; ustar(ii,jj) = 0.0 ; uhtot = 0.0 ; htot = 0.0
       if (use_bbl_thick_u) then
         if ((G%mask2dCu(I,j) > 0.0) .and. (cdrag_sqrt*visc%bbl_thick_u(I,j) > 0.0))  then
@@ -2519,22 +2524,23 @@ subroutine set_BBL_TKE_block(u, v, h, tv, fluxes, visc, G, GV, US, CS, OBC, nii,
 
     do concurrent (jj=1:jje, ii=1:iie) DO_LOCALITY(local(i, j))
       i = isb + ii - 1 ; j = jsb + jj - 1
+      ! The faces at I-1 and J-1 are at ii and jj in the face arrays, and those at I and J at ii+1 and jj+1.
       visc%ustar_BBL(i,j) = sqrt(0.5*G%IareaT(i,j) * &
-                (((G%areaCu(I-1,j)*(ustar(ii-1,jj)*ustar(ii-1,jj))) + &
-                  (G%areaCu(I,j)*(ustar(ii,jj)*ustar(ii,jj)))) + &
-                 ((G%areaCv(i,J-1)*(vstar(ii,jj-1)*vstar(ii,jj-1))) + &
-                  (G%areaCv(i,J)*(vstar(ii,jj)*vstar(ii,jj)))) ) )
+                (((G%areaCu(I-1,j)*(ustar(ii,jj)*ustar(ii,jj))) + &
+                  (G%areaCu(I,j)*(ustar(ii+1,jj)*ustar(ii+1,jj)))) + &
+                 ((G%areaCv(i,J-1)*(vstar(ii,jj)*vstar(ii,jj))) + &
+                  (G%areaCv(i,J)*(vstar(ii,jj+1)*vstar(ii,jj+1)))) ) )
       visc%BBL_meanKE_loss(i,j) = cdrag_sqrt * &
-                 ((((G%areaCu(I-1,j)*(ustar(ii-1,jj)*u2_bbl(ii-1,jj))) + &
-                    (G%areaCu(I,j) * (ustar(ii,jj)*u2_bbl(ii,jj)))) + &
-                   ((G%areaCv(i,J-1)*(vstar(ii,jj-1)*v2_bbl(ii,jj-1))) + &
-                    (G%areaCv(i,J) * (vstar(ii,jj)*v2_bbl(ii,jj)))) )*G%IareaT(i,j))
+                 ((((G%areaCu(I-1,j)*(ustar(ii,jj)*u2_bbl(ii,jj))) + &
+                    (G%areaCu(I,j) * (ustar(ii+1,jj)*u2_bbl(ii+1,jj)))) + &
+                   ((G%areaCv(i,J-1)*(vstar(ii,jj)*v2_bbl(ii,jj))) + &
+                    (G%areaCv(i,J) * (vstar(ii,jj+1)*v2_bbl(ii,jj+1)))) )*G%IareaT(i,j))
       ! The following line could be omitted if SET_DIFF_ANSWER_DATE > 20250301 and EPBL_BBL_EFFIC_BUG is false.
       visc%BBL_meanKE_loss_sqrtCd(i,j) = &
-                 ((((G%areaCu(I-1,j)*(ustar(ii-1,jj)*u2_bbl(ii-1,jj))) + &
-                    (G%areaCu(I,j) * (ustar(ii,jj)*u2_bbl(ii,jj)))) + &
-                   ((G%areaCv(i,J-1)*(vstar(ii,jj-1)*v2_bbl(ii,jj-1))) + &
-                    (G%areaCv(i,J) * (vstar(ii,jj)*v2_bbl(ii,jj)))) )*G%IareaT(i,j))
+                 ((((G%areaCu(I-1,j)*(ustar(ii,jj)*u2_bbl(ii,jj))) + &
+                    (G%areaCu(I,j) * (ustar(ii+1,jj)*u2_bbl(ii+1,jj)))) + &
+                   ((G%areaCv(i,J-1)*(vstar(ii,jj)*v2_bbl(ii,jj))) + &
+                    (G%areaCv(i,J) * (vstar(ii,jj+1)*v2_bbl(ii,jj+1)))) )*G%IareaT(i,j))
     enddo
   enddo ; enddo
 
@@ -2858,6 +2864,10 @@ subroutine set_diffusivity_init(Time, G, GV, US, param_file, diag, CS, int_tide_
                  units="nondim", default=0.0, do_not_log=.true.)
     call get_param(param_file, mdl, "EPBL_BBL_USE_MSTAR", CS%ePBL_BBL_mstar, &
                  default=.false., do_not_log=.true.)
+    if (((CS%BBL_effic > 0.0) .or. (CS%ePBL_BBL_effic > 0.0) .or. CS%ePBL_BBL_mstar) .and. &
+        ((CS%niblock == 1) .or. (CS%njblock == 1))) &
+      call MOM_error(WARNING, "set_diffusivity_init: set_BBL_TKE needs blocks of at least 2 "//&
+                     "points, so it uses 2 where SET_DIFF_NIBLOCK or SET_DIFF_NJBLOCK is 1.")
     call get_param(param_file, mdl, "BBL_MIXING_MAX_DECAY", decay_length, &
                  "The maximum decay scale for the BBL diffusion, or 0 to allow the mixing "//&
                  "to penetrate as far as stratification and rotation permit.  The default "//&
