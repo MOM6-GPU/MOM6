@@ -1109,7 +1109,7 @@ subroutine vertvisc(u, v, h, forces, visc, dt, OBC, ADp, CDp, G, GV, US, CS, &
   !$omp target exit data map(delete: c1)
 
   !$omp target exit data map(from: ADp%du_dt_str, ADp%dv_dt_str)
-  !$omp target exit data map(delete: ADp)
+  !$omp target exit data map(release: ADp)
   !$omp target exit data map(delete: surface_stress)
 
   ! Here the velocities associated with open boundary conditions are applied.
