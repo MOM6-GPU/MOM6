@@ -1233,11 +1233,20 @@ subroutine Calc_kappa_shear_vertex(u_in, v_in, h, T_in, S_in, tv, p_surf, kappa_
 
   ! Set the diffusivities in tracer columns from the values at vertices.
 
+#ifdef IFX_WORKAROUNDS_MOM6
+  ! Avoid an ifx ICE, see bug_reports/ifx_dc_dtype_bounds_ice
+  associate(ifx_jsc=>G%jsc, ifx_jec=>G%jec, ifx_isc=>G%isc, ifx_iec=>G%iec)
+  do concurrent (j=ifx_jsc:ifx_jec, i=ifx_isc:ifx_iec)
+#else
   do concurrent( j=G%jsc:G%jec, i=G%isc:G%iec )
+#endif
     ! The turbulent length scales (and hence turbulent diffusivity) should always go to 0 at the top and bottom.
     kappa_io(i,j,1) = 0.0
     kappa_io(i,j,nz+1) = 0.0
   enddo
+#ifdef IFX_WORKAROUNDS_MOM6
+  end associate
+#endif
   if (CS%VS_ThicknessMean) then
     ! This conversion factor is required to allow for arbitrary fractional powers of the diffusivities.
     mks_to_HZ_T = 1.0 /  GV%HZ_T_to_MKS
@@ -1300,17 +1309,35 @@ subroutine Calc_kappa_shear_vertex(u_in, v_in, h, T_in, S_in, tv, p_surf, kappa_
       endif
     enddo ; enddo ! end of the i- and j-block loops
   elseif (CS%VS_GeometricMean) then   ! The geometic mean diffusivities are not thickness weighted.
+#ifdef IFX_WORKAROUNDS_MOM6
+    ! Avoid an ifx ICE, see bug_reports/ifx_dc_dtype_bounds_ice
+    associate(ifx_jsc=>G%jsc, ifx_jec=>G%jec, ifx_isc=>G%isc, ifx_iec=>G%iec)
+    do concurrent (K=2:nz, j=ifx_jsc:ifx_jec, i=ifx_isc:ifx_iec)
+#else
     do concurrent( K=2:nz, j=G%jsc:G%jec, i=G%isc:G%iec )
+#endif
       kappa_io(i,j,K) = G%mask2dT(i,j) * sqrt(sqrt( &
             (max(kappa_vertex(I-1,J-1,K),CS%VS_GeoMean_Kdmin) * max(kappa_vertex(I,J,K),CS%VS_GeoMean_Kdmin)) * &
             (max(kappa_vertex(I-1,J,K),CS%VS_GeoMean_Kdmin) * max(kappa_vertex(I,J-1,K),CS%VS_GeoMean_Kdmin)) ))
     enddo
+#ifdef IFX_WORKAROUNDS_MOM6
+    end associate
+#endif
   else   ! Use a non-thickness weighted arithmetic mean.
+#ifdef IFX_WORKAROUNDS_MOM6
+    ! Avoid an ifx ICE, see bug_reports/ifx_dc_dtype_bounds_ice
+    associate(ifx_jsc=>G%jsc, ifx_jec=>G%jec, ifx_isc=>G%isc, ifx_iec=>G%iec)
+    do concurrent (K=2:nz, j=ifx_jsc:ifx_jec, i=ifx_isc:ifx_iec)
+#else
     do concurrent( K=2:nz, j=G%jsc:G%jec, i=G%isc:G%iec )
+#endif
       kappa_io(i,j,K) = G%mask2dT(i,j) * 0.25 * &
                        ((kappa_vertex(I-1,J-1,K) + kappa_vertex(I,J,K)) +&
                         (kappa_vertex(I-1,J,K) + kappa_vertex(I,J-1,K)))
     enddo
+#ifdef IFX_WORKAROUNDS_MOM6
+    end associate
+#endif
   endif
 
   !   The checksums and the diagnostics below all read host memory, so anything they touch has to

@@ -422,21 +422,49 @@ subroutine tracer_hordiff(h, dt, MEKE, VarMix, visc, G, GV, US, CS, Reg, tv, do_
       do k=1,nz ; do j=js,je ; do I=is-1,ie
         Reg%Tr(m)%df_x(I,j,k) = 0.0
       enddo ; enddo ; enddo
+#ifdef IFX_WORKAROUNDS_MOM6
+      ! Avoid ifx transferring the whole base object, see bug_reports/ifx_update_component_copies_parent
+      associate(ifx_upd1=>Reg%Tr(m)%df_x)
+      !$omp target update to(ifx_upd1)
+      end associate
+#else
       !$omp target update to(Reg%Tr(m)%df_x)
+#endif
     endif
     if (associated(Reg%Tr(m)%df_y)) then
       do k=1,nz ; do J=js-1,je ; do i=is,ie
         Reg%Tr(m)%df_y(i,J,k) = 0.0
       enddo ; enddo ; enddo
+#ifdef IFX_WORKAROUNDS_MOM6
+      ! Avoid ifx transferring the whole base object, see bug_reports/ifx_update_component_copies_parent
+      associate(ifx_upd1=>Reg%Tr(m)%df_y)
+      !$omp target update to(ifx_upd1)
+      end associate
+#else
       !$omp target update to(Reg%Tr(m)%df_y)
+#endif
     endif
     if (associated(Reg%Tr(m)%df2d_x)) then
       do j=js,je ; do I=is-1,ie ; Reg%Tr(m)%df2d_x(I,j) = 0.0 ; enddo ; enddo
+#ifdef IFX_WORKAROUNDS_MOM6
+      ! Avoid ifx transferring the whole base object, see bug_reports/ifx_update_component_copies_parent
+      associate(ifx_upd1=>Reg%Tr(m)%df2d_x)
+      !$omp target update to(ifx_upd1)
+      end associate
+#else
       !$omp target update to(Reg%Tr(m)%df2d_x)
+#endif
     endif
     if (associated(Reg%Tr(m)%df2d_y)) then
       do J=js-1,je ; do i=is,ie ; Reg%Tr(m)%df2d_y(i,J) = 0.0 ; enddo ; enddo
+#ifdef IFX_WORKAROUNDS_MOM6
+      ! Avoid ifx transferring the whole base object, see bug_reports/ifx_update_component_copies_parent
+      associate(ifx_upd1=>Reg%Tr(m)%df2d_y)
+      !$omp target update to(ifx_upd1)
+      end associate
+#else
       !$omp target update to(Reg%Tr(m)%df2d_y)
+#endif
     endif
   enddo
 

@@ -13,13 +13,24 @@ public :: diag_buffer_unit_tests_2d, diag_buffer_unit_tests_3d
 type, abstract :: buffer_base
 end type buffer_base
 
+! Avoid an ifx ICE when mapping any structure that contains these types (e.g. MOM_control_struct
+! via diag_ctrl), see bug_reports/ifx_map_extended_type_array_ice.  buffer_base is never used
+! polymorphically, so dropping the extension does not change behavior.
 !> Holds a 2d field
+#ifdef IFX_WORKAROUNDS_MOM6
+type :: buffer_2d
+#else
 type, extends(buffer_base) :: buffer_2d
+#endif
   real, dimension(:,:), allocatable :: field !< The actual 2d field to be stored [arbitrary]
 end type buffer_2d
 
 !> Holds a 3d field
+#ifdef IFX_WORKAROUNDS_MOM6
+type :: buffer_3d
+#else
 type, extends(buffer_base) :: buffer_3d
+#endif
   real, dimension(:,:,:), allocatable :: field !< The actual 3d field to be stored [arbitrary]
 end type buffer_3d
 

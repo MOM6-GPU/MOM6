@@ -690,9 +690,18 @@ subroutine zonal_mass_flux(u, h_in, h_W, h_E, uh, dt, G, GV, US, CS, OBC, por_fa
   endif ; endif
 
   if (present(du_cor)) then
+#ifdef IFX_WORKAROUNDS_MOM6
+    ! Avoid an ifx ICE, see bug_reports/ifx_dc_dtype_bounds_ice
+    associate(ifx_jsd=>G%jsd, ifx_jed=>G%jed, ifx_isdb=>G%IsdB, ifx_iedb=>G%IedB)
+    do concurrent (j=ifx_jsd:ifx_jed, I=ifx_isdb:ifx_iedb)
+#else
     do concurrent (j=G%jsd:G%jed, I=G%IsdB:G%IedB)
+#endif
       du_cor(I,j) = 0.0
     enddo
+#ifdef IFX_WORKAROUNDS_MOM6
+    end associate
+#endif
   endif
 
   if (present(LB_in)) then
@@ -1482,6 +1491,10 @@ subroutine zonal_flux_adjust(u, h_in, h_W, h_E, uhbt, uh_tot_0, duhdu_tot_0, &
   integer :: i, j, k, nz, itt, II, jj, IIe, jje
   logical :: domore, do_ij(nIIB,njj)
   logical :: local_open_BC ! True if there are open OBC points on this PE [nondim].
+#ifdef IFX_WORKAROUNDS_MOM6
+  type(ocean_OBC_type), pointer :: OBC_loc ! OBC if present, otherwise null, see
+                           ! bug_reports/ifx_absent_optional_in_target_region
+#endif
   integer, parameter :: max_itts = 20
 
   !$omp target enter data &
@@ -1491,6 +1504,10 @@ subroutine zonal_flux_adjust(u, h_in, h_W, h_E, uhbt, uh_tot_0, duhdu_tot_0, &
   jje = jeb - jsb + 1
   local_open_BC = .false.
   if (present(OBC)) then ; if (associated(OBC)) local_open_BC = OBC%open_u_BCs_exist_globally ; endif
+#ifdef IFX_WORKAROUNDS_MOM6
+  ! ifx dereferences optional arguments used in offloaded loops even if they are absent.
+  OBC_loc => NULL() ; if (present(OBC)) OBC_loc => OBC
+#endif
 
   tol_vel = CS%tol_vel
 
@@ -1570,11 +1587,19 @@ subroutine zonal_flux_adjust(u, h_in, h_W, h_E, uhbt, uh_tot_0, duhdu_tot_0, &
               G%IareaT(i,j), G%IareaT(i+1,j), G%IdxT(i,j), G%IdxT(i+1,j), &
               dt, CS%vol_CFL, por_face_areaU(I,j,k), CS%h_marg_min)
 
+#ifdef IFX_WORKAROUNDS_MOM6
+          if (local_open_BC) &
+            call flux_elem_OBC(u_new, h_in(i,j,k), h_in(i+1,j,k), &
+                uh, duhdu, visc_rem(II,jj,k), &
+                por_face_areaU(I,j,k), G%dy_Cu(I,j), OBC_loc, OBC_loc%segnum_u(I,j), &
+                CS%h_marg_min)
+#else
           if (local_open_BC) &
             call flux_elem_OBC(u_new, h_in(i,j,k), h_in(i+1,j,k), &
                 uh, duhdu, visc_rem(II,jj,k), &
                 por_face_areaU(I,j,k), G%dy_Cu(I,j), OBC, OBC%segnum_u(I,j), &
                 CS%h_marg_min)
+#endif
 
           if (present(uh_3d)) uh_3d(II,jj,k) = uh
           uh_err(II,jj) = uh_err(II,jj) + uh
@@ -1934,9 +1959,18 @@ subroutine meridional_mass_flux(v, h_in, h_S, h_N, vh, dt, G, GV, US, CS, OBC, p
   endif ; endif
 
   if (present(dv_cor)) then
+#ifdef IFX_WORKAROUNDS_MOM6
+    ! Avoid an ifx ICE, see bug_reports/ifx_dc_dtype_bounds_ice
+    associate(ifx_jsdb=>G%jsdB, ifx_jedb=>G%jedB, ifx_isd=>G%isd, ifx_ied=>G%ied)
+    do concurrent (J=ifx_jsdb:ifx_jedb, i=ifx_isd:ifx_ied)
+#else
     do concurrent (J=G%jsdB:G%jedB, i=G%isd:G%ied)
+#endif
       dv_cor(i,J) = 0.0
     enddo
+#ifdef IFX_WORKAROUNDS_MOM6
+    end associate
+#endif
   endif
 
   if (present(LB_in)) then
@@ -2588,6 +2622,10 @@ subroutine meridional_flux_adjust(v, h_in, h_S, h_N, vhbt, vh_tot_0, dvhdv_tot_0
   real :: tol_vel ! The tolerance for velocity in the current iteration [L T-1 ~> m s-1].
   integer :: i, j, k, nz, itt, ii, JJ, iie, JJe
   logical :: domore, do_ij(nii,nJJB), local_open_BC
+#ifdef IFX_WORKAROUNDS_MOM6
+  type(ocean_OBC_type), pointer :: OBC_loc ! OBC if present, otherwise null, see
+                           ! bug_reports/ifx_absent_optional_in_target_region
+#endif
   integer, parameter :: max_itts = 20
 
   !$omp target enter data &
@@ -2596,6 +2634,10 @@ subroutine meridional_flux_adjust(v, h_in, h_S, h_N, vhbt, vh_tot_0, dvhdv_tot_0
   if (present(OBC)) then ; if (associated(OBC)) then
     local_open_BC = OBC%open_v_BCs_exist_globally
   endif ; endif
+#ifdef IFX_WORKAROUNDS_MOM6
+  ! ifx dereferences optional arguments used in offloaded loops even if they are absent.
+  OBC_loc => NULL() ; if (present(OBC)) OBC_loc => OBC
+#endif
 
   nz = GV%ke
   iie = ieb - isb + 1
@@ -2677,11 +2719,19 @@ subroutine meridional_flux_adjust(v, h_in, h_S, h_N, vhbt, vh_tot_0, dvhdv_tot_0
               G%IareaT(i,J), G%IareaT(i,J+1), G%IdyT(i,J), G%IdyT(i,J+1), dt, &
               CS%vol_CFL, por_face_areaV(i,J,k), CS%h_marg_min)
 
+#ifdef IFX_WORKAROUNDS_MOM6
+          if (local_open_BC) &
+            call flux_elem_OBC(v_new, h_in(i,J,k), h_in(i,J+1,k), &
+                vh, dvhdv, visc_rem(ii,JJ,k), &
+                por_face_areaV(i,J,k), G%dx_Cv(i,J), OBC_loc, OBC_loc%segnum_v(i,J), &
+                CS%h_marg_min)
+#else
           if (local_open_BC) &
             call flux_elem_OBC(v_new, h_in(i,J,k), h_in(i,J+1,k), &
                 vh, dvhdv, visc_rem(ii,JJ,k), &
                 por_face_areaV(i,J,k), G%dx_Cv(i,J), OBC, OBC%segnum_v(i,J), &
                 CS%h_marg_min)
+#endif
 
           if (present(vh_3d)) vh_3d(ii,JJ,k) = vh
           vh_err(ii,JJ) = vh_err(ii,JJ) + vh

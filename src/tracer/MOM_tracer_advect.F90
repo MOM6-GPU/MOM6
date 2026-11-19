@@ -1148,11 +1148,21 @@ subroutine advect_y(Tr, hprev, vhr, vh_neglect, OBC, domore_v, domore_k, ntr, Id
 
   ! make a copy of the tracers in case values need to be overridden for OBCs
 
+#ifdef IFX_WORKAROUNDS_MOM6
+  ! Avoid an ifx ICE, see bug_reports/ifx_dc_dtype_bounds_ice
+  associate(ifx_jsd=>G%jsd, ifx_jed=>G%jed, ifx_isd=>G%isd, ifx_ied=>G%ied)
+  do concurrent (kk=1:kke, j=ifx_jsd:ifx_jed, m=1:ntr, i=ifx_isd:ifx_ied, &
+                 (domore_k(ksb + kk - 1) > 0) .and. advect_this_tracer(m)) DO_LOCALITY(local(k))
+#else
   do concurrent (kk=1:kke, j=G%jsd:G%jed, m=1:ntr, i=G%isd:G%ied, &
                  (domore_k(ksb + kk - 1) > 0) .and. advect_this_tracer(m)) DO_LOCALITY(local(k))
+#endif
     k = ksb + kk - 1
     T_tmp(i,m,j,kk) = Tr(m)%t(i,j,k)
   enddo
+#ifdef IFX_WORKAROUNDS_MOM6
+  end associate
+#endif
 
   ! loop through open boundaries and recalculate flux terms
   if (associated(OBC)) then ; if (OBC%OBC_pe) then

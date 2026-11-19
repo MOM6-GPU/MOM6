@@ -1406,6 +1406,7 @@ end subroutine mixedlayer_restrat_Bodner
 !! Note that if \f$ tau=0 \f$, then the running mean equals the signal. Thus,
 !! rmean2ts with tau_growing=0 recovers the "resetting running mean" used in OM4.
 real elemental function rmean2ts(signal, filtered, tau_growing, tau_decaying, dt)
+  !$omp declare target
   ! Arguments
   real, intent(in) :: signal       ! Unfiltered signal in arbitrary units [A]
   real, intent(in) :: filtered     ! Current value of running mean in the same arbitrary units [A]

@@ -1020,9 +1020,18 @@ subroutine absorbRemainingSW_3d(G, GV, US, h, opacity_band, nsw, optics, dt, H_l
   ! h_heat, T_chg and Pen_SW_rem stay thread-local scalars and the vertical recurrences that
   ! they carry remain sequential.  T_chg_above spans both vertical sweeps, so it is a 3-d array
   ! rather than a per-thread automatic.
+#ifdef IFX_WORKAROUNDS_MOM6
+  ! exp_repro has !$omp declare target only in its submodule body (see
+  ! bug_reports/ifx_declare_target_separate_module_procedure), so ifx will not offload a
+  ! do concurrent loop that calls it.  An explicit target region can call it.
+  !$omp target teams loop collapse(2) private(i, j, k, n, h_heat, T_chg, Pen_SW_rem, SW_trans, &
+  !$omp   unabsorbed, opt_depth, exp_OD, heat_bnd, SWa, coSWa_frac, TKE_lay)
+  do jj=1,jje ; do ii=1,iie
+#else
   do concurrent (jj=1:jje, ii=1:iie) DO_LOCALITY(local(i, j, k, n, h_heat, T_chg, Pen_SW_rem, SW_trans )) &
                                    & DO_LOCALITY(local(unabsorbed, opt_depth, exp_OD, heat_bnd, SWa)) &
                                    & DO_LOCALITY(local(coSWa_frac, TKE_lay))
+#endif
     i = is + ii - 1 ; j = js + jj - 1
     h_heat = 0.0
 
@@ -1154,7 +1163,11 @@ subroutine absorbRemainingSW_3d(G, GV, US, h, opacity_band, nsw, optics, dt, H_l
         T_chg = T_chg + T_chg_above(i,j,k)
       enddo ! k-loop of the upward sweep
     endif ! absorbAllSW .or. adjustAbsorptionProfile
+#ifdef IFX_WORKAROUNDS_MOM6
+  enddo ; enddo
+#else
   enddo ! i- and j-loop over columns
+#endif
 
   !$omp target exit data map(delete: T_chg_above)
 

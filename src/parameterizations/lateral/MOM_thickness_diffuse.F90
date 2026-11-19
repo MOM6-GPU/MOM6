@@ -895,14 +895,32 @@ subroutine thickness_diffuse_full(h, e, Kh_u, Kh_v, tv, uhD, vhD, cg1, dt, G, GV
   !$omp target enter data if(associated(tv%p_surf)) map(to: tv%p_surf)
   !$omp target enter data if(allocated(MEKE%GM_src)) map(to: MEKE%GM_src)
 
+#ifdef IFX_WORKAROUNDS_MOM6
+  ! Avoid an ifx ICE, see bug_reports/ifx_dc_dtype_bounds_ice
+  associate(ifx_jsd=>G%jsd, ifx_jed=>G%jed, ifx_isdb=>G%isdB, ifx_iedb=>G%iedB)
+  do concurrent (k=1:nz+1, j=ifx_jsd:ifx_jed, i=ifx_isdb:ifx_iedb)
+#else
   do concurrent (k=1:nz+1, j=G%jsd:G%jed, i=G%isdB:G%iedB)
+#endif
     Slope_x_PE(i,j,k) = 0.0
     hN2_x_PE(i,j,k) = 0.0
   enddo
+#ifdef IFX_WORKAROUNDS_MOM6
+  end associate
+#endif
+#ifdef IFX_WORKAROUNDS_MOM6
+  ! Avoid an ifx ICE, see bug_reports/ifx_dc_dtype_bounds_ice
+  associate(ifx_jsdb=>G%jsdB, ifx_jedb=>G%jedB, ifx_isd=>G%isd, ifx_ied=>G%ied)
+  do concurrent (k=1:nz+1, j=ifx_jsdb:ifx_jedb, i=ifx_isd:ifx_ied)
+#else
   do concurrent (k=1:nz+1, j=G%jsdB:G%jedB, i=G%isd:G%ied)
+#endif
     Slope_y_PE(i,j,k) = 0.0
     hN2_y_PE(i,j,k) = 0.0
   enddo
+#ifdef IFX_WORKAROUNDS_MOM6
+  end associate
+#endif
 
   find_work = allocated(MEKE%GM_src)
   find_work = (allocated(CS%GMwork) .or. find_work)

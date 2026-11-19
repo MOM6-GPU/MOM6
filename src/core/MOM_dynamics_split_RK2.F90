@@ -435,15 +435,42 @@ subroutine step_MOM_dyn_split_RK2(u_inst, v_inst, h, tv, visc, Time_local, dt, f
   !$omp target enter data map(alloc: u_bc_accel, v_bc_accel, eta_pred, uh_in, vh_in)
   !$omp target enter data map(alloc: up, vp, hp, dz, h_tmp)
 
+#ifdef IFX_WORKAROUNDS_MOM6
+  ! Avoid an ifx ICE, see bug_reports/ifx_dc_dtype_bounds_ice
+  associate(ifx_jsd=>G%jsd, ifx_jed=>G%jed, ifx_isdb=>G%IsdB, ifx_iedb=>G%IedB)
+  do concurrent (k=1:nz, j=ifx_jsd:ifx_jed, I=ifx_isdb:ifx_iedb)
+#else
   do concurrent (k=1:nz, j=G%jsd:G%jed, I=G%IsdB:G%IedB)
+#endif
     up(I,j,k) = 0.0
   enddo
+#ifdef IFX_WORKAROUNDS_MOM6
+  end associate
+#endif
+#ifdef IFX_WORKAROUNDS_MOM6
+  ! Avoid an ifx ICE, see bug_reports/ifx_dc_dtype_bounds_ice
+  associate(ifx_jsdb=>G%JsdB, ifx_jedb=>G%JedB, ifx_isd=>G%isd, ifx_ied=>G%ied)
+  do concurrent (k=1:nz, J=ifx_jsdb:ifx_jedb, i=ifx_isd:ifx_ied)
+#else
   do concurrent (k=1:nz, J=G%JsdB:G%JedB, i=G%isd:G%ied)
+#endif
     vp(i,J,k) = 0.0
   enddo
+#ifdef IFX_WORKAROUNDS_MOM6
+  end associate
+#endif
+#ifdef IFX_WORKAROUNDS_MOM6
+  ! Avoid an ifx ICE, see bug_reports/ifx_dc_dtype_bounds_ice
+  associate(ifx_jsd=>G%jsd, ifx_jed=>G%jed, ifx_isd=>G%isd, ifx_ied=>G%ied)
+  do concurrent (k=1:nz, j=ifx_jsd:ifx_jed, i=ifx_isd:ifx_ied)
+#else
   do concurrent (k=1:nz, j=G%jsd:G%jed, i=G%isd:G%ied)
+#endif
     hp(i,j,k) = h(i,j,k)
   enddo
+#ifdef IFX_WORKAROUNDS_MOM6
+  end associate
+#endif
   ! TODO: hp needs accurate +/-2 halos.
 
   ! Update CFL truncation value as function of time
@@ -528,7 +555,14 @@ subroutine step_MOM_dyn_split_RK2(u_inst, v_inst, h, tv, visc, Time_local, dt, f
                      CS%ALE_CSp, CS%ADp, p_surf, CS%pbce, CS%eta_PF)
 
   if (dyn_p_surf) then
+#ifdef IFX_WORKAROUNDS_MOM6
+    ! Avoid ifx transferring the whole base object, see bug_reports/ifx_update_component_copies_parent
+    associate(ifx_upd1=>CS%eta_PF)
+    !$omp target update from(ifx_upd1)
+    end associate
+#else
     !$omp target update from(CS%eta_PF)
+#endif
     pres_to_eta = 1.0 / (GV%g_Earth * GV%H_to_RZ)
     !$OMP parallel do default(shared)
     do j=Jsq,Jeq+1 ; do i=Isq,Ieq+1
@@ -541,7 +575,14 @@ subroutine step_MOM_dyn_split_RK2(u_inst, v_inst, h, tv, visc, Time_local, dt, f
     Use_Stokes_PGF = associated(Waves)
     if (Use_Stokes_PGF) Use_Stokes_PGF = Waves%Stokes_PGF
     if (Use_Stokes_PGF) then
+#ifdef IFX_WORKAROUNDS_MOM6
+      ! Avoid ifx transferring the whole base object, see bug_reports/ifx_update_component_copies_parent
+      associate(ifx_upd1=>CS%PFu, ifx_upd2=>CS%PFv)
+      !$omp target update from(h, u_inst, v_inst, ifx_upd1, ifx_upd2)
+      end associate
+#else
       !$omp target update from(h, u_inst, v_inst, CS%PFu, CS%PFv)
+#endif
       call thickness_to_dz(h, tv, dz, G, GV, US, halo_size=1)
       call Stokes_PGF(G, GV, US, dz, u_inst, v_inst, CS%PFu_Stokes, CS%PFv_Stokes, Waves)
 
@@ -571,7 +612,14 @@ subroutine step_MOM_dyn_split_RK2(u_inst, v_inst, h, tv, visc, Time_local, dt, f
   endif ; endif
 
   if (associated(CS%OBC) .and. CS%debug_OBC) then
+#ifdef IFX_WORKAROUNDS_MOM6
+    ! Avoid ifx transferring the whole base object, see bug_reports/ifx_update_component_copies_parent
+    associate(ifx_upd1=>CS%PFu, ifx_upd2=>CS%PFv)
+    !$omp target update from(ifx_upd1, ifx_upd2)
+    end associate
+#else
     !$omp target update from (CS%PFu, CS%PFv)
+#endif
     call open_boundary_zero_normal_flow(CS%OBC, G, GV, CS%PFu, CS%PFv)
   endif
 
@@ -610,9 +658,30 @@ subroutine step_MOM_dyn_split_RK2(u_inst, v_inst, h, tv, visc, Time_local, dt, f
   call cpu_clock_end(id_clock_btforce)
 
   if (CS%debug) then
+#ifdef IFX_WORKAROUNDS_MOM6
+    ! Avoid ifx transferring the whole base object, see bug_reports/ifx_update_component_copies_parent
+    associate(ifx_upd1=>CS%CAu_pred, ifx_upd2=>CS%CAv_pred)
+    !$omp target update from(ifx_upd1, ifx_upd2)
+    end associate
+#else
     !$omp target update from(CS%CAu_pred, CS%CAv_pred)
+#endif
+#ifdef IFX_WORKAROUNDS_MOM6
+    ! Avoid ifx transferring the whole base object, see bug_reports/ifx_update_component_copies_parent
+    associate(ifx_upd1=>CS%PFu, ifx_upd2=>CS%PFv, ifx_upd3=>CS%pbce)
+    !$omp target update from(ifx_upd1, ifx_upd2, ifx_upd3)
+    end associate
+#else
     !$omp target update from(CS%PFu, CS%PFv, CS%pbce)
+#endif
+#ifdef IFX_WORKAROUNDS_MOM6
+    ! Avoid ifx transferring the whole base object, see bug_reports/ifx_update_component_copies_parent
+    associate(ifx_upd1=>CS%diffu, ifx_upd2=>CS%diffv)
+    !$omp target update from(ifx_upd1, ifx_upd2)
+    end associate
+#else
     !$omp target update from(CS%diffu, CS%diffv)
+#endif
     !$omp target update from(u_bc_accel, v_bc_accel)
     call MOM_accel_chksum("pre-btstep accel", CS%CAu_pred, CS%CAv_pred, CS%PFu, CS%PFv, &
                           CS%diffu, CS%diffv, G, GV, US, CS%pbce, u_bc_accel, v_bc_accel, &
@@ -657,7 +726,14 @@ subroutine step_MOM_dyn_split_RK2(u_inst, v_inst, h, tv, visc, Time_local, dt, f
   if (G%nonblocking_updates) then
     call complete_group_pass(CS%pass_eta, G%Domain)
     !$omp target update to(eta)
+#ifdef IFX_WORKAROUNDS_MOM6
+    ! Avoid ifx transferring the whole base object, see bug_reports/ifx_update_component_copies_parent
+    associate(ifx_upd1=>CS%visc_rem_u, ifx_upd2=>CS%visc_rem_v)
+    !$omp target update from(ifx_upd1, ifx_upd2)
+    end associate
+#else
     !$omp target update from(CS%visc_rem_u, CS%visc_rem_v)
+#endif
     call start_group_pass(CS%pass_visc_rem, G%Domain)
   else
     call do_group_pass(CS%pass_eta, G%Domain, omp_offload=.true.)
@@ -683,7 +759,14 @@ subroutine step_MOM_dyn_split_RK2(u_inst, v_inst, h, tv, visc, Time_local, dt, f
 
   if (G%nonblocking_updates) then
     call complete_group_pass(CS%pass_visc_rem, G%Domain, clock=id_clock_pass)
+#ifdef IFX_WORKAROUNDS_MOM6
+    ! Avoid ifx transferring the whole base object, see bug_reports/ifx_update_component_copies_parent
+    associate(ifx_upd1=>CS%visc_rem_u, ifx_upd2=>CS%visc_rem_v)
+    !$omp target update to(ifx_upd1, ifx_upd2)
+    end associate
+#else
     !$omp target update to(CS%visc_rem_u, CS%visc_rem_v)
+#endif
   endif
 
 ! u_accel_bt = layer accelerations due to barotropic solver
@@ -747,9 +830,30 @@ subroutine step_MOM_dyn_split_RK2(u_inst, v_inst, h, tv, visc, Time_local, dt, f
   call cpu_clock_end(id_clock_mom_update)
 
   if (CS%debug) then
+#ifdef IFX_WORKAROUNDS_MOM6
+    ! Avoid ifx transferring the whole base object, see bug_reports/ifx_update_component_copies_parent
+    associate(ifx_upd1=>CS%CAu_pred, ifx_upd2=>CS%CAv_pred, ifx_upd3=>CS%PFu, ifx_upd4=>CS%PFv)
+    !$omp target update from(ifx_upd1, ifx_upd2, ifx_upd3, ifx_upd4)
+    end associate
+#else
     !$omp target update from(CS%CAu_pred, CS%CAv_pred, CS%PFu, CS%PFv)
+#endif
+#ifdef IFX_WORKAROUNDS_MOM6
+    ! Avoid ifx transferring the whole base object, see bug_reports/ifx_update_component_copies_parent
+    associate(ifx_upd1=>CS%diffu, ifx_upd2=>CS%diffv, ifx_upd3=>CS%pbce)
+    !$omp target update from(ifx_upd1, ifx_upd2, ifx_upd3)
+    end associate
+#else
     !$omp target update from(CS%diffu, CS%diffv, CS%pbce)
+#endif
+#ifdef IFX_WORKAROUNDS_MOM6
+    ! Avoid ifx transferring the whole base object, see bug_reports/ifx_update_component_copies_parent
+    associate(ifx_upd1=>CS%u_accel_bt, ifx_upd2=>CS%v_accel_bt)
+    !$omp target update from(ifx_upd1, ifx_upd2)
+    end associate
+#else
     !$omp target update from(CS%u_accel_bt, CS%v_accel_bt)
+#endif
     call MOM_accel_chksum("Predictor accel", CS%CAu_pred, CS%CAv_pred, CS%PFu, CS%PFv, &
              CS%diffu, CS%diffv, G, GV, US, CS%pbce, CS%u_accel_bt, CS%v_accel_bt, symmetric=sym)
 
@@ -913,7 +1017,14 @@ subroutine step_MOM_dyn_split_RK2(u_inst, v_inst, h, tv, visc, Time_local, dt, f
       Use_Stokes_PGF = associated(Waves)
       if (Use_Stokes_PGF) Use_Stokes_PGF = Waves%Stokes_PGF
       if (Use_Stokes_PGF) then
+#ifdef IFX_WORKAROUNDS_MOM6
+        ! Avoid ifx transferring the whole base object, see bug_reports/ifx_update_component_copies_parent
+        associate(ifx_upd1=>CS%PFu, ifx_upd2=>CS%PFv)
+        !$omp target update from(ifx_upd1, ifx_upd2, h)
+        end associate
+#else
         !$omp target update from(CS%PFu, CS%PFv, h)
+#endif
         call thickness_to_dz(h, tv, dz, G, GV, US, halo_size=1)
         call Stokes_PGF(G, GV, US, dz, u_inst, v_inst, CS%PFu_Stokes, CS%PFv_Stokes, Waves)
         if (.not.Waves%Passive_Stokes_PGF) then
@@ -995,9 +1106,30 @@ subroutine step_MOM_dyn_split_RK2(u_inst, v_inst, h, tv, visc, Time_local, dt, f
   call cpu_clock_end(id_clock_btforce)
 
   if (CS%debug) then
+#ifdef IFX_WORKAROUNDS_MOM6
+    ! Avoid ifx transferring the whole base object, see bug_reports/ifx_update_component_copies_parent
+    associate(ifx_upd1=>CS%CAu, ifx_upd2=>CS%CAv)
+    !$omp target update from(ifx_upd1, ifx_upd2)
+    end associate
+#else
     !$omp target update from(CS%CAu, CS%CAv)
+#endif
+#ifdef IFX_WORKAROUNDS_MOM6
+    ! Avoid ifx transferring the whole base object, see bug_reports/ifx_update_component_copies_parent
+    associate(ifx_upd1=>CS%PFu, ifx_upd2=>CS%PFv, ifx_upd3=>CS%pbce)
+    !$omp target update from(ifx_upd1, ifx_upd2, ifx_upd3)
+    end associate
+#else
     !$omp target update from(CS%PFu, CS%PFv, CS%pbce)
+#endif
+#ifdef IFX_WORKAROUNDS_MOM6
+    ! Avoid ifx transferring the whole base object, see bug_reports/ifx_update_component_copies_parent
+    associate(ifx_upd1=>CS%diffu, ifx_upd2=>CS%diffv)
+    !$omp target update from(ifx_upd1, ifx_upd2)
+    end associate
+#else
     !$omp target update from(CS%diffu, CS%diffv)
+#endif
     !$omp target update from(u_bc_accel, v_bc_accel)
     call MOM_accel_chksum("corr pre-btstep accel", CS%CAu, CS%CAv, CS%PFu, CS%PFv, &
                           CS%diffu, CS%diffv, G, GV, US, CS%pbce, u_bc_accel, v_bc_accel, &
@@ -1037,7 +1169,14 @@ subroutine step_MOM_dyn_split_RK2(u_inst, v_inst, h, tv, visc, Time_local, dt, f
   if (showCallTree) call callTree_leave("btstep()")
 
   if (CS%debug .and. debug_redundant) then
+#ifdef IFX_WORKAROUNDS_MOM6
+    ! Avoid ifx transferring the whole base object, see bug_reports/ifx_update_component_copies_parent
+    associate(ifx_upd1=>CS%u_accel_bt, ifx_upd2=>CS%v_accel_bt)
+    !$omp target update from(ifx_upd1, ifx_upd2)
+    end associate
+#else
     !$omp target update from(CS%u_accel_bt, CS%v_accel_bt)
+#endif
     call check_redundant("u_accel_bt ", CS%u_accel_bt, CS%v_accel_bt, G, unscale=US%L_T2_to_m_s2)
   endif
 
@@ -1054,10 +1193,38 @@ subroutine step_MOM_dyn_split_RK2(u_inst, v_inst, h, tv, visc, Time_local, dt, f
   call cpu_clock_end(id_clock_mom_update)
 
   if (CS%debug) then
+#ifdef IFX_WORKAROUNDS_MOM6
+    ! Avoid ifx transferring the whole base object, see bug_reports/ifx_update_component_copies_parent
+    associate(ifx_upd1=>CS%CAu, ifx_upd2=>CS%CAv)
+    !$omp target update from(ifx_upd1, ifx_upd2)
+    end associate
+#else
     !$omp target update from(CS%CAu, CS%CAv)
+#endif
+#ifdef IFX_WORKAROUNDS_MOM6
+    ! Avoid ifx transferring the whole base object, see bug_reports/ifx_update_component_copies_parent
+    associate(ifx_upd1=>CS%PFu, ifx_upd2=>CS%PFv, ifx_upd3=>CS%pbce)
+    !$omp target update from(ifx_upd1, ifx_upd2, ifx_upd3)
+    end associate
+#else
     !$omp target update from(CS%PFu, CS%PFv, CS%pbce)
+#endif
+#ifdef IFX_WORKAROUNDS_MOM6
+    ! Avoid ifx transferring the whole base object, see bug_reports/ifx_update_component_copies_parent
+    associate(ifx_upd1=>CS%diffu, ifx_upd2=>CS%diffv)
+    !$omp target update from(ifx_upd1, ifx_upd2)
+    end associate
+#else
     !$omp target update from(CS%diffu, CS%diffv)
+#endif
+#ifdef IFX_WORKAROUNDS_MOM6
+    ! Avoid ifx transferring the whole base object, see bug_reports/ifx_update_component_copies_parent
+    associate(ifx_upd1=>CS%u_accel_bt, ifx_upd2=>CS%v_accel_bt)
+    !$omp target update from(ifx_upd1, ifx_upd2)
+    end associate
+#else
     !$omp target update from(CS%u_accel_bt, CS%v_accel_bt)
+#endif
     call MOM_accel_chksum("Corrector accel", CS%CAu, CS%CAv, CS%PFu, CS%PFv, &
                           CS%diffu, CS%diffv, G, GV, US, CS%pbce, CS%u_accel_bt, CS%v_accel_bt, &
                           symmetric=sym)
@@ -1140,9 +1307,18 @@ subroutine step_MOM_dyn_split_RK2(u_inst, v_inst, h, tv, visc, Time_local, dt, f
   ! h  = h + dt * div . uh
   ! u_av and v_av adjusted so their mass transports match uhbt and vhbt.
   call cpu_clock_begin(id_clock_continuity)
+#ifdef IFX_WORKAROUNDS_MOM6
+  ! Avoid an ifx ICE, see bug_reports/ifx_dc_dtype_bounds_ice
+  associate(ifx_jsd=>G%jsd, ifx_jed=>G%jed, ifx_isd=>G%isd, ifx_ied=>G%ied)
+  do concurrent (k=1:nz, j=ifx_jsd:ifx_jed, i=ifx_isd:ifx_ied)
+#else
   do concurrent (k=1:nz, j=G%jsd:G%jed, i=G%isd:G%ied)
+#endif
     h_tmp(i,j,k) = h(i,j,k)
   enddo
+#ifdef IFX_WORKAROUNDS_MOM6
+  end associate
+#endif
 
   call continuity(u_inst, v_inst, h_tmp, h, uh, vh, dt, G, GV, US, CS%continuity_CSp, CS%OBC, pbv, &
                   uhbt=CS%uhbt, vhbt=CS%vhbt, visc_rem_u=CS%visc_rem_u, visc_rem_v=CS%visc_rem_v, &
@@ -1748,7 +1924,14 @@ subroutine initialize_dyn_split_RK2(u, v, h, tv, uh, vh, eta, Time, G, GV, US, p
       CS%eta(i,j) = CS%eta(i,j) + h(i,j,k)
     enddo ; enddo ; enddo
     call set_initialized(CS%eta, trim(eta_rest_name), restart_CS)
+#ifdef IFX_WORKAROUNDS_MOM6
+    ! Avoid ifx transferring the whole base object, see bug_reports/ifx_update_component_copies_parent
+    associate(ifx_upd1=>CS%eta)
+    !$omp target update to(ifx_upd1)
+    end associate
+#else
     !$omp target update to(CS%eta)
+#endif
   endif
   ! Copy eta into an output array.
   do j=js,je ; do i=is,ie ; eta(i,j) = CS%eta(i,j) ; enddo ; enddo
@@ -1764,7 +1947,14 @@ subroutine initialize_dyn_split_RK2(u, v, h, tv, uh, vh, eta, Time, G, GV, US, p
     call horizontal_viscosity(u, v, h, uh, vh, CS%diffu, CS%diffv, MEKE, VarMix, G, GV, US, CS%hor_visc, &
                               tv, dt, OBC=CS%OBC, BT=CS%barotropic_CSp, &
                               TD=thickness_diffuse_CSp, hu_cont=CS%BT_cont%h_u, hv_cont=CS%BT_cont%h_v)
+#ifdef IFX_WORKAROUNDS_MOM6
+    ! Avoid ifx transferring the whole base object, see bug_reports/ifx_update_component_copies_parent
+    associate(ifx_upd1=>CS%diffu, ifx_upd2=>CS%diffv)
+    !$omp target update from(ifx_upd1, ifx_upd2)
+    end associate
+#else
     !$omp target update from(CS%diffu, CS%diffv)
+#endif
     call set_initialized(CS%diffu, "diffu", restart_CS)
     call set_initialized(CS%diffv, "diffv", restart_CS)
   endif
@@ -1795,9 +1985,23 @@ subroutine initialize_dyn_split_RK2(u, v, h, tv, uh, vh, eta, Time, G, GV, US, p
         do concurrent (k=1:nz, j=jsd:jed, i=isd:ied)
           h_tmp(i,j,k) = h(i,j,k)
         enddo
+#ifdef IFX_WORKAROUNDS_MOM6
+        ! Avoid ifx transferring the whole base object, see bug_reports/ifx_update_component_copies_parent
+        associate(ifx_upd1=>CS%u_av, ifx_upd2=>CS%v_av, ifx_upd3=>CS%h_av)
+        !$omp target update to(ifx_upd1, ifx_upd2, ifx_upd3, uh, vh)
+        end associate
+#else
         !$omp target update to(CS%u_av, CS%v_av, CS%h_av, uh, vh)
+#endif
         call continuity(CS%u_av, CS%v_av, h, h_tmp, uh, vh, dt, G, GV, US, CS%continuity_CSp, CS%OBC, pbv)
+#ifdef IFX_WORKAROUNDS_MOM6
+        ! Avoid ifx transferring the whole base object, see bug_reports/ifx_update_component_copies_parent
+        associate(ifx_upd1=>CS%u_av, ifx_upd2=>CS%v_av, ifx_upd3=>CS%h_av)
+        !$omp target update from(ifx_upd1, ifx_upd2, ifx_upd3, uh, vh)
+        end associate
+#else
         !$omp target update from(CS%u_av, CS%v_av, CS%h_av, uh, vh)
+#endif
 
         !$omp target update from(h_tmp)
         call pass_var(h_tmp, G%Domain, clock=id_clock_pass_init)
@@ -1809,10 +2013,24 @@ subroutine initialize_dyn_split_RK2(u, v, h, tv, uh, vh, eta, Time, G, GV, US, p
       endif
       call pass_vector(CS%u_av, CS%v_av, G%Domain, halo=cor_stencil, clock=id_clock_pass_init, complete=.false.)
       call pass_vector(uh, vh, G%Domain, halo=cor_stencil, clock=id_clock_pass_init, complete=.true.)
+#ifdef IFX_WORKAROUNDS_MOM6
+      ! Avoid ifx transferring the whole base object, see bug_reports/ifx_update_component_copies_parent
+      associate(ifx_upd1=>CS%u_av, ifx_upd2=>CS%v_av, ifx_upd3=>CS%h_av)
+      !$omp target update to(ifx_upd1, ifx_upd2, ifx_upd3, uh, vh)
+      end associate
+#else
       !$omp target update to(CS%u_av, CS%v_av, CS%h_av, uh, vh)
+#endif
       call CorAdCalc(CS%u_av, CS%v_av, CS%h_av, uh, vh, CS%CAu_pred, CS%CAv_pred, CS%OBC, CS%ADp, &
                      G, GV, US, CS%CoriolisAdv, pbv) !, Waves=Waves)
+#ifdef IFX_WORKAROUNDS_MOM6
+      ! Avoid ifx transferring the whole base object, see bug_reports/ifx_update_component_copies_parent
+      associate(ifx_upd1=>CS%CAu_pred, ifx_upd2=>CS%CAv_pred)
+      !$omp target update from(ifx_upd1, ifx_upd2)
+      end associate
+#else
       !$omp target update from(CS%CAu_pred, CS%CAv_pred)
+#endif
       CS%CAu_pred_stored = .true.
     endif
   else

@@ -20,7 +20,14 @@ interface
   !! Compute exp(x) with bitwise reproducibility across platforms.
   !! Implemented in submodule MOM_exp
   elemental module function exp_repro(x) result(a)
+#ifndef IFX_WORKAROUNDS_MOM6
     !$omp declare target
+#else
+    ! Avoid an ifx bug, see bug_reports/ifx_declare_target_separate_module_procedure.
+    ! The directive is kept only in the submodule body, the only placement where ifx
+    ! compiles the body for the device.  Callers must use exp_repro from !$omp target
+    ! regions, because ifx will not offload a do concurrent loop that calls it.
+#endif
     real, intent(in) :: x
       !< Input value [nondim]
     real :: a
@@ -32,7 +39,14 @@ interface
   !! Compute log(x) with bitwise reproducibility across platforms.
   !! Implemented in submodule MOM_log
   elemental module function log_repro(x) result(a)
+#ifndef IFX_WORKAROUNDS_MOM6
     !$omp declare target
+#else
+    ! Avoid an ifx bug, see bug_reports/ifx_declare_target_separate_module_procedure.
+    ! The directive is kept only in the submodule body, the only placement where ifx
+    ! compiles the body for the device.  Callers must use log_repro from !$omp target
+    ! regions, because ifx will not offload a do concurrent loop that calls it.
+#endif
     real, intent(in) :: x
       !< Input value
     real :: a
