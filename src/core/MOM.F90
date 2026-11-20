@@ -3322,7 +3322,7 @@ subroutine initialize_MOM(Time, Time_init, param_file, dirs, CS, &
   CS%n_dyn_steps_in_adv = 0
 
   allocate(CS%ADp)
-  !$omp target enter data map(alloc: CS%ADp)
+  !$omp target enter data map(to: CS%ADp)
 
   if (debug_truncations) then
     allocate(CS%u_prev(IsdB:IedB,jsd:jed,nz), source=0.0)

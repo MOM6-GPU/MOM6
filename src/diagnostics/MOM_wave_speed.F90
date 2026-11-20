@@ -2,7 +2,6 @@
 ! See the LICENSE file for licensing information.
 ! SPDX-License-Identifier: Apache-2.0
 
-#include "omp_loop_bind_compat.h"
 #include <MOM_memory.h>
 #include "do_concurrent_compat.h"
 
@@ -225,7 +224,7 @@ subroutine wave_speed(h, tv, G, GV, US, cg1, CS, halo_size, use_ebt_mode, mono_N
   endif
 
   !$omp target enter data map(alloc: Hf, Tf, Sf, Rf, pres, T_int, S_int, dRho_dT, dRho_dS)
-  !$omp target enter data map(alloc: dSpV_dT, dSpV_dS, H_top, H_bot, gprime, Igl, Igu)
+  !$omp target enter data map(alloc: dSpV_dT, dSpV_dS, H_top, H_bot, gprime, Igl, Igu, I_beta, yy)
   !$omp target enter data map(alloc: Hc, Tc, Sc, Rc, mode_struct)
   !$omp target enter data map(alloc: htot, kf, nkc)
 
@@ -387,7 +386,7 @@ subroutine wave_speed(h, tv, G, GV, US, cg1, CS, halo_size, use_ebt_mode, mono_N
       endif
     endif
 
-    !$omp target teams loop LOOP_BIND_TEAMS_PARALLEL collapse(2) private( i, j, k, k2, itt, kc, do_merge, &
+    !$omp target teams distribute parallel do collapse(2) private( i, j, k, k2, itt, kc, do_merge, &
     !$omp &                                      I_Htot, I_Hnew, det, ddet, lam, dlam, lam0, cg1_est, &
     !$omp &                                      speed2_tot, drxh_sum, dSpVxh_sum, hw, sum_hc, gp, &
     !$omp &                                      N2min, ms_min, ms_max, ms_sq, below_mono_N2_frac, &
@@ -835,7 +834,7 @@ subroutine wave_speed(h, tv, G, GV, US, cg1, CS, halo_size, use_ebt_mode, mono_N
   enddo ; enddo ! end of the i- and j-block loops
 
   !$omp target exit data map(delete: Hf, Tf, Sf, Rf, pres, T_int, S_int, dRho_dT, dRho_dS)
-  !$omp target exit data map(delete: dSpV_dT, dSpV_dS, H_top, H_bot, gprime, Igl, Igu)
+  !$omp target exit data map(delete: dSpV_dT, dSpV_dS, H_top, H_bot, gprime, Igl, Igu, I_beta, yy)
   !$omp target exit data map(delete: Hc, Tc, Sc, Rc, mode_struct)
   !$omp target exit data map(delete: htot, kf, nkc)
 

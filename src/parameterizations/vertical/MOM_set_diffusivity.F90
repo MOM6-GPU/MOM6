@@ -3,7 +3,6 @@
 ! SPDX-License-Identifier: Apache-2.0
 
 #include "do_concurrent_compat.h"
-#include "omp_loop_bind_compat.h"
 
 !> Calculate vertical diffusivity from all mixing processes
 module MOM_set_diffusivity
@@ -1183,74 +1182,69 @@ subroutine find_TKE_to_Kd(h, tv, dRho_int, N2_lay, isb, ieb, jsb, jeb, nii, njj,
       maxEnt(ii,jj,1) = 0.0 ; htot(ii,jj) = h(i,j,1) - GV%Angstrom_H
     enddo
   endif
-  !$omp target
-  do k=kb_min,nz-1
-    !$omp loop collapse(2) private(i,j)
-    do jj=1,jje ; do ii=1,iie
-    j = jsb+jj-1 ; i = isb+ii-1
-    if (k == kb(ii,jj)) then
-      maxEnt(ii,jj,kb(ii,jj)) = mFkb(ii,jj)
-    elseif (k > kb(ii,jj)) then
-      if (CS%answer_date < 20190101) then
-        maxEnt(ii,jj,k) = (1.0/dsp1_ds(ii,jj,k))*(maxEnt(ii,jj,k-1) + htot(ii,jj))
-      else
-        maxEnt(ii,jj,k) = ds_dsp1(ii,jj,k)*(maxEnt(ii,jj,k-1) + htot(ii,jj))
-      endif
-      htot(ii,jj) = htot(ii,jj) + (h(i,j,k) - GV%Angstrom_H)
-    endif
-  enddo ; enddo ; enddo
-  !$omp end target
 
-  !$omp target
-  !$omp loop collapse(2) private(i,j)
-  do jj=1,jje ; do ii=1,iie
+  do concurrent (jj=1:jje)
+    do k=kb_min,nz-1
+      do concurrent (ii=1:iie) DO_LOCALITY(local(i,j))
+        j = jsb+jj-1 ; i = isb+ii-1
+        if (k == kb(ii,jj)) then
+          maxEnt(ii,jj,kb(ii,jj)) = mFkb(ii,jj)
+        elseif (k > kb(ii,jj)) then
+          if (CS%answer_date < 20190101) then
+            maxEnt(ii,jj,k) = (1.0/dsp1_ds(ii,jj,k))*(maxEnt(ii,jj,k-1) + htot(ii,jj))
+          else
+            maxEnt(ii,jj,k) = ds_dsp1(ii,jj,k)*(maxEnt(ii,jj,k-1) + htot(ii,jj))
+          endif
+          htot(ii,jj) = htot(ii,jj) + (h(i,j,k) - GV%Angstrom_H)
+        endif
+      enddo
+    enddo
+  enddo
+
+  do concurrent (jj=1:jje, ii=1:iie) DO_LOCALITY(local(i,j))
     j = jsb+jj-1 ; i = isb+ii-1
     htot(ii,jj) = h(i,j,nz) - GV%Angstrom_H ; maxEnt(ii,jj,nz) = 0.0
     do_i(ii,jj) = (G%mask2dT(i,j) > 0.0)
-  enddo ; enddo
-  do k=nz-1,kb_min,-1
+  enddo
+
+  do concurrent (jj=1:jje)
+    do k=nz-1,kb_min,-1
 #ifndef __NVCOMPILER_OPENMP_GPU
-    i_rem = 0
+      i_rem = 0
 #endif
-    !$omp loop collapse(2) private(i,j)
-    do jj=1,jje ; do ii=1,iie
-      j = jsb+jj-1 ; i = isb+ii-1
-      if (do_i(ii,jj)) then
-      if (k<kb(ii,jj)) then ; do_i(ii,jj) = .false. ; cycle ; endif
+      do concurrent (ii=1:iie) DO_LOCALITY(local(i,j))
+        j = jsb+jj-1 ; i = isb+ii-1
+        if (do_i(ii,jj)) then
+          if (k<kb(ii,jj)) then ; do_i(ii,jj) = .false. ; cycle ; endif
 #ifndef __NVCOMPILER_OPENMP_GPU
-      i_rem = i_rem + 1  ! Count the i-rows that are still being worked on.
+          i_rem = i_rem + 1  ! Count the i-rows that are still being worked on.
 #endif
-      maxEnt(ii,jj,k) = MIN(maxEnt(ii,jj,k), dsp1_ds(ii,jj,k+1)*maxEnt(ii,jj,k+1) + htot(ii,jj))
-      htot(ii,jj) = htot(ii,jj) + (h(i,j,k) - GV%Angstrom_H)
-      endif
-    enddo ; enddo
+          maxEnt(ii,jj,k) = MIN(maxEnt(ii,jj,k), dsp1_ds(ii,jj,k+1)*maxEnt(ii,jj,k+1) + htot(ii,jj))
+          htot(ii,jj) = htot(ii,jj) + (h(i,j,k) - GV%Angstrom_H)
+        endif
+      enddo
 #ifndef __NVCOMPILER_OPENMP_GPU
-    if (i_rem == 0) exit
+      if (i_rem == 0) exit
 #endif
+    enddo
   enddo ! k-loop
-  !$omp end target
 
   ! Now set maxTKE and TKE_to_Kd.
-  !$omp target
-  !$omp loop collapse(2)
-  do jj=1,jje ; do ii=1,iie
+  do concurrent (jj=1:jje, ii=1:iie)
     maxTKE(ii,jj,1) = 0.0 ; TKE_to_Kd(ii,jj,1) = 0.0
     maxTKE(ii,jj,nz) = 0.0 ; TKE_to_Kd(ii,jj,nz) = 0.0
-  enddo ; enddo
-  !$omp loop collapse(3) private(i,j)
-  do k=2,kmb ; do jj=1,jje ; do ii=1,iie
+  enddo
+  do concurrent (k=2:kmb, jj=1:jje, ii=1:iie) DO_LOCALITY(local(i,j))
     j = jsb+jj-1 ; i = isb+ii-1
     maxTKE(ii,jj,k) = 0.0
     TKE_to_Kd(ii,jj,k) = 1.0 / ((N2_lay(ii,jj,k) + Omega2) * (dz(i,j,k) + dz_neglect))
-  enddo ; enddo ; enddo
-  !$omp loop collapse(3)
-  do k=kmb+1,kb_min-1 ; do jj=1,jje ; do ii=1,iie
+  enddo
+  do concurrent (k=kmb+1:kb_min-1, jj=1:jje, ii=1:iie)
     !   These are the properties in the deeper mixed and buffer layers, and
     ! should perhaps be revisited.
     maxTKE(ii,jj,k) = 0.0 ; TKE_to_Kd(ii,jj,k) = 0.0
-  enddo ; enddo ; enddo
-  !$omp loop collapse(3) private(dh_max, dRho_lay, i, j)
-  do k=kb_min,nz-1 ; do jj=1,jje ; do ii=1,iie
+  enddo
+  do concurrent (k=kb_min:nz-1, jj=1:jje, ii=1:iie) DO_LOCALITY(local(i,j))
     j = jsb+jj-1 ; i = isb+ii-1
     if (k<kb(ii,jj)) then
       maxTKE(ii,jj,k) = 0.0
@@ -1279,8 +1273,7 @@ subroutine find_TKE_to_Kd(h, tv, dRho_int, N2_lay, isb, ieb, jsb, jeb, nii, njj,
         TKE_to_Kd(ii,jj,k) = 1.0 / (G_Rho0 * dRho_lay + CS%omega**2 * (dz(i,j,k) + dz_neglect))
       endif
     endif
-  enddo ; enddo ; enddo
-  !$omp end target
+  enddo
 
   !$omp target exit data map(release: htot, mFkb, p_ref, Rcv_kmb, p_0, do_i, ds_dsp1, dsp1_ds, &
   !$omp   rho_0, maxEnt)
@@ -1812,111 +1805,109 @@ subroutine add_drag_diffusivity(h, u, v, tv, fluxes, visc, isb, ieb, jsb, jeb, n
   ! TODO: tile/port remaining host-side BBL redistribution loops.
   ! Left unported because of exp changing answers on GPU.
   do concurrent (jj=1:jje, ii=1:iie) ; j = jsb+jj-1 ; i = isb+ii-1 ; do_i(ii,jj) = (G%mask2dT(i,j) > 0.0) ; enddo
-  !$omp target teams
-  do k=nz-1,kb_min,-1
+  do concurrent (jj=1:jje)
+    do k=nz-1,kb_min,-1
 #ifndef __NVCOMPILER_OPENMP_GPU
-    i_rem = 0
+          i_rem = 0
 #endif
-    !$omp loop LOOP_BIND_TEAMS_PARALLEL collapse(2) &
-    !$omp   private(i, j, TKE_to_layer, dRl, dRbot, delta_Kd, TKE_here, TKE_Ray)
-    do jj=1,jje ; do ii=1,iie ; j = jsb+jj-1 ; i = isb+ii-1 ; if (do_i(ii,jj)) then
-      if (k<kb(ii,jj)) then ; do_i(ii,jj) = .false. ; cycle ; endif
+      do concurrent (ii=1:iie, do_i(ii,jj)) DO_LOCALITY(local(i,j,TKE_to_layer,dRl,dRbot,delta_Kd,TKE_here,TKE_Ray))
+        if (k<kb(ii,jj)) then ; do_i(ii,jj) = .false. ; cycle ; endif
 #ifndef __NVCOMPILER_OPENMP_GPU
-      i_rem = i_rem + 1  ! Count the i-rows that are still being worked on.
+        i_rem = i_rem + 1  ! Count the i-rows that are still being worked on.
 #endif
-      !   Apply vertical decay of the turbulent energy.  This energy is
-      ! simply lost.
-      TKE(ii,jj) = TKE(ii,jj) * exp_repro(-I2decay(ii,jj) * (h(i,j,k) + h(i,j,k+1)))
+        !   Apply vertical decay of the turbulent energy.  This energy is
+        ! simply lost.
+        TKE(ii,jj) = TKE(ii,jj) * exp_repro(-I2decay(ii,jj) * (h(i,j,k) + h(i,j,k+1)))
 
-      if (maxTKE(ii,jj,k) <= 0.0) cycle
+        if (maxTKE(ii,jj,k) <= 0.0) cycle
 
   ! This is an analytic integral where diffusivity is a quadratic function of
   ! rho that goes asymptotically to 0 at Rho_top (vaguely following KPP?).
-      if (TKE(ii,jj) > 0.0) then
-        if (Rint(K) <= Rho_top(ii,jj)) then
-          TKE_to_layer = TKE(ii,jj)
-        else
-          dRl = Rint(K+1) - Rint(K) ; dRbot = Rint(K+1) - Rho_top(ii,jj)
-          TKE_to_layer = TKE(ii,jj) * dRl * &
-              (3.0*dRbot*(Rint(K) - Rho_top(ii,jj)) + dRl**2) / (dRbot**3)
-        endif
-      else ; TKE_to_layer = 0.0 ; endif
-
-      ! TKE_Ray has been initialized to 0 above.
-      TKE_Ray = 0.0
-      if (Rayleigh_drag) TKE_Ray = 0.5*CS%BBL_effic * G%IareaT(i,j) * &
-            (((G%areaCu(I-1,j) * visc%Ray_u(I-1,j,k) * u(I-1,j,k)**2) + &
-              (G%areaCu(I,j)   * visc%Ray_u(I,j,k)   * u(I,j,k)**2)) + &
-             ((G%areaCv(i,J-1) * visc%Ray_v(i,J-1,k) * v(i,J-1,k)**2) + &
-              (G%areaCv(i,J)   * visc%Ray_v(i,J,k)   * v(i,J,k)**2)))
-
-      if (TKE_to_layer + TKE_Ray > 0.0) then
-        if (CS%BBL_mixing_as_max) then
-          if (TKE_to_layer + TKE_Ray > maxTKE(ii,jj,k)) &
-              TKE_to_layer = maxTKE(ii,jj,k) - TKE_Ray
-
-          TKE(ii,jj) = TKE(ii,jj) - TKE_to_layer
-
-          if (Kd_lay(ii,jj,k) < (TKE_to_layer + TKE_Ray) * TKE_to_Kd(ii,jj,k)) then
-            delta_Kd = (TKE_to_layer + TKE_Ray) * TKE_to_Kd(ii,jj,k) - Kd_lay(ii,jj,k)
-            if ((CS%Kd_max >= 0.0) .and. (delta_Kd > CS%Kd_max)) then
-              delta_Kd = CS%Kd_max
-              Kd_lay(ii,jj,k) = Kd_lay(ii,jj,k) + delta_Kd
-            else
-              Kd_lay(ii,jj,k) =  (TKE_to_layer + TKE_Ray) * TKE_to_Kd(ii,jj,k)
-            endif
-            Kd_int(ii,jj,K)   = Kd_int(ii,jj,K)   + 0.5 * delta_Kd
-            Kd_int(ii,jj,K+1) = Kd_int(ii,jj,K+1) + 0.5 * delta_Kd
-            if (do_diag_Kd_BBL) then
-              Kd_BBL(i,j,K) = Kd_BBL(i,j,K) + 0.5 * delta_Kd
-              Kd_BBL(i,j,K+1) = Kd_BBL(i,j,K+1) + 0.5 * delta_Kd
-            endif
-          endif
-        else
-          if (Kd_lay(ii,jj,k) >= maxTKE(ii,jj,k) * TKE_to_Kd(ii,jj,k)) then
-            TKE_here = 0.0
-            TKE(ii,jj) = TKE(ii,jj) + TKE_Ray
-          elseif (Kd_lay(ii,jj,k) + (TKE_to_layer + TKE_Ray) * TKE_to_Kd(ii,jj,k) > &
-                  maxTKE(ii,jj,k) * TKE_to_Kd(ii,jj,k)) then
-            TKE_here = ((TKE_to_layer + TKE_Ray) + Kd_lay(ii,jj,k) / TKE_to_Kd(ii,jj,k)) - maxTKE(ii,jj,k)
-            TKE(ii,jj) = (TKE(ii,jj) - TKE_here) + TKE_Ray
+        if (TKE(ii,jj) > 0.0) then
+          if (Rint(K) <= Rho_top(ii,jj)) then
+            TKE_to_layer = TKE(ii,jj)
           else
-            TKE_here = TKE_to_layer + TKE_Ray
-            TKE(ii,jj) = TKE(ii,jj) - TKE_to_layer
+            dRl = Rint(K+1) - Rint(K) ; dRbot = Rint(K+1) - Rho_top(ii,jj)
+            TKE_to_layer = TKE(ii,jj) * dRl * &
+                (3.0*dRbot*(Rint(K) - Rho_top(ii,jj)) + dRl**2) / (dRbot**3)
           endif
-          if (TKE(ii,jj) < 0.0) TKE(ii,jj) = 0.0 ! This should be unnecessary?
+        else ; TKE_to_layer = 0.0 ; endif
 
-          if (TKE_here > 0.0) then
-            delta_Kd = TKE_here * TKE_to_Kd(ii,jj,k)
-            if (CS%Kd_max >= 0.0) delta_Kd = min(delta_Kd, CS%Kd_max)
-            Kd_lay(ii,jj,k) = Kd_lay(ii,jj,k) + delta_Kd
-            Kd_int(ii,jj,K)   = Kd_int(ii,jj,K)   + 0.5 * delta_Kd
-            Kd_int(ii,jj,K+1) = Kd_int(ii,jj,K+1) + 0.5 * delta_Kd
-            if (do_diag_Kd_BBL) then
-              Kd_BBL(i,j,K) = Kd_BBL(i,j,K) + 0.5 * delta_Kd
-              Kd_BBL(i,j,K+1) = Kd_BBL(i,j,K+1) + 0.5 * delta_Kd
+        ! TKE_Ray has been initialized to 0 above.
+        TKE_Ray = 0.0
+        if (Rayleigh_drag) TKE_Ray = 0.5*CS%BBL_effic * G%IareaT(i,j) * &
+              (((G%areaCu(I-1,j) * visc%Ray_u(I-1,j,k) * u(I-1,j,k)**2) + &
+                (G%areaCu(I,j)   * visc%Ray_u(I,j,k)   * u(I,j,k)**2)) + &
+              ((G%areaCv(i,J-1) * visc%Ray_v(i,J-1,k) * v(i,J-1,k)**2) + &
+                (G%areaCv(i,J)   * visc%Ray_v(i,J,k)   * v(i,J,k)**2)))
+
+        if (TKE_to_layer + TKE_Ray > 0.0) then
+          if (CS%BBL_mixing_as_max) then
+            if (TKE_to_layer + TKE_Ray > maxTKE(ii,jj,k)) &
+                TKE_to_layer = maxTKE(ii,jj,k) - TKE_Ray
+
+            TKE(ii,jj) = TKE(ii,jj) - TKE_to_layer
+
+            if (Kd_lay(ii,jj,k) < (TKE_to_layer + TKE_Ray) * TKE_to_Kd(ii,jj,k)) then
+              delta_Kd = (TKE_to_layer + TKE_Ray) * TKE_to_Kd(ii,jj,k) - Kd_lay(ii,jj,k)
+              if ((CS%Kd_max >= 0.0) .and. (delta_Kd > CS%Kd_max)) then
+                delta_Kd = CS%Kd_max
+                Kd_lay(ii,jj,k) = Kd_lay(ii,jj,k) + delta_Kd
+              else
+                Kd_lay(ii,jj,k) =  (TKE_to_layer + TKE_Ray) * TKE_to_Kd(ii,jj,k)
+              endif
+              Kd_int(ii,jj,K)   = Kd_int(ii,jj,K)   + 0.5 * delta_Kd
+              Kd_int(ii,jj,K+1) = Kd_int(ii,jj,K+1) + 0.5 * delta_Kd
+              if (do_diag_Kd_BBL) then
+                Kd_BBL(i,j,K) = Kd_BBL(i,j,K) + 0.5 * delta_Kd
+                Kd_BBL(i,j,K+1) = Kd_BBL(i,j,K+1) + 0.5 * delta_Kd
+              endif
+            endif
+          else
+            if (Kd_lay(ii,jj,k) >= maxTKE(ii,jj,k) * TKE_to_Kd(ii,jj,k)) then
+              TKE_here = 0.0
+              TKE(ii,jj) = TKE(ii,jj) + TKE_Ray
+            elseif (Kd_lay(ii,jj,k) + (TKE_to_layer + TKE_Ray) * TKE_to_Kd(ii,jj,k) > &
+                    maxTKE(ii,jj,k) * TKE_to_Kd(ii,jj,k)) then
+              TKE_here = ((TKE_to_layer + TKE_Ray) + Kd_lay(ii,jj,k) / TKE_to_Kd(ii,jj,k)) - maxTKE(ii,jj,k)
+              TKE(ii,jj) = (TKE(ii,jj) - TKE_here) + TKE_Ray
+            else
+              TKE_here = TKE_to_layer + TKE_Ray
+              TKE(ii,jj) = TKE(ii,jj) - TKE_to_layer
+            endif
+            if (TKE(ii,jj) < 0.0) TKE(ii,jj) = 0.0 ! This should be unnecessary?
+
+            if (TKE_here > 0.0) then
+              delta_Kd = TKE_here * TKE_to_Kd(ii,jj,k)
+              if (CS%Kd_max >= 0.0) delta_Kd = min(delta_Kd, CS%Kd_max)
+              Kd_lay(ii,jj,k) = Kd_lay(ii,jj,k) + delta_Kd
+              Kd_int(ii,jj,K)   = Kd_int(ii,jj,K)   + 0.5 * delta_Kd
+              Kd_int(ii,jj,K+1) = Kd_int(ii,jj,K+1) + 0.5 * delta_Kd
+              if (do_diag_Kd_BBL) then
+                Kd_BBL(i,j,K) = Kd_BBL(i,j,K) + 0.5 * delta_Kd
+                Kd_BBL(i,j,K+1) = Kd_BBL(i,j,K+1) + 0.5 * delta_Kd
+              endif
             endif
           endif
         endif
-      endif
 
-      ! This may be risky - in the case that there are exactly zero
-      ! velocities at 4 neighboring points, but nonzero velocities
-      ! above the iterations would stop too soon. I don't see how this
-      ! could happen in practice. RWH
-      if ((TKE(ii,jj)<= 0.0) .and. (TKE_Ray == 0.0)) then
-        do_i(ii,jj) = .false.
+        ! This may be risky - in the case that there are exactly zero
+        ! velocities at 4 neighboring points, but nonzero velocities
+        ! above the iterations would stop too soon. I don't see how this
+        ! could happen in practice. RWH
+        if ((TKE(ii,jj)<= 0.0) .and. (TKE_Ray == 0.0)) then
+          do_i(ii,jj) = .false.
 #ifndef __NVCOMPILER_OPENMP_GPU
-        i_rem = i_rem - 1
+          i_rem = i_rem - 1
 #endif
-      endif
+        endif
 
-    endif ; enddo ; enddo
+      enddo
 #ifndef __NVCOMPILER_OPENMP_GPU
-    if (i_rem == 0) exit
+      if (i_rem == 0) exit
 #endif
+    enddo
   enddo ! k-loop
-  !$omp end target teams
 
 end subroutine add_drag_diffusivity
 
@@ -1999,8 +1990,9 @@ subroutine add_LOTW_BBL_diffusivity(h, u, v, tv, fluxes, visc, isb, ieb, jsb, je
   if (allocated(visc%Ray_u) .and. allocated(visc%Ray_v)) Rayleigh_drag = .true.
   cdrag_sqrt = sqrt(CS%cdrag)
 
-  ! TODO: tile/port single-row LOTW BBL routine and column temporaries.
-  !$omp target teams loop LOOP_BIND_TEAMS_PARALLEL collapse(2) private( &
+  !$omp target enter data map(alloc: dz_above)
+
+  !$omp target teams distribute parallel do collapse(2) private( &
   !$omp   dz_above, TKE_column, BBL_meanKE_dis, TKE_remaining, TKE_consumed, &
   !$omp   TKE_Kd_wall, ustar, ustar2, absf, dz_int, z_bot, h_bot, D_minus_z, &
   !$omp   total_depth, Idecay, Kd_wall, Kd_lower, ustar_D, i, j, k &
@@ -2117,6 +2109,7 @@ subroutine add_LOTW_BBL_diffusivity(h, u, v, tv, fluxes, visc, isb, ieb, jsb, je
       if (do_diag_Kd_BBL) Kd_BBL(i,j,K) = Kd_wall
     enddo ! k
   enddo ; enddo ! ij
+  !$omp target exit data map(release: dz_above)
 
 end subroutine add_LOTW_BBL_diffusivity
 
