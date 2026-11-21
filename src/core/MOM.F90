@@ -935,9 +935,7 @@ subroutine step_MOM(forces_in, fluxes_in, sfc_state, Time_start, time_int_in, CS
                            end_time_thermo, .true., Waves=Waves)
 
       if ( CS%use_ALE_algorithm ) then
-        !$omp target update from(u, v, h)
         call ALE_regridding_and_remapping(CS, G, GV, US, u, v, h, CS%tv, dtdia, Time_local)
-        !$omp target update to(u, v, h)
       endif
 
       call post_diabatic_halo_updates(CS, G, GV, US, u, v, h, CS%tv)
@@ -1056,9 +1054,7 @@ subroutine step_MOM(forces_in, fluxes_in, sfc_state, Time_start, time_int_in, CS
                            Time_local, .false., Waves=Waves)
 
       if ( CS%use_ALE_algorithm ) then
-        !$omp target update from(u, v, h)
         call ALE_regridding_and_remapping(CS, G, GV, US, u, v, h, CS%tv, dtdia, Time_local)
-        !$omp target update to(u, v, h)
       endif
 
       ! UMW NOTE: These transfers are needed to prevent excessive transfers in the group
@@ -1309,7 +1305,10 @@ subroutine step_MOM_dynamics(forces, p_surf_begin, p_surf_end, dt, dt_tr_adv, &
   call cpu_clock_begin(id_clock_dynamics)
 
   call cpu_clock_begin(id_clock_stoch)
-  if (CS%use_stochastic_EOS) call MOM_stoch_eos_run(G, u, v, dt, Time_local, CS%stoch_eos_CS)
+  if (CS%use_stochastic_EOS) then
+    !$omp target update from(u, v)
+    call MOM_stoch_eos_run(G, u, v, dt, Time_local, CS%stoch_eos_CS)
+  endif
   call cpu_clock_end(id_clock_stoch)
 
   call cpu_clock_begin(id_clock_varT)
@@ -2010,6 +2009,9 @@ end subroutine step_MOM_thermo
 
 !> ALE_regridding_and_remapping does regridding (the generation of a new grid) and remapping
 !! (from the old grid to the new grid). This is done after the themrodynamic step.
+!! On entry u, v and h are current on the device and the tracers on the host.  The regridding and
+!! the remapping of u, v and the tracers are done on the device.  On return u and v are current on
+!! the device only, h is current on both the device and the host, and the tracers on the host.
 subroutine ALE_regridding_and_remapping(CS, G, GV, US, u, v, h, tv, dtdia, Time_end_thermo)
   type(MOM_control_struct), intent(inout) :: CS     !< Master MOM control structure
   type(ocean_grid_type),    intent(inout) :: G      !< ocean grid structure
@@ -2052,6 +2054,9 @@ subroutine ALE_regridding_and_remapping(CS, G, GV, US, u, v, h, tv, dtdia, Time_
 
   call cpu_clock_begin(id_clock_remap)
 
+  ! The host copies are used for the halo updates, the pre-ALE diagnostics and adjustments, and debugging.
+  !$omp target update from(u, v, h)
+
   ! Regridding/remapping is done here, at end of thermodynamics time step
   ! (that may comprise several dynamical time steps)
   ! The routine 'ALE_regrid' can be found in 'MOM_ALE.F90'.
@@ -2088,6 +2093,10 @@ subroutine ALE_regridding_and_remapping(CS, G, GV, US, u, v, h, tv, dtdia, Time_
   ! Adjust the target grids for diagnostics, in case there have been thickness adjustments.
   call diag_update_remap_grids(CS%diag)
 
+  ! h now has updated halos and any adjustments.
+  !$omp target update to(h)
+  !$omp target enter data map(alloc: h_new, dzRegrid, h_old_u, h_old_v, h_new_u, h_new_v)
+
   if (use_ice_shelf) then
     call ALE_regrid(G, GV, US, h, h_new, dzRegrid, tv, CS%ALE_CSp, CS%frac_shelf_h, PCM_cell)
   else
@@ -2120,9 +2129,12 @@ subroutine ALE_regridding_and_remapping(CS, G, GV, US, u, v, h, tv, dtdia, Time_
       call remap_dyn_split_RK2_aux_vars(G, GV, CS%dyn_split_RK2_CSp, h_old_u, h_old_v, h_new_u, h_new_v, CS%ALE_CSp)
     endif
 
+    ! The remaining auxiliary variables are remapped on the host.
+    !$omp target update from(h_new)
     if (associated(CS%OBC) .or. associated(CS%visc%Kv_shear_Bu)) then
       call pass_var(h, G%Domain, complete=.false.)
       call pass_var(h_new, G%Domain, complete=.true.)
+      !$omp target update to(h, h_new)
     endif
 
     if (associated(CS%OBC)) &
@@ -2134,10 +2146,11 @@ subroutine ALE_regridding_and_remapping(CS, G, GV, US, u, v, h, tv, dtdia, Time_
   endif
 
   ! Replace the old grid with new one.  All remapping must be done by this point in the code.
-  !$OMP parallel do default(shared)
-  do k=1,nz ; do j=js-1,je+1 ; do i=is-1,ie+1
+  do concurrent (k=1:nz, j=js-1:je+1, i=is-1:ie+1)
     h(i,j,k) = h_new(i,j,k)
-  enddo ; enddo ; enddo
+  enddo
+  !$omp target update from(h)
+  !$omp target exit data map(delete: h_new, dzRegrid, h_old_u, h_old_v, h_new_u, h_new_v)
 
   if (showCallTree) call callTree_waypoint("finished ALE_regrid (ALE_regridding_and_remapping)")
   call cpu_clock_end(id_clock_ALE)
@@ -2155,6 +2168,9 @@ subroutine ALE_regridding_and_remapping(CS, G, GV, US, u, v, h, tv, dtdia, Time_
 
   call postALE_tracer_diagnostics(CS%tracer_Reg, G, GV, CS%diag, dtdia)
 
+  if (CS%debug) then
+    !$omp target update from(u, v)
+  endif
   if (CS%debug .and. CS%use_ALE_algorithm) then
     call MOM_state_chksum("Post-ALE ", u, v, h, CS%uh, CS%vh, G, GV, US)
     call hchksum(tv%T, "Post-ALE T", G%HI, haloshift=1, unscale=US%C_to_degC)
@@ -3705,6 +3721,9 @@ subroutine initialize_MOM(Time, Time_init, param_file, dirs, CS, &
     allocate(h_new_u(IsdB:IedB, jsd:jed, nz), source=0.0)
     allocate(h_old_v(isd:ied, JsdB:JedB, nz), source=0.0)
     allocate(h_new_v(isd:ied, JsdB:JedB, nz), source=0.0)
+    ! The regridding and remapping are done on the device, where the state is not yet current.
+    !$omp target update to(CS%u, CS%v, CS%h)
+    !$omp target enter data map(alloc: h_new, dzRegrid, h_old_u, h_new_u, h_old_v, h_new_v)
     if (use_ice_shelf) then
       call ALE_regrid(G, GV, US, CS%h, h_new, dzRegrid, CS%tv, CS%ALE_CSp, CS%frac_shelf_h, PCM_cell)
     else
@@ -3727,6 +3746,9 @@ subroutine initialize_MOM(Time, Time_init, param_file, dirs, CS, &
     call ALE_remap_velocities(CS%ALE_CSp, G, GV, h_old_u, h_old_v, h_new_u, h_new_v, CS%u, CS%v, CS%debug)
 
     if (allocated(CS%tv%SpV_avg)) CS%tv%valid_SpV_halo = -1   ! Record that SpV_avg is no longer valid.
+
+    !$omp target update from(CS%u, CS%v, h_new)
+    !$omp target exit data map(delete: h_new, dzRegrid, h_old_u, h_new_u, h_old_v, h_new_v)
 
     ! Replace the old grid with new one.  All remapping must be done at this point.
     !$OMP parallel do default(shared)

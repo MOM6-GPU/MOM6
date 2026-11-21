@@ -489,6 +489,8 @@ subroutine thickness_diffuse(h, uhtr, vhtr, tv, dt, G, GV, US, MEKE, VarMix, CDp
 
   !$omp target enter data map(alloc: Sfn_unlim_u_3D, Sfn_unlim_v_3D)
   if (CS%use_meso_sfn_ANN) then
+    ! u and v may have been changed on the device, for example by the ALE remapping.
+    !$omp target update from(u, v)
     call meso_sfn_ANN_compute(h, e, Sfn_unlim_u_3D, Sfn_unlim_v_3D, G, GV, US, tv, &
                               CS%meso_sfn_ANN_CS, dt, u, v)
     !$omp target update to(Sfn_unlim_u_3D, Sfn_unlim_v_3D)
