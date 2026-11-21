@@ -3280,9 +3280,19 @@ subroutine adiabatic(h, tv, fluxes, dt, G, GV, US, CS)
   type(diabatic_CS),       pointer       :: CS     !< module control structure
 
   real, dimension(SZI_(G),SZJ_(G),SZK_(GV)) :: zeros  ! An array of zeros with units of [H ~> m or kg m-2]
+  integer :: i, j, k, nz
+
+  nz = GV%ke
+
   !$omp target enter data map(alloc: zeros)
 
-  zeros(:,:,:) = 0.0
+  ! The tracer packages read zeros as ea and eb on the device, so it is zeroed there.
+  do concurrent (k=1:nz, j=G%jsd:G%jed, i=G%isd:G%ied)
+    zeros(i,j,k) = 0.0
+  enddo
+
+  ! adiabatic is not ported yet, so copy back the mixed layer depth (zeros(:,:,1)) that the host tracer code reads.
+  !$omp target update from(zeros(:,:,1))
 
   ! h is current only on the device here.  Tracer packages that read h_new on the host
   ! need an update from(h) first.
