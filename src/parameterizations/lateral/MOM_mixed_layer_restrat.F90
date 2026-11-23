@@ -31,7 +31,6 @@ implicit none ; private
 
 #include <MOM_memory.h>
 #include "do_concurrent_compat.h"
-#include "omp_loop_bind_compat.h"
 
 #ifdef __NVCOMPILER_OPENMP_GPU
 integer, parameter :: default_nkblock = 0 !< Default k block size for the mixed layer density integral [nondim]
@@ -972,6 +971,7 @@ subroutine mixedlayer_restrat_Bodner(CS, G, GV, US, h, uhtr, vhtr, tv, forces, d
   !$omp target enter data map(to: h_MLD, BLD, bflux)
   !$omp target enter data map(alloc: little_h, big_H, wpup, htot, buoy_av, uDml_diag, vDml_diag)
   !$omp target enter data map(alloc: vol_dt_avail, uhml, vhml)
+  !$omp target enter data map(alloc: dmu)
 
   ! Apply time filter to h_MLD (to remove diurnal cycle) to obtain "little h".
   ! "little h" is representative of the active mixing layer depth, used in B22 formula (eq 27).
@@ -1245,10 +1245,7 @@ subroutine mixedlayer_restrat_Bodner(CS, G, GV, US, h, uhtr, vhtr, tv, forces, d
   endif
 
   ! U - Component
-  ! These loops are OpenMP target constructs rather than do concurrent because they need the
-  ! per-column dmu profile as a private automatic array, which do concurrent local() cannot
-  ! yet express without crashing nvfortran (private() handles it correctly).
-  !$omp target teams loop collapse(2) LOOP_BIND_TEAMS_PARALLEL &
+  !$omp target teams distribute parallel do collapse(2) &
   !$omp   private(k, dmu, grid_dsd, absf, h_sml, h_big, grd_b, r_wpup, psi_mag, IhTot, &
   !$omp           sigint, muzb, muza, hAtVel)
   do j=js,je ; do I=is-1,ie
@@ -1291,7 +1288,7 @@ subroutine mixedlayer_restrat_Bodner(CS, G, GV, US, h, uhtr, vhtr, tv, forces, d
   enddo ; enddo
 
   ! V- component
-  !$omp target teams loop collapse(2) LOOP_BIND_TEAMS_PARALLEL &
+  !$omp target teams distribute parallel do collapse(2) &
   !$omp   private(k, dmu, grid_dsd, absf, h_sml, h_big, grd_b, r_wpup, psi_mag, IhTot, &
   !$omp           sigint, muzb, muza, hAtVel)
   do J=js-1,je ; do i=is,ie
@@ -1353,6 +1350,7 @@ subroutine mixedlayer_restrat_Bodner(CS, G, GV, US, h, uhtr, vhtr, tv, forces, d
 
   !$omp target exit data map(release: little_h, big_H, wpup, htot, buoy_av, uDml_diag, vDml_diag)
   !$omp target exit data map(release: vol_dt_avail, uhml, vhml, U_star_2d, h_MLD, BLD, bflux)
+  !$omp target exit data map(release: dmu)
 
   if (CS%id_uhml > 0 .or. CS%id_vhml > 0) &
     ! Remapped uhml and vhml require east/north halo updates of h

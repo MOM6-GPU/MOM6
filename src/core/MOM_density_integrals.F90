@@ -963,9 +963,9 @@ subroutine generic_plm_update_dpa(niblock, njblock, kstart, kend, tv, T_t, T_b, 
       enddo
     endif
 
-    !$omp target exit data map(release: T5, S5, T25, TS5, S25, p5, r5, u5)
-
   enddo ; enddo
+
+  !$omp target exit data map(release: T5, S5, T25, TS5, S25, p5, r5, u5)
 
 end subroutine generic_plm_update_dpa
 
