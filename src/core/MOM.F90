@@ -818,9 +818,22 @@ subroutine step_MOM(forces_in, fluxes_in, sfc_state, Time_start, time_int_in, CS
 
   if (cycle_start) then
     CS%time_in_cycle = 0.0
+    ! Refer to the (already mapped) array rather than CS%ssh_rint inside the offloaded loop, so
+    ! that the whole of CS is not implicitly mapped to and from the device.
+    associate(ssh_rint => CS%ssh_rint)
+#ifdef IFX_WORKAROUNDS_MOM6
+    ! ifx 2026.1 workaround: writes to an associate name in an offloaded do concurrent are lost,
+    ! see bug_reports/ifx_associate_write_lost
+    !$omp target teams loop collapse(2)
+    do j=js,je ; do i=is,ie
+      ssh_rint(i,j) = 0.
+    enddo ; enddo
+#else
     do concurrent (j=js:je, i=is:ie)
-      CS%ssh_rint(i,j) = 0.
+      ssh_rint(i,j) = 0.
     enddo
+#endif
+    end associate
 
     if (CS%VarMix%use_variable_mixing) then
       Time_end_diag = Time_start + real_to_time(cycle_time, unscale=US%T_to_s)
@@ -1092,9 +1105,20 @@ subroutine step_MOM(forces_in, fluxes_in, sfc_state, Time_start, time_int_in, CS
       call find_eta(h, CS%tv, G, GV, US, ssh, eta_bt=CS%eta_av_bc, dZref=G%Z_ref)
       !$omp target exit data map(release: CS%eta_av_bc)
 
+      associate(ssh_rint => CS%ssh_rint)  ! Avoid implicitly mapping all of CS
+#ifdef IFX_WORKAROUNDS_MOM6
+      ! ifx 2026.1 workaround: writes to an associate name in an offloaded do concurrent are lost,
+      ! see bug_reports/ifx_associate_write_lost
+      !$omp target teams loop collapse(2)
+      do j=js,je ; do i=is,ie
+        ssh_rint(i,j) = ssh_rint(i,j) + dt * ssh(i,j)
+      enddo ; enddo
+#else
       do concurrent (j=js:je, i=is:ie)
-        CS%ssh_rint(i,j) = CS%ssh_rint(i,j) + dt * ssh(i,j)
+        ssh_rint(i,j) = ssh_rint(i,j) + dt * ssh(i,j)
       enddo
+#endif
+      end associate
 
       if (CS%IDs%id_ssh_inst > 0) then
         !$omp target update from(ssh)
@@ -1145,10 +1169,22 @@ subroutine step_MOM(forces_in, fluxes_in, sfc_state, Time_start, time_int_in, CS
     !$omp target enter data map(alloc: ssh)
 
     I_wt_ssh = 1.0/CS%time_in_cycle
+    associate(ssh_rint => CS%ssh_rint, ave_ssh_ibc => CS%ave_ssh_ibc)  ! Avoid mapping all of CS
+#ifdef IFX_WORKAROUNDS_MOM6
+    ! ifx 2026.1 workaround: writes to an associate name in an offloaded do concurrent are lost,
+    ! see bug_reports/ifx_associate_write_lost
+    !$omp target teams loop collapse(2)
+    do j=js,je ; do i=is,ie
+      ssh(i,j) = ssh_rint(i,j) * I_wt_ssh
+      ave_ssh_ibc(i,j) = ssh(i,j)
+    enddo ; enddo
+#else
     do concurrent (j=js:je, i=is:ie)
-      ssh(i,j) = CS%ssh_rint(i,j) * I_wt_ssh
-      CS%ave_ssh_ibc(i,j) = ssh(i,j)
+      ssh(i,j) = ssh_rint(i,j) * I_wt_ssh
+      ave_ssh_ibc(i,j) = ssh(i,j)
     enddo
+#endif
+    end associate
 
     if (associated(CS%HA_CSp)) then
       !$omp target update from(ssh)
@@ -1198,16 +1234,52 @@ subroutine step_MOM(forces_in, fluxes_in, sfc_state, Time_start, time_int_in, CS
     !$omp   if (CS%time_in_cycle > 0. .or. CS%time_in_thermo_cycle > 0.)
 
     if (CS%time_in_cycle > 0.0) then
+#ifdef IFX_WORKAROUNDS_MOM6
+      ! Avoid ifx transferring the whole base object, see bug_reports/ifx_update_component_copies_parent
+      if (allocated(sfc_state_diag%u)) then
+        associate(ifx_upd1=>sfc_state_diag%u)
+        !$omp target update from(ifx_upd1)
+        end associate
+      endif
+#else
       !$omp target update if(allocated(sfc_state_diag%u)) from(sfc_state_diag%u)
+#endif
+#ifdef IFX_WORKAROUNDS_MOM6
+      ! Avoid ifx transferring the whole base object, see bug_reports/ifx_update_component_copies_parent
+      if (allocated(sfc_state_diag%v)) then
+        associate(ifx_upd1=>sfc_state_diag%v)
+        !$omp target update from(ifx_upd1)
+        end associate
+      endif
+#else
       !$omp target update if(allocated(sfc_state_diag%v)) from(sfc_state_diag%v)
+#endif
       call enable_averages(CS%time_in_cycle, Time_local, CS%diag)
       call post_surface_dyn_diags(CS%sfc_IDs, G, CS%diag, sfc_state_diag, ssh)
     endif
 
     if (CS%time_in_thermo_cycle > 0.0) then
       !$omp target update from(CS%ave_ssh_ibc)
+#ifdef IFX_WORKAROUNDS_MOM6
+      ! Avoid ifx transferring the whole base object, see bug_reports/ifx_update_component_copies_parent
+      if (allocated(sfc_state_diag%SST)) then
+        associate(ifx_upd1=>sfc_state_diag%SST)
+        !$omp target update from(ifx_upd1)
+        end associate
+      endif
+#else
       !$omp target update if(allocated(sfc_state_diag%SST)) from(sfc_state_diag%SST)
+#endif
+#ifdef IFX_WORKAROUNDS_MOM6
+      ! Avoid ifx transferring the whole base object, see bug_reports/ifx_update_component_copies_parent
+      if (allocated(sfc_state_diag%SSS)) then
+        associate(ifx_upd1=>sfc_state_diag%SSS)
+        !$omp target update from(ifx_upd1)
+        end associate
+      endif
+#else
       !$omp target update if(allocated(sfc_state_diag%SSS)) from(sfc_state_diag%SSS)
+#endif
       call enable_averages(CS%time_in_thermo_cycle, Time_local, CS%diag)
       call post_surface_thermo_diags(CS%sfc_IDs, G, GV, US, CS%diag, CS%time_in_thermo_cycle, &
                                      sfc_state_diag, CS%tv, ssh, CS%ave_ssh_ibc)
@@ -1783,12 +1855,29 @@ subroutine step_MOM_tracer_dyn(CS, G, GV, US, h, Time_local)
   ! and advective times now agree.
   call cpu_clock_begin(id_clock_thermo) ; call cpu_clock_begin(id_clock_tracer)
 
+  ! Refer to the (already mapped) arrays rather than CS%uhtr and CS%vhtr inside the offloaded
+  ! loops, so that the whole of CS is not implicitly mapped to and from the device.
+  associate(uhtr => CS%uhtr, vhtr => CS%vhtr)
+#ifdef IFX_WORKAROUNDS_MOM6
+  ! ifx 2026.1 workaround: writes to an associate name in an offloaded do concurrent are lost,
+  ! see bug_reports/ifx_associate_write_lost
+  !$omp target teams loop collapse(3)
+  do k=1,GV%ke ; do j=G%jsd,G%jed ; do I=G%IsdB,G%IedB
+    uhtr(I,j,k) = 0.
+  enddo ; enddo ; enddo
+  !$omp target teams loop collapse(3)
+  do k=1,GV%ke ; do J=G%JsdB,G%JedB ; do i=G%isd,G%ied
+    vhtr(i,J,k) = 0.
+  enddo ; enddo ; enddo
+#else
   do concurrent (k=1:GV%ke, j=G%jsd:G%jed, I=G%IsdB:G%IedB)
-    CS%uhtr(I,j,k) = 0.
+    uhtr(I,j,k) = 0.
   enddo
   do concurrent (k=1:GV%ke, J=G%JsdB:G%JedB, i=G%isd:G%ied)
-    CS%vhtr(i,J,k) = 0.
+    vhtr(i,J,k) = 0.
   enddo
+#endif
+  end associate
 
   if (CS%accumulate_resolved_flux) then
     CS%uhtr_resolved(:,:,:) = 0.0
@@ -4135,6 +4224,15 @@ subroutine initialize_MOM(Time, Time_init, param_file, dirs, CS, &
   call callTree_leave("initialize_MOM()")
   call cpu_clock_end(id_clock_init) ; call cpu_clock_end(id_clock_ocean)
 
+#ifdef IFX_WORKAROUNDS_MOM6
+  ! ifx 2026.1 workaround: CS (and CS%ADp, which is only map(alloc)-ed) was sent to the device
+  ! before some of its allocatable components were allocated and mapped; mapping a component only
+  ! attaches its device address, so the device copy keeps stale descriptors.  Resend it now that
+  ! all components exist, see bug_reports/ifx_dt_component_write_lost.
+  !$omp target update to(CS)
+  !$omp target update to(CS%ADp)
+#endif
+
 end subroutine initialize_MOM
 
 !> Finishes initializing MOM and writes out the initial conditions.
@@ -4501,9 +4599,12 @@ subroutine extract_surface_state(CS, sfc_state_in)
   endif
 
   ! copy Hml into sfc_state, so that caps can access it
+  ! CS%Hml is only set on the host (by the diabatic driver), and has no persistent device copy.
+  !$omp target data map(to: CS%Hml)
   do concurrent (j=js:je, i=is:ie)
     sfc_state%Hml(i,j) = CS%Hml(i,j)
   enddo
+  !$omp end target data
 
   if (CS%Hmix < 0.0) then  ! A bulk mixed layer is in use, so layer 1 has the properties
     if (use_temperature) then ; do concurrent (j=js:je, i=is:ie)
@@ -4654,7 +4755,14 @@ subroutine extract_surface_state(CS, sfc_state_in)
 
   if (allocated(sfc_state%melt_potential)) then
     ! leaving unported due to calculate_TFreeze
+#ifdef IFX_WORKAROUNDS_MOM6
+    ! Avoid ifx transferring the whole base object, see bug_reports/ifx_update_component_copies_parent
+    associate(ifx_upd1=>sfc_state%melt_potential)
+    !$omp target update from(ifx_upd1)
+    end associate
+#else
     !$omp target update from(sfc_state%melt_potential)
+#endif
     !$OMP parallel do default(shared) private(depth_ml, dh, T_freeze, depth, pres, delT)
     do j=js,je
       do i=is,ie
@@ -4697,7 +4805,14 @@ subroutine extract_surface_state(CS, sfc_state_in)
         endif
       enddo
     enddo ! end of j loop
+#ifdef IFX_WORKAROUNDS_MOM6
+    ! Avoid ifx transferring the whole base object, see bug_reports/ifx_update_component_copies_parent
+    associate(ifx_upd1=>sfc_state%melt_potential)
+    !$omp target update to(ifx_upd1)
+    end associate
+#else
     !$omp target update to(sfc_state%melt_potential)
+#endif
   endif   ! melt_potential
 
   ! Preference would be to combine the omp statement with the if statement, but doing so
@@ -4781,8 +4896,24 @@ subroutine extract_surface_state(CS, sfc_state_in)
 
   if (CS%check_bad_sfc_vals) then
     numberOfErrors=0 ! count number of errors
+#ifdef IFX_WORKAROUNDS_MOM6
+    ! Avoid ifx transferring the whole base object, see bug_reports/ifx_update_component_copies_parent
+    associate(ifx_upd1=>sfc_state%sea_lev, ifx_upd2=>sfc_state%u, ifx_upd3=>sfc_state%v)
+    !$omp target update from(ifx_upd1, ifx_upd2, ifx_upd3)
+    end associate
+#else
     !$omp target update from(sfc_state%sea_lev, sfc_state%u, sfc_state%v)
+#endif
+#ifdef IFX_WORKAROUNDS_MOM6
+    ! Avoid ifx transferring the whole base object, see bug_reports/ifx_update_component_copies_parent
+    if (use_temperature) then
+      associate(ifx_upd1=>sfc_state%SSS, ifx_upd2=>sfc_state%SST)
+      !$omp target update from(ifx_upd1, ifx_upd2)
+      end associate
+    endif
+#else
     !$omp target update if(use_temperature) from(sfc_state%SSS, sfc_state%SST)
+#endif
     do j=js,je ; do i=is,ie
       if (G%mask2dT(i,j)>0.) then
         localError = sfc_state%sea_lev(i,j) < -G%bathyT(i,j) - G%Z_ref &
@@ -4833,17 +4964,116 @@ subroutine extract_surface_state(CS, sfc_state_in)
   endif
 
   if (CS%debug) then
+#ifdef IFX_WORKAROUNDS_MOM6
+    ! Avoid ifx transferring the whole base object, see bug_reports/ifx_update_component_copies_parent
+    if (allocated(sfc_state%sea_lev)) then
+      associate(ifx_upd1=>sfc_state%sea_lev)
+      !$omp target update from(ifx_upd1)
+      end associate
+    endif
+#else
     !$omp target update if(allocated(sfc_state%sea_lev)) from(sfc_state%sea_lev)
+#endif
+#ifdef IFX_WORKAROUNDS_MOM6
+    ! Avoid ifx transferring the whole base object, see bug_reports/ifx_update_component_copies_parent
+    if (allocated(sfc_state%Hml)) then
+      associate(ifx_upd1=>sfc_state%Hml)
+      !$omp target update from(ifx_upd1)
+      end associate
+    endif
+#else
     !$omp target update if(allocated(sfc_state%Hml)) from(sfc_state%Hml)
+#endif
+#ifdef IFX_WORKAROUNDS_MOM6
+    ! Avoid ifx transferring the whole base object, see bug_reports/ifx_update_component_copies_parent
+    if (allocated(sfc_state%u)) then
+      associate(ifx_upd1=>sfc_state%u)
+      !$omp target update from(ifx_upd1)
+      end associate
+    endif
+#else
     !$omp target update if(allocated(sfc_state%u)) from(sfc_state%u)
+#endif
+#ifdef IFX_WORKAROUNDS_MOM6
+    ! Avoid ifx transferring the whole base object, see bug_reports/ifx_update_component_copies_parent
+    if (allocated(sfc_state%v)) then
+      associate(ifx_upd1=>sfc_state%v)
+      !$omp target update from(ifx_upd1)
+      end associate
+    endif
+#else
     !$omp target update if(allocated(sfc_state%v)) from(sfc_state%v)
+#endif
+#ifdef IFX_WORKAROUNDS_MOM6
+    ! Avoid ifx transferring the whole base object, see bug_reports/ifx_update_component_copies_parent
+    if (allocated(sfc_state%SSS)) then
+      associate(ifx_upd1=>sfc_state%SSS)
+      !$omp target update from(ifx_upd1)
+      end associate
+    endif
+#else
     !$omp target update if(allocated(sfc_state%SSS)) from(sfc_state%SSS)
+#endif
+#ifdef IFX_WORKAROUNDS_MOM6
+    ! Avoid ifx transferring the whole base object, see bug_reports/ifx_update_component_copies_parent
+    if (allocated(sfc_state%SST)) then
+      associate(ifx_upd1=>sfc_state%SST)
+      !$omp target update from(ifx_upd1)
+      end associate
+    endif
+#else
     !$omp target update if(allocated(sfc_state%SST)) from(sfc_state%SST)
+#endif
+#ifdef IFX_WORKAROUNDS_MOM6
+    ! Avoid ifx transferring the whole base object, see bug_reports/ifx_update_component_copies_parent
+    if (allocated(sfc_state%frazil)) then
+      associate(ifx_upd1=>sfc_state%frazil)
+      !$omp target update from(ifx_upd1)
+      end associate
+    endif
+#else
     !$omp target update if(allocated(sfc_state%frazil)) from(sfc_state%frazil)
+#endif
+#ifdef IFX_WORKAROUNDS_MOM6
+    ! Avoid ifx transferring the whole base object, see bug_reports/ifx_update_component_copies_parent
+    if (allocated(sfc_state%melt_potential)) then
+      associate(ifx_upd1=>sfc_state%melt_potential)
+      !$omp target update from(ifx_upd1)
+      end associate
+    endif
+#else
     !$omp target update if(allocated(sfc_state%melt_potential)) from(sfc_state%melt_potential)
+#endif
+#ifdef IFX_WORKAROUNDS_MOM6
+    ! Avoid ifx transferring the whole base object, see bug_reports/ifx_update_component_copies_parent
+    if (allocated(sfc_state%ocean_mass)) then
+      associate(ifx_upd1=>sfc_state%ocean_mass)
+      !$omp target update from(ifx_upd1)
+      end associate
+    endif
+#else
     !$omp target update if(allocated(sfc_state%ocean_mass)) from(sfc_state%ocean_mass)
+#endif
+#ifdef IFX_WORKAROUNDS_MOM6
+    ! Avoid ifx transferring the whole base object, see bug_reports/ifx_update_component_copies_parent
+    if (allocated(sfc_state%ocean_heat)) then
+      associate(ifx_upd1=>sfc_state%ocean_heat)
+      !$omp target update from(ifx_upd1)
+      end associate
+    endif
+#else
     !$omp target update if(allocated(sfc_state%ocean_heat)) from(sfc_state%ocean_heat)
+#endif
+#ifdef IFX_WORKAROUNDS_MOM6
+    ! Avoid ifx transferring the whole base object, see bug_reports/ifx_update_component_copies_parent
+    if (allocated(sfc_state%ocean_salt)) then
+      associate(ifx_upd1=>sfc_state%ocean_salt)
+      !$omp target update from(ifx_upd1)
+      end associate
+    endif
+#else
     !$omp target update if(allocated(sfc_state%ocean_salt)) from(sfc_state%ocean_salt)
+#endif
     call MOM_surface_chksum("Post extract_sfc", sfc_state, G, US, haloshift=0, symmetric=.true.)
   endif
 

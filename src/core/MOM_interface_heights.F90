@@ -757,7 +757,7 @@ subroutine find_rho_bottom_2d(G, GV, US, tv, h, dz, pres_int, dz_avg, isb, ieb, 
 
     !$omp target
     do k=nz,1,-1
-#ifndef __NVCOMPILER_OPENMP_GPU
+#if !defined(__NVCOMPILER_OPENMP_GPU) && !defined(MOM_OPENMP_GPU)
       do_any = .false.
 #endif
       !$omp loop collapse(2) private(i,j)
@@ -769,7 +769,7 @@ subroutine find_rho_bottom_2d(G, GV, US, tv, h, dz, pres_int, dz_avg, isb, ieb, 
           dz_bbl_rem(ii,jj) = dz_bbl_rem(ii,jj) - dz(i,j,k)
           hb(ii,jj) = hb(ii,jj) + h(i,j,k)
           k_bot(ii,jj) = k
-#ifndef __NVCOMPILER_OPENMP_GPU
+#if !defined(__NVCOMPILER_OPENMP_GPU) && !defined(MOM_OPENMP_GPU)
           do_any = .true.
 #endif
         else
@@ -785,7 +785,7 @@ subroutine find_rho_bottom_2d(G, GV, US, tv, h, dz, pres_int, dz_avg, isb, ieb, 
         endif
         endif
       enddo ; enddo
-#ifndef __NVCOMPILER_OPENMP_GPU
+#if !defined(__NVCOMPILER_OPENMP_GPU) && !defined(MOM_OPENMP_GPU)
       if (.not.do_any) exit
 #endif
     enddo
@@ -826,7 +826,7 @@ subroutine find_rho_bottom_2d(G, GV, US, tv, h, dz, pres_int, dz_avg, isb, ieb, 
 
     !$omp target
     do k=nz,1,-1
-#ifndef __NVCOMPILER_OPENMP_GPU
+#if !defined(__NVCOMPILER_OPENMP_GPU) && !defined(MOM_OPENMP_GPU)
       do_any = .false.
 #endif
       !$omp loop collapse(2) private(i,j)
@@ -839,7 +839,7 @@ subroutine find_rho_bottom_2d(G, GV, US, tv, h, dz, pres_int, dz_avg, isb, ieb, 
           dz_bbl_rem(ii,jj) = dz_bbl_rem(ii,jj) - dz(i,j,k)
           hb(ii,jj) = hb(ii,jj) + h(i,j,k)
           k_bot(ii,jj) = k
-#ifndef __NVCOMPILER_OPENMP_GPU
+#if !defined(__NVCOMPILER_OPENMP_GPU) && !defined(MOM_OPENMP_GPU)
           do_any = .true.
 #endif
         else
@@ -864,7 +864,7 @@ subroutine find_rho_bottom_2d(G, GV, US, tv, h, dz, pres_int, dz_avg, isb, ieb, 
         endif
         endif
       enddo ; enddo
-#ifndef __NVCOMPILER_OPENMP_GPU
+#if !defined(__NVCOMPILER_OPENMP_GPU) && !defined(MOM_OPENMP_GPU)
       if (.not.do_any) exit
 #endif
     enddo

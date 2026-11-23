@@ -1721,7 +1721,7 @@ subroutine VarMix_init(Time, G, GV, US, param_file, diag, CS)
   integer :: number_of_OBC_segments
   integer :: is, ie, js, je, Isq, Ieq, Jsq, Jeq, i, j
   integer :: isd, ied, jsd, jed, IsdB, IedB, JsdB, JedB
-#ifdef __NVCOMPILER_OPENMP_GPU
+#if defined(__NVCOMPILER_OPENMP_GPU) || defined(MOM_OPENMP_GPU)
   integer, parameter :: default_niblock = 0
   integer, parameter :: default_njblock = 0
   integer, parameter :: default_nkblock = 0
@@ -2383,6 +2383,14 @@ subroutine VarMix_init(Time, G, GV, US, param_file, diag, CS)
       CS%Laplac3_const_v(i,J) = Leith_Lap_const * grid_sp_v3
     enddo ; enddo
   endif
+
+#ifdef IFX_WORKAROUNDS_MOM6
+  ! ifx 2026.1 workaround: CS was sent to the device before some of its allocatable
+  ! components were allocated and mapped; mapping a component only attaches its device address,
+  ! so the device copy keeps stale descriptors.  Resend it now that all components exist,
+  ! see bug_reports/ifx_dt_component_write_lost.
+  !$omp target update to(CS)
+#endif
 
 end subroutine VarMix_init
 

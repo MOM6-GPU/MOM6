@@ -496,7 +496,7 @@ subroutine full_convection_init(param_file, CS)
 
   ! Local variables
   integer, parameter :: default_niblock = 0 ! Default i block size for array calculations [nondim].
-#ifdef __NVCOMPILER_OPENMP_GPU
+#if defined(__NVCOMPILER_OPENMP_GPU) || defined(MOM_OPENMP_GPU)
   integer, parameter :: default_njblock = 0 ! Default j block size for array calculations [nondim].
 #else
   ! A single row at a time recovers the loop structure and work array sizes that predate the

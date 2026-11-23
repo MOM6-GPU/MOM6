@@ -88,6 +88,7 @@ contains
 !!
 !! This is an elemental function that can be applied to any combination of scalar and array inputs.
 real elemental function density_elem_buggy_Wright_loc(T, S, pressure)
+        !$omp declare target
   real, intent(in) :: T        !< potential temperature relative to the surface [degC].
   real, intent(in) :: S        !< salinity [PSU].
   real, intent(in) :: pressure !< pressure [Pa].
@@ -120,6 +121,7 @@ end function density_elem_buggy_Wright
 !!
 !! This is an elemental function that can be applied to any combination of scalar and array inputs.
 real elemental function density_anomaly_elem_buggy_Wright(this, T, S, pressure, rho_ref)
+        !$omp declare target
   class(buggy_Wright_EOS), intent(in) :: this !< This EOS
   real, intent(in) :: T        !< potential temperature relative to the surface [degC].
   real, intent(in) :: S        !< salinity [PSU].
@@ -197,6 +199,7 @@ end function spec_vol_anomaly_elem_buggy_Wright
 !> Calculate the partial derivatives of density with potential temperature and salinity
 !! using the buggy implementation of the equation of state, as fit by Wright, 1997
 elemental subroutine calculate_density_derivs_elem_buggy_Wright_loc( T, S, pressure, drho_dT, drho_dS)
+        !$omp declare target
   real,               intent(in)  :: T        !< Potential temperature relative to the surface [degC]
   real,               intent(in)  :: S        !< Salinity [PSU]
   real,               intent(in)  :: pressure !< Pressure [Pa]
@@ -229,6 +232,7 @@ end subroutine calculate_density_derivs_elem_buggy_Wright_loc
 !! density_elem_buggy_Wright without "this" variable that causes runtime errors on
 !! gpu runs with nvfortran.
 elemental subroutine calculate_density_derivs_elem_buggy_Wright(this, T, S, pressure, drho_dT, drho_dS)
+        !$omp declare target
   class(buggy_Wright_EOS), intent(in) :: this !< This EOS
   real,               intent(in)  :: T        !< Potential temperature relative to the surface [degC]
   real,               intent(in)  :: S        !< Salinity [PSU]
@@ -551,9 +555,18 @@ subroutine int_density_dz_wright(T, S, z_t, z_b, rho_ref, rho_0, G_e, HI, &
       z0pres(i,j) = Z_0p(i,j)
     enddo
   else
+#ifdef IFX_WORKAROUNDS_MOM6
+    ! Avoid an ifx ICE, see bug_reports/ifx_dc_dtype_bounds_ice
+    associate(ifx_jsd=>HI%jsd, ifx_jed=>HI%jed, ifx_isd=>HI%isd, ifx_ied=>HI%ied)
+    do concurrent (j=ifx_jsd:ifx_jed, i=ifx_isd:ifx_ied)
+#else
     do concurrent (j=HI%jsd:HI%jed, i=HI%isd:HI%ied)
+#endif
       z0pres(i,j) = 0.0
     enddo
+#ifdef IFX_WORKAROUNDS_MOM6
+    end associate
+#endif
   endif
 
   a1s = a1 ; a2s = a2
@@ -999,6 +1012,9 @@ subroutine calculate_density_array_2d_buggy_Wright(this, T, S, pressure, rho, &
   real, optional, intent(in) :: rho_ref
     !< A reference density [kg m-3]
 
+#ifdef IFX_WORKAROUNDS_MOM6
+  real :: rho_ref_loc ! A local copy of rho_ref [kg m-3]
+#endif
   integer :: is, ie, js, je
   integer :: i, j
 
@@ -1009,10 +1025,20 @@ subroutine calculate_density_array_2d_buggy_Wright(this, T, S, pressure, rho, &
   !   Possibly because Nvidia cannot associate `this` with `EOS%type`.
 
   if (present(rho_ref)) then
+#ifdef IFX_WORKAROUNDS_MOM6
+    ! ifx makes the optional rho_ref PRIVATE (uninitialized) in the offloaded loop,
+    ! see bug_reports/ifx_optional_scalar_private.
+    rho_ref_loc = rho_ref
+    do concurrent (j=js:je, i=is:ie)
+      rho(i,j) = density_anomaly_elem_buggy_Wright(this, T(i,j), S(i,j), &
+          pressure(i,j), rho_ref_loc)
+    enddo
+#else
     do concurrent (j=js:je, i=is:ie)
       rho(i,j) = density_anomaly_elem_buggy_Wright(this, T(i,j), S(i,j), &
           pressure(i,j), rho_ref)
     enddo
+#endif
   else
     do concurrent (j=js:je, i=is:ie)
       rho(i,j) = density_elem_buggy_Wright_loc( T(i,j), S(i,j), pressure(i,j))
@@ -1038,6 +1064,9 @@ subroutine calculate_density_array_3d_buggy_Wright(this, T, S, pressure, rho, &
   real, optional, intent(in) :: rho_ref
     !< A reference density [kg m-3]
 
+#ifdef IFX_WORKAROUNDS_MOM6
+  real :: rho_ref_loc ! A local copy of rho_ref [kg m-3]
+#endif
   integer :: is, ie, js, je, ks, ke
   integer :: i, j, k
 
@@ -1049,10 +1078,20 @@ subroutine calculate_density_array_3d_buggy_Wright(this, T, S, pressure, rho, &
   !   Possibly because Nvidia cannot associate `this` with `EOS%type`.
 
   if (present(rho_ref)) then
+#ifdef IFX_WORKAROUNDS_MOM6
+    ! ifx makes the optional rho_ref PRIVATE (uninitialized) in the offloaded loop,
+    ! see bug_reports/ifx_optional_scalar_private.
+    rho_ref_loc = rho_ref
+    do concurrent (k=ks:ke, j=js:je, i=is:ie)
+      rho(i,j,k) = density_anomaly_elem_buggy_Wright(this, T(i,j,k), S(i,j,k), &
+          pressure(i,j,k), rho_ref_loc)
+    enddo
+#else
     do concurrent (k=ks:ke, j=js:je, i=is:ie)
       rho(i,j,k) = density_anomaly_elem_buggy_Wright(this, T(i,j,k), S(i,j,k), &
           pressure(i,j,k), rho_ref)
     enddo
+#endif
   else
     do concurrent (k=ks:ke, j=js:je, i=is:ie)
       rho(i,j,k) = density_elem_buggy_Wright_loc( T(i,j,k), S(i,j,k), pressure(i,j,k))

@@ -1209,7 +1209,7 @@ subroutine find_TKE_to_Kd(h, tv, dRho_int, N2_lay, isb, ieb, jsb, jeb, nii, njj,
     do_i(ii,jj) = (G%mask2dT(i,j) > 0.0)
   enddo ; enddo
   do k=nz-1,kb_min,-1
-#ifndef __NVCOMPILER_OPENMP_GPU
+#if !defined(__NVCOMPILER_OPENMP_GPU) && !defined(MOM_OPENMP_GPU)
     i_rem = 0
 #endif
     !$omp loop collapse(2) private(i,j)
@@ -1217,14 +1217,14 @@ subroutine find_TKE_to_Kd(h, tv, dRho_int, N2_lay, isb, ieb, jsb, jeb, nii, njj,
       j = jsb+jj-1 ; i = isb+ii-1
       if (do_i(ii,jj)) then
       if (k<kb(ii,jj)) then ; do_i(ii,jj) = .false. ; cycle ; endif
-#ifndef __NVCOMPILER_OPENMP_GPU
+#if !defined(__NVCOMPILER_OPENMP_GPU) && !defined(MOM_OPENMP_GPU)
       i_rem = i_rem + 1  ! Count the i-rows that are still being worked on.
 #endif
       maxEnt(ii,jj,k) = MIN(maxEnt(ii,jj,k), dsp1_ds(ii,jj,k+1)*maxEnt(ii,jj,k+1) + htot(ii,jj))
       htot(ii,jj) = htot(ii,jj) + (h(i,j,k) - GV%Angstrom_H)
       endif
     enddo ; enddo
-#ifndef __NVCOMPILER_OPENMP_GPU
+#if !defined(__NVCOMPILER_OPENMP_GPU) && !defined(MOM_OPENMP_GPU)
     if (i_rem == 0) exit
 #endif
   enddo ! k-loop
@@ -1443,7 +1443,7 @@ subroutine find_N2(h, tv, T_f, S_f, fluxes, isb, ieb, jsb, jeb, nii, njj, dz, G,
 
   !$omp target
   do k=nz,2,-1
-#ifndef __NVCOMPILER_OPENMP_GPU
+#if !defined(__NVCOMPILER_OPENMP_GPU) && !defined(MOM_OPENMP_GPU)
     do_any = .false.
 #endif
     !$omp loop collapse(2) private(dz_int,i,j)
@@ -1463,14 +1463,14 @@ subroutine find_N2(h, tv, T_f, S_f, fluxes, isb, ieb, jsb, jeb, nii, njj, dz, G,
           drho_bot(ii,jj) = drho_bot(ii,jj) + dRho_int(ii,jj,K-1)
         endif
         do_i(ii,jj) = .false.
-#ifndef __NVCOMPILER_OPENMP_GPU
+#if !defined(__NVCOMPILER_OPENMP_GPU) && !defined(MOM_OPENMP_GPU)
       else
         do_any = .true.
 #endif
       endif
       endif
     enddo ; enddo
-#ifndef __NVCOMPILER_OPENMP_GPU
+#if !defined(__NVCOMPILER_OPENMP_GPU) && !defined(MOM_OPENMP_GPU)
     if (.not.do_any) exit
 #endif
   enddo
@@ -1487,7 +1487,7 @@ subroutine find_N2(h, tv, T_f, S_f, fluxes, isb, ieb, jsb, jeb, nii, njj, dz, G,
 
   !$omp target
   do k=nz,2,-1
-#ifndef __NVCOMPILER_OPENMP_GPU
+#if !defined(__NVCOMPILER_OPENMP_GPU) && !defined(MOM_OPENMP_GPU)
     do_any = .false.
 #endif
     !$omp loop collapse(2) private(dz_int,i,j)
@@ -1503,14 +1503,14 @@ subroutine find_N2(h, tv, T_f, S_f, fluxes, isb, ieb, jsb, jeb, nii, njj, dz, G,
       if (z_from_bot(ii,jj) > h_amp(i,jj)) then
         if (k>2) N2_int(ii,jj,K-1) = N2_bot(ii,jj)
         do_i(ii,jj) = .false.
-#ifndef __NVCOMPILER_OPENMP_GPU
+#if !defined(__NVCOMPILER_OPENMP_GPU) && !defined(MOM_OPENMP_GPU)
       else
         do_any = .true.
 #endif
       endif
       endif
     enddo ; enddo
-#ifndef __NVCOMPILER_OPENMP_GPU
+#if !defined(__NVCOMPILER_OPENMP_GPU) && !defined(MOM_OPENMP_GPU)
     if (.not.do_any) exit
 #endif
   enddo
@@ -1784,7 +1784,7 @@ subroutine add_drag_diffusivity(h, u, v, tv, fluxes, visc, isb, ieb, jsb, jeb, n
 
   !$omp target
   do k=nz-1,2,-1
-#ifndef __NVCOMPILER_OPENMP_GPU
+#if !defined(__NVCOMPILER_OPENMP_GPU) && !defined(MOM_OPENMP_GPU)
     domore = .false.
 #endif
     !$omp loop collapse(2) private(i,j)
@@ -1798,12 +1798,12 @@ subroutine add_drag_diffusivity(h, u, v, tv, fluxes, visc, isb, ieb, jsb, jeb, n
         Rho_top(ii,jj) = (rho_htot(ii,jj) - gh_sum_top(ii,jj)) / htot(ii,jj)
         do_i(ii,jj) = .false.
       elseif (k <= kb(ii,jj)) then ; do_i(ii,jj) = .false.
-#ifndef __NVCOMPILER_OPENMP_GPU
+#if !defined(__NVCOMPILER_OPENMP_GPU) && !defined(MOM_OPENMP_GPU)
       else ; domore = .true.
 #endif
       endif
     endif ; enddo ; enddo
-#ifndef __NVCOMPILER_OPENMP_GPU
+#if !defined(__NVCOMPILER_OPENMP_GPU) && !defined(MOM_OPENMP_GPU)
     if (.not.domore) exit
 #endif
   enddo ! k-loop
@@ -1814,14 +1814,14 @@ subroutine add_drag_diffusivity(h, u, v, tv, fluxes, visc, isb, ieb, jsb, jeb, n
   do concurrent (jj=1:jje, ii=1:iie) ; j = jsb+jj-1 ; i = isb+ii-1 ; do_i(ii,jj) = (G%mask2dT(i,j) > 0.0) ; enddo
   !$omp target teams
   do k=nz-1,kb_min,-1
-#ifndef __NVCOMPILER_OPENMP_GPU
+#if !defined(__NVCOMPILER_OPENMP_GPU) && !defined(MOM_OPENMP_GPU)
     i_rem = 0
 #endif
     !$omp loop LOOP_BIND_TEAMS_PARALLEL collapse(2) &
     !$omp   private(i, j, TKE_to_layer, dRl, dRbot, delta_Kd, TKE_here, TKE_Ray)
     do jj=1,jje ; do ii=1,iie ; j = jsb+jj-1 ; i = isb+ii-1 ; if (do_i(ii,jj)) then
       if (k<kb(ii,jj)) then ; do_i(ii,jj) = .false. ; cycle ; endif
-#ifndef __NVCOMPILER_OPENMP_GPU
+#if !defined(__NVCOMPILER_OPENMP_GPU) && !defined(MOM_OPENMP_GPU)
       i_rem = i_rem + 1  ! Count the i-rows that are still being worked on.
 #endif
       !   Apply vertical decay of the turbulent energy.  This energy is
@@ -1906,13 +1906,13 @@ subroutine add_drag_diffusivity(h, u, v, tv, fluxes, visc, isb, ieb, jsb, jeb, n
       ! could happen in practice. RWH
       if ((TKE(ii,jj)<= 0.0) .and. (TKE_Ray == 0.0)) then
         do_i(ii,jj) = .false.
-#ifndef __NVCOMPILER_OPENMP_GPU
+#if !defined(__NVCOMPILER_OPENMP_GPU) && !defined(MOM_OPENMP_GPU)
         i_rem = i_rem - 1
 #endif
       endif
 
     endif ; enddo ; enddo
-#ifndef __NVCOMPILER_OPENMP_GPU
+#if !defined(__NVCOMPILER_OPENMP_GPU) && !defined(MOM_OPENMP_GPU)
     if (i_rem == 0) exit
 #endif
   enddo ! k-loop
@@ -2666,7 +2666,7 @@ subroutine set_diffusivity_init(Time, G, GV, US, param_file, diag, CS, int_tide_
   logical :: TKE_to_Kd_used  ! If true, TKE_to_Kd and maxTKE need to be calculated.
   integer :: is, ie, js, je
   integer :: isd, ied, jsd, jed
-#ifdef __NVCOMPILER_OPENMP_GPU
+#if defined(__NVCOMPILER_OPENMP_GPU) || defined(MOM_OPENMP_GPU)
   integer, parameter :: default_niblock = 0 ! Default i block size for array calculations [nondim]
   integer, parameter :: default_njblock = 0 ! Default j block size for array calculations [nondim]
 #else

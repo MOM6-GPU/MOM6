@@ -1011,7 +1011,13 @@ subroutine btstep(U_in, V_in, eta_in, dt, bc_accel_u, bc_accel_v, forces, pbce, 
   endif
 
   ! Zero out various wide-halo arrays.
+#ifdef IFX_WORKAROUNDS_MOM6
+  ! Avoid an ifx ICE, see bug_reports/ifx_dc_dtype_bounds_ice
+  associate(ifx_jsdw=>CS%jsdw, ifx_jedw=>CS%jedw, ifx_isdw=>CS%isdw, ifx_iedw=>CS%iedw)
+  do concurrent (j=ifx_jsdw:ifx_jedw, i=ifx_isdw:ifx_iedw)
+#else
   do concurrent (j=CS%jsdw:CS%jedw, i=CS%isdw:CS%iedw)
+#endif
     gtot_E(i,j) = 0.0 ; gtot_W(i,j) = 0.0
     gtot_N(i,j) = 0.0 ; gtot_S(i,j) = 0.0
     eta(i,j) = 0.0
@@ -1024,17 +1030,38 @@ subroutine btstep(U_in, V_in, eta_in, dt, bc_accel_u, bc_accel_v, forces, pbce, 
     endif
     if (CS%dynamic_psurf) dyn_coef_eta(i,j) = 0.0
   enddo
+#ifdef IFX_WORKAROUNDS_MOM6
+  end associate
+#endif
   !   The halo regions of various arrays need to be initialized to
   ! non-NaNs in case the neighboring domains are not part of the ocean.
   ! Otherwise a halo update later on fills in the correct values.
+#ifdef IFX_WORKAROUNDS_MOM6
+  ! Avoid an ifx ICE, see bug_reports/ifx_dc_dtype_bounds_ice
+  associate(ifx_jsdw=>CS%jsdw, ifx_jedw=>CS%jedw, ifx_isdw=>CS%isdw, ifx_iedw=>CS%iedw)
+  do concurrent (j=ifx_jsdw:ifx_jedw, I=ifx_isdw-1:ifx_iedw)
+#else
   do concurrent (j=CS%jsdw:CS%jedw, I=CS%isdw-1:CS%iedw)
+#endif
     Cor_ref_u(I,j) = 0.0 ; BT_force_u(I,j) = 0.0 ; ubt(I,j) = 0.0
     Datu(I,j) = 0.0 ; bt_rem_u(I,j) = 0.0 ; uhbt0(I,j) = 0.0
   enddo
+#ifdef IFX_WORKAROUNDS_MOM6
+  end associate
+#endif
+#ifdef IFX_WORKAROUNDS_MOM6
+  ! Avoid an ifx ICE, see bug_reports/ifx_dc_dtype_bounds_ice
+  associate(ifx_jsdw=>CS%jsdw, ifx_jedw=>CS%jedw, ifx_isdw=>CS%isdw, ifx_iedw=>CS%iedw)
+  do concurrent (J=ifx_jsdw-1:ifx_jedw, i=ifx_isdw:ifx_iedw)
+#else
   do concurrent (J=CS%jsdw-1:CS%jedw, i=CS%isdw:CS%iedw)
+#endif
     Cor_ref_v(i,J) = 0.0 ; BT_force_v(i,J) = 0.0 ; vbt(i,J) = 0.0
     Datv(i,J) = 0.0 ; bt_rem_v(i,J) = 0.0 ; vhbt0(i,J) = 0.0
   enddo
+#ifdef IFX_WORKAROUNDS_MOM6
+  end associate
+#endif
 
   if (apply_OBCs) then
     SpV_col_avg(:,:) = 0.0
@@ -1065,23 +1092,50 @@ subroutine btstep(U_in, V_in, eta_in, dt, bc_accel_u, bc_accel_v, forces, pbce, 
 
   ! Copy input arrays into their wide-halo counterparts.
   if (interp_eta_PF) then
+#ifdef IFX_WORKAROUNDS_MOM6
+    ! Avoid an ifx ICE, see bug_reports/ifx_dc_dtype_bounds_ice
+    associate(ifx_jsd=>G%jsd, ifx_jed=>G%jed, ifx_isd=>G%isd, ifx_ied=>G%ied)
+    do concurrent (j=ifx_jsd:ifx_jed, i=ifx_isd:ifx_ied)
+#else
     do concurrent (j=G%jsd:G%jed, i=G%isd:G%ied)
+#endif
       ! Was "do j=Jsq,Jeq+1 ; do i=Isq,Ieq+1" but doing so breaks OBC. Not sure why?
       eta(i,j) = eta_in(i,j)
       eta_PF_1(i,j) = eta_PF_start(i,j)
       d_eta_PF(i,j) = eta_PF_in(i,j) - eta_PF_start(i,j)
     enddo
+#ifdef IFX_WORKAROUNDS_MOM6
+    end associate
+#endif
   else
+#ifdef IFX_WORKAROUNDS_MOM6
+    ! Avoid an ifx ICE, see bug_reports/ifx_dc_dtype_bounds_ice
+    associate(ifx_jsd=>G%Jsd, ifx_jed=>G%Jed, ifx_isd=>G%isd, ifx_ied=>G%ied)
+    do concurrent (j=ifx_jsd:ifx_jed, i=ifx_isd:ifx_ied)
+#else
     do concurrent (j=G%Jsd:G%Jed, i=G%isd:G%ied)
+#endif
       ! Was "do j=Jsq,Jeq+1 ; do i=Isq,Ieq+1" but doing so breaks OBC. Not sure why?
       eta(i,j) = eta_in(i,j)
       eta_PF(i,j) = eta_PF_in(i,j)
     enddo
+#ifdef IFX_WORKAROUNDS_MOM6
+    end associate
+#endif
   endif
   if (integral_BT_cont) then
+#ifdef IFX_WORKAROUNDS_MOM6
+    ! Avoid an ifx ICE, see bug_reports/ifx_dc_dtype_bounds_ice
+    associate(ifx_jsd=>G%jsd, ifx_jed=>G%jed, ifx_isd=>G%isd, ifx_ied=>G%ied)
+    do concurrent (j=ifx_jsd:ifx_jed, i=ifx_isd:ifx_ied)
+#else
     do concurrent (j=G%jsd:G%jed, i=G%isd:G%ied)
+#endif
       eta_IC(i,j) = eta_in(i,j)
     enddo
+#ifdef IFX_WORKAROUNDS_MOM6
+    end associate
+#endif
   endif
 
   do concurrent (k=1:nz, j=js:je, I=is-1:ie)
@@ -1333,12 +1387,30 @@ subroutine btstep(U_in, V_in, eta_in, dt, bc_accel_u, bc_accel_v, forces, pbce, 
 ! Calculate the initial barotropic velocities from the layer's velocities.
   call btstep_ubt_from_layer(U_in, V_in, wt_u, wt_v, ubt, vbt, G, GV, CS)
 
+#ifdef IFX_WORKAROUNDS_MOM6
+  ! Avoid an ifx ICE, see bug_reports/ifx_dc_dtype_bounds_ice
+  associate(ifx_jsdw=>CS%jsdw, ifx_jedw=>CS%jedw, ifx_isdw=>CS%isdw, ifx_iedw=>CS%iedw)
+  do concurrent (j=ifx_jsdw:ifx_jedw, i=ifx_isdw-1:ifx_iedw)
+#else
   do concurrent (j=CS%jsdw:CS%jedw, i=CS%isdw-1:CS%iedw)
+#endif
     uhbt(i,j) = 0.0 ; u_accel_bt(i,j) = 0.0
   enddo
+#ifdef IFX_WORKAROUNDS_MOM6
+  end associate
+#endif
+#ifdef IFX_WORKAROUNDS_MOM6
+  ! Avoid an ifx ICE, see bug_reports/ifx_dc_dtype_bounds_ice
+  associate(ifx_jsdw=>CS%jsdw, ifx_jedw=>CS%jedw, ifx_isdw=>CS%isdw, ifx_iedw=>CS%iedw)
+  do concurrent (j=ifx_jsdw-1:ifx_jedw, i=ifx_isdw:ifx_iedw)
+#else
   do concurrent (j=CS%jsdw-1:CS%jedw, i=CS%isdw:CS%iedw)
+#endif
     vhbt(i,j) = 0.0 ; v_accel_bt(i,j) = 0.0
   enddo
+#ifdef IFX_WORKAROUNDS_MOM6
+  end associate
+#endif
 
   if (apply_OBCs .or. (CS%id_ubtdt > 0)) then
     !$omp target update from(ubt)
@@ -2694,24 +2766,60 @@ subroutine btstep_timeloop(eta, ubt, vbt, uhbt0, Datu, BTCL_u, vhbt0, Datv, BTCL
   if (integral_BT_cont) then
     !$omp target enter data map(alloc: ubt_int, uhbt_int, vbt_int, vhbt_int, cfl_ltd_vol)
 
+#ifdef IFX_WORKAROUNDS_MOM6
+    ! Avoid an ifx ICE, see bug_reports/ifx_dc_dtype_bounds_ice
+    associate(ifx_jsdw=>CS%jsdw, ifx_jedw=>CS%jedw, ifx_isdw=>CS%isdw, ifx_iedw=>CS%iedw)
+    do concurrent (j=ifx_jsdw:ifx_jedw, I=ifx_isdw-1:ifx_iedw)
+#else
     do concurrent (j=CS%jsdw:CS%jedw, I=CS%isdw-1:CS%iedw)
+#endif
       ubt_int(I,j) = 0.
       uhbt_int(I,j) = 0.
     enddo
+#ifdef IFX_WORKAROUNDS_MOM6
+    end associate
+#endif
 
+#ifdef IFX_WORKAROUNDS_MOM6
+    ! Avoid an ifx ICE, see bug_reports/ifx_dc_dtype_bounds_ice
+    associate(ifx_jsdw=>CS%jsdw, ifx_jedw=>CS%jedw, ifx_isdw=>CS%isdw, ifx_iedw=>CS%iedw)
+    do concurrent (J=ifx_jsdw-1:ifx_jedw, i=ifx_isdw:ifx_iedw)
+#else
     do concurrent (J=CS%jsdw-1:CS%jedw, i=CS%isdw:CS%iedw)
+#endif
       vbt_int(i,J) = 0.
       vhbt_int(i,J) = 0.
     enddo
+#ifdef IFX_WORKAROUNDS_MOM6
+    end associate
+#endif
 
+#ifdef IFX_WORKAROUNDS_MOM6
+    ! Avoid an ifx ICE, see bug_reports/ifx_dc_dtype_bounds_ice
+    associate(ifx_jsdw=>CS%jsdw, ifx_jedw=>CS%jedw, ifx_isdw=>CS%isdw, ifx_iedw=>CS%iedw)
+    do concurrent (j=ifx_jsdw:ifx_jedw, i=ifx_isdw:ifx_iedw)
+#else
     do concurrent (j=CS%jsdw:CS%jedw, i=CS%isdw:CS%iedw)
+#endif
       cfl_ltd_vol(i,j) = huge(GV%Z_to_H)
     enddo
+#ifdef IFX_WORKAROUNDS_MOM6
+    end associate
+#endif
   endif
 
+#ifdef IFX_WORKAROUNDS_MOM6
+  ! Avoid an ifx ICE, see bug_reports/ifx_dc_dtype_bounds_ice
+  associate(ifx_jsdw=>CS%jsdw, ifx_jedw=>CS%jedw, ifx_isdw=>CS%isdw, ifx_iedw=>CS%iedw)
+  do concurrent (j=ifx_jsdw:ifx_jedw, i=ifx_isdw:ifx_iedw)
+#else
   do concurrent (j=CS%jsdw:CS%jedw, i=CS%isdw:CS%iedw)
+#endif
     p_surf_dyn(i,j) = 0.0
   enddo
+#ifdef IFX_WORKAROUNDS_MOM6
+  end associate
+#endif
 
   if (CS%bt_limit_integral_transport) then
     !$omp target update from(eta_IC)
@@ -3444,9 +3552,18 @@ subroutine btloop_find_PF(PFu, PFv, isv, iev, jsv, jev, eta_PF_BT, eta_PF, &
   enddo
 
   if (find_etaav .and. (abs(wt_accel2_n) > 0.0)) then
+#ifdef IFX_WORKAROUNDS_MOM6
+    ! Avoid an ifx ICE, see bug_reports/ifx_dc_dtype_bounds_ice
+    associate(ifx_jsc=>G%jsc, ifx_jec=>G%jec, ifx_isc=>G%isc, ifx_iec=>G%iec)
+    do concurrent (j=ifx_jsc:ifx_jec, i=ifx_isc:ifx_iec)
+#else
     do concurrent (j=G%jsc:G%jec, i=G%isc:G%iec)
+#endif
       eta_sum(i,j) = eta_sum(i,j) + wt_accel2_n * eta_PF_BT(i,j)
     enddo
+#ifdef IFX_WORKAROUNDS_MOM6
+    end associate
+#endif
   endif
 
 end subroutine btloop_find_PF
@@ -3688,12 +3805,30 @@ subroutine btstep_ubt_from_layer(U_in, V_in, wt_u, wt_v, ubt, vbt,  G, GV, CS)
 
   is = G%isc ; ie = G%iec ; js = G%jsc ; je = G%jec ; nz = GV%ke
 
+#ifdef IFX_WORKAROUNDS_MOM6
+  ! Avoid an ifx ICE, see bug_reports/ifx_dc_dtype_bounds_ice
+  associate(ifx_jsdw=>CS%jsdw, ifx_jedw=>CS%jedw, ifx_isdw=>CS%isdw, ifx_iedw=>CS%iedw)
+  do concurrent (j=ifx_jsdw:ifx_jedw, i=ifx_isdw-1:ifx_iedw)
+#else
   do concurrent (j=CS%jsdw:CS%jedw, i=CS%isdw-1:CS%iedw)
+#endif
     ubt(i,j) = 0.0
   enddo
+#ifdef IFX_WORKAROUNDS_MOM6
+  end associate
+#endif
+#ifdef IFX_WORKAROUNDS_MOM6
+  ! Avoid an ifx ICE, see bug_reports/ifx_dc_dtype_bounds_ice
+  associate(ifx_jsdw=>CS%jsdw, ifx_jedw=>CS%jedw, ifx_isdw=>CS%isdw, ifx_iedw=>CS%iedw)
+  do concurrent (j=ifx_jsdw-1:ifx_jedw, i=ifx_isdw:ifx_iedw)
+#else
   do concurrent (j=CS%jsdw-1:CS%jedw, i=CS%isdw:CS%iedw)
+#endif
     vbt(i,j) = 0.0
   enddo
+#ifdef IFX_WORKAROUNDS_MOM6
+  end associate
+#endif
 
   do concurrent (j=js:je)
     do k=1,nz
@@ -3841,6 +3976,10 @@ subroutine set_dtbt(G, GV, US, CS, pbce, gtot_est, BT_cont, eta, SSH_add, Time)
   real :: dtbt_max    ! The maximum barotropic timestep [T ~> s]
   real :: Idt_max2    ! The squared inverse of the local maximum stable
                       ! barotropic time step [T-2 ~> s-2].
+#ifdef IFX_WORKAROUNDS_MOM6
+  real :: max_Idt2    ! The largest value of Idt_max2 on this PE [T-2 ~> s-2].
+  real :: gtot_est_loc ! A local copy of gtot_est [L2 H-1 T-2 ~> m s-2 or m4 kg-1 s-2].
+#endif
   logical :: use_BT_cont
   type(memory_size_type) :: MS
   character(len=200) :: mesg
@@ -3895,13 +4034,38 @@ subroutine set_dtbt(G, GV, US, CS, pbce, gtot_est, BT_cont, eta, SSH_add, Time)
       enddo
     enddo
   else
+#ifdef IFX_WORKAROUNDS_MOM6
+    ! ifx makes the optional gtot_est PRIVATE (uninitialized) in the offloaded loop,
+    ! see bug_reports/ifx_optional_scalar_private.
+    gtot_est_loc = gtot_est
+    do concurrent (j=js:je, i=is:ie)
+      gtot_E(i,j) = gtot_est_loc ; gtot_W(i,j) = gtot_est_loc
+      gtot_N(i,j) = gtot_est_loc ; gtot_S(i,j) = gtot_est_loc
+    enddo
+#else
     do concurrent (j=js:je, i=is:ie)
       gtot_E(i,j) = gtot_est ; gtot_W(i,j) = gtot_est
       gtot_N(i,j) = gtot_est ; gtot_S(i,j) = gtot_est
     enddo
+#endif
   endif
 
   min_max_dt2 = 1.0e38*US%s_to_T**2  ! A huge value for the permissible timestep squared.
+#ifdef IFX_WORKAROUNDS_MOM6
+  ! Avoid an ifx -O3 miscompilation of the conditional min reduction below, which returns the
+  ! initial value, see bug_reports/ifx_dc_reduce_locality.  Reduce the largest Idt_max2 instead,
+  ! and apply the same test once on the host.
+  max_Idt2 = 0.0
+  do concurrent (j=js:je, i=is:ie) DO_LOCALITY(reduce(max:max_Idt2))
+    Idt_max2 = 0.5 * (1.0 + 2.0*CS%bebt) * (G%IareaT(i,j) * &
+      (((gtot_E(i,j)*Datu(I,j)*G%IdxCu(I,j)) + (gtot_W(i,j)*Datu(I-1,j)*G%IdxCu(I-1,j))) + &
+       ((gtot_N(i,j)*Datv(i,J)*G%IdyCv(i,J)) + (gtot_S(i,j)*Datv(i,J-1)*G%IdyCv(i,J-1)))) + &
+      ((G%Coriolis2Bu(I,J) + G%Coriolis2Bu(I-1,J-1)) + &
+       (G%Coriolis2Bu(I-1,J) + G%Coriolis2Bu(I,J-1))) * CS%BT_Coriolis_scale**2 )
+    max_Idt2 = max(max_Idt2, Idt_max2)
+  enddo
+  if (max_Idt2 * min_max_dt2 > 1.0) min_max_dt2 = 1.0 / max_Idt2
+#else
   do concurrent (j=js:je, i=is:ie) DO_LOCALITY(reduce(min:min_max_dt2))
     !   This is pretty accurate for gravity waves, but it is a conservative
     ! estimate since it ignores the stabilizing effect of the bottom drag.
@@ -3912,6 +4076,7 @@ subroutine set_dtbt(G, GV, US, CS, pbce, gtot_est, BT_cont, eta, SSH_add, Time)
        (G%Coriolis2Bu(I-1,J) + G%Coriolis2Bu(I,J-1))) * CS%BT_Coriolis_scale**2 )
     if (Idt_max2 * min_max_dt2 > 1.0) min_max_dt2 = 1.0 / Idt_max2
   enddo
+#endif
   !$omp target exit data map(release: gtot_E, gtot_W, gtot_N, gtot_S, Datu, Datv)
   dtbt_max = sqrt(min_max_dt2 / dgeo_de)
   if (id_clock_sync > 0) call cpu_clock_begin(id_clock_sync)
@@ -4958,6 +5123,7 @@ end subroutine btcalc
 !! INTEGRAL_BT_CONT=True it determines the time-integrated zonal transport for a given
 !! time-integrated velocity.
 pure function find_uhbt(u, BTC) result(uhbt)
+  !$omp declare target
   real, intent(in) :: u    !< The local zonal velocity [L T-1 ~> m s-1] or time integrated velocity [L ~> m]
   type(local_BT_cont_u_type), intent(in) :: BTC !< A structure containing various fields that
                            !! allow the barotropic transports to be calculated consistently
@@ -4983,6 +5149,7 @@ end function find_uhbt
 !> The function find_duhbt_du determines the marginal zonal face area for a given velocity, or
 !! with INTEGRAL_BT_CONT=True for a given time-integrated velocity.
 pure function find_duhbt_du(u, BTC) result(duhbt_du)
+  !$omp declare target
   real, intent(in) :: u    !< The local zonal velocity [L T-1 ~> m s-1] or time integrated velocity [L ~> m]
   type(local_BT_cont_u_type), intent(in) :: BTC !< A structure containing various fields that
                            !! allow the barotropic transports to be calculated consistently
@@ -5092,6 +5259,7 @@ end function uhbt_to_ubt
 !! INTEGRAL_BT_CONT=True it determines the time-integrated meridional transport for a given
 !! time-integrated velocity.
 pure function find_vhbt(v, BTC) result(vhbt)
+  !$omp declare target
   real, intent(in) :: v    !< The local meridional velocity [L T-1 ~> m s-1] or time integrated velocity [L ~> m]
   type(local_BT_cont_v_type), intent(in) :: BTC !< A structure containing various fields that
                            !! allow the barotropic transports to be calculated consistently
@@ -5116,6 +5284,7 @@ end function find_vhbt
 !> The function find_dvhbt_dv determines the marginal meridional face area for a given velocity, or
 !! with INTEGRAL_BT_CONT=True for a given time-integrated velocity.
 pure function find_dvhbt_dv(v, BTC) result(dvhbt_dv)
+  !$omp declare target
   real, intent(in) :: v    !< The local meridional velocity [L T-1 ~> m s-1] or time integrated velocity [L ~> m]
   type(local_BT_cont_v_type), intent(in) :: BTC !< A structure containing various fields that
                            !! allow the barotropic transports to be calculated consistently
@@ -5502,6 +5671,7 @@ end subroutine BT_cont_to_face_areas
 
 !> Swap the values of two real variables
 pure subroutine swap(a,b)
+  !$omp declare target
   real, intent(inout) :: a !< The first variable to be swapped [arbitrary units]
   real, intent(inout) :: b !< The second variable to be swapped [arbitrary units]
   real :: tmp ! A temporary variable [arbitrary units]
@@ -5530,6 +5700,9 @@ subroutine find_face_areas(Datu, Datv, G, GV, US, CS, MS, halo, eta, add_max)
   ! Local variables
   real :: H1, H2      ! Temporary total thicknesses [H ~> m or kg m-2].
   real :: Z_to_H      ! A local conversion factor [H Z-1 ~> nondim or kg m-3]
+#ifdef IFX_WORKAROUNDS_MOM6
+  real :: add_max_loc ! A local copy of add_max [Z ~> m]
+#endif
   integer :: i, j, is, ie, js, je, hs
   is = G%isc ; ie = G%iec ; js = G%jsc ; je = G%jec
   hs = max(halo,0)
@@ -5568,6 +5741,22 @@ subroutine find_face_areas(Datu, Datv, G, GV, US, CS, MS, halo, eta, add_max)
   elseif (present(add_max)) then
     Z_to_H = GV%Z_to_H ; if (.not.GV%Boussinesq) Z_to_H = GV%RZ_to_H * CS%Rho_BT_lin
 
+#ifdef IFX_WORKAROUNDS_MOM6
+    ! ifx makes the optional add_max PRIVATE (uninitialized) in the offloaded loops,
+    ! see bug_reports/ifx_optional_scalar_private.
+    add_max_loc = add_max
+    do concurrent (j=js-hs:je+hs, I=is-1-hs:ie+hs)
+      H1 = max((G%meanSL(i+1,j) + add_max_loc) + G%bathyT(i+1,j), 0.0)
+      H2 = max((G%meanSL(i,j) + add_max_loc) + G%bathyT(i,j), 0.0)
+      Datu(I,j) = CS%dy_Cu(I,j) * Z_to_H * max(H1, H2)
+    enddo
+
+    do concurrent (J=js-1-hs:je+hs, i=is-hs:ie+hs)
+      H1 = max((G%meanSL(i,j+1) + add_max_loc) + G%bathyT(i,j+1), 0.0)
+      H2 = max((G%meanSL(i,j) + add_max_loc) + G%bathyT(i,j), 0.0)
+      Datv(i,J) = CS%dx_Cv(i,J) * Z_to_H * max(H1, H2)
+    enddo
+#else
     do concurrent (j=js-hs:je+hs, I=is-1-hs:ie+hs)
       H1 = max((G%meanSL(i+1,j) + add_max) + G%bathyT(i+1,j), 0.0)
       H2 = max((G%meanSL(i,j) + add_max) + G%bathyT(i,j), 0.0)
@@ -5579,6 +5768,7 @@ subroutine find_face_areas(Datu, Datv, G, GV, US, CS, MS, halo, eta, add_max)
       H2 = max((G%meanSL(i,j) + add_max) + G%bathyT(i,j), 0.0)
       Datv(i,J) = CS%dx_Cv(i,J) * Z_to_H * max(H1, H2)
     enddo
+#endif
   else
     Z_to_H = GV%Z_to_H ; if (.not.GV%Boussinesq) Z_to_H = GV%RZ_to_H * CS%Rho_BT_lin
 
@@ -5669,6 +5859,9 @@ end subroutine bt_mass_source
 !! already been initialized.
 subroutine barotropic_init(u, v, h, Time, G, GV, US, param_file, diag, CS, &
                            restart_CS, calc_dtbt, BT_cont, OBC, SAL_CSp, HA_CSp)
+#ifdef IFX_WORKAROUNDS_MOM6
+  use, intrinsic :: iso_c_binding, only : c_loc, c_f_pointer, c_int8_t
+#endif
   type(ocean_grid_type),   intent(inout) :: G    !< The ocean's grid structure.
   type(verticalGrid_type), intent(in)    :: GV   !< The ocean's vertical grid structure.
   type(unit_scale_type),   intent(in)    :: US   !< A dimensional unit scaling type
@@ -5682,7 +5875,11 @@ subroutine barotropic_init(u, v, h, Time, G, GV, US, param_file, diag, CS, &
   type(param_file_type),   intent(in)    :: param_file !< A structure to parse for run-time parameters.
   type(diag_ctrl), target, intent(inout) :: diag !< A structure that is used to regulate diagnostic
                                                  !! output.
+#ifdef IFX_WORKAROUNDS_MOM6
+  type(barotropic_CS), target, intent(inout) :: CS !< Barotropic control structure
+#else
   type(barotropic_CS),     intent(inout) :: CS   !< Barotropic control structure
+#endif
   type(MOM_restart_CS),    intent(in)    :: restart_CS !< MOM restart control structure
   logical,                 intent(out)   :: calc_dtbt  !< If true, the barotropic time step must
                                                  !! be recalculated before stepping.
@@ -5699,6 +5896,9 @@ subroutine barotropic_init(u, v, h, Time, G, GV, US, param_file, diag, CS, &
 # include "version_variable.h"
   ! Local variables
   character(len=40)  :: mdl = "MOM_barotropic"  ! This module's name.
+#ifdef IFX_WORKAROUNDS_MOM6
+  integer(kind=c_int8_t), pointer :: CS_bytes(:) ! The storage of CS, viewed as an array of bytes
+#endif
   real :: Datu(SZIBS_(G),SZJ_(G))   ! Zonal open face area [H L ~> m2 or kg m-1].
   real :: Datv(SZI_(G),SZJBS_(G))   ! Meridional open face area [H L ~> m2 or kg m-1].
   real :: gtot_estimate ! Summed GV%g_prime [L2 H-1 T-2 ~> m s-2 or m4 kg-1 s-2], to give an
@@ -6587,7 +6787,17 @@ subroutine barotropic_init(u, v, h, Time, G, GV, US, param_file, diag, CS, &
     endif
   endif
 
+#ifdef IFX_WORKAROUNDS_MOM6
+  ! Avoid wrong data on the device with ifx and the Level Zero runtime, see
+  ! bug_reports/ifx_l0_staging_buffer_overrun.  ifx turns an update of CS into one transfer per
+  ! component, and the runtime follows each one with a small transfer per pointer already
+  ! attached in the enclosing mapped structure.  Update the same storage as one array instead.
+  ! This does not transfer the data of allocatable components, none of which is mapped yet.
+  call c_f_pointer(c_loc(CS), CS_bytes, [storage_size(CS)/8])
+  !$omp target update to (CS_bytes)
+#else
   !$omp target update to (CS)
+#endif
 
   ! CS%dtbt calculated here by set_dtbt is only used when dtbt is not reset during the run, i.e. DTBT_RESET_PERIOD<0.
   !$omp target enter data map (to: CS%frhatu, CS%frhatv)

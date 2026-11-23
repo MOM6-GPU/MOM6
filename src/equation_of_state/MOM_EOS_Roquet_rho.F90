@@ -206,6 +206,7 @@ contains
 !!
 !! This is an elemental function that can be applied to any combination of scalar and array inputs.
 real elemental function density_elem_Roquet_rho_loc(T, S, pressure)
+  !$omp declare target
   real, intent(in) :: T        !< Conservative temperature [degC]
   real, intent(in) :: S        !< Absolute salinity [g kg-1]
   real, intent(in) :: pressure !< Pressure [Pa]
@@ -276,6 +277,7 @@ end function density_elem_Roquet_rho
 !!
 !! This is an elemental function that can be applied to any combination of scalar and array inputs.
 real elemental function density_anomaly_elem_Roquet_rho_loc(T, S, pressure, rho_ref)
+  !$omp declare target
   real, intent(in) :: T        !< Conservative temperature [degC]
   real, intent(in) :: S        !< Absolute salinity [g kg-1]
   real, intent(in) :: pressure !< Pressure [Pa]
@@ -377,6 +379,7 @@ end function spec_vol_anomaly_elem_Roquet_rho
 !> For a given thermodynamic state, calculate the derivatives of density with conservative
 !! temperature and absolute salinity, using the density polynomial fit EOS from Roquet et al. (2015).
 elemental subroutine calculate_density_derivs_elem_Roquet_rho_loc(T, S, pressure, drho_dT, drho_dS)
+  !$omp declare target
   real, intent(in)  :: T        !< Conservative temperature [degC]
   real, intent(in)  :: S        !< Absolute salinity [g kg-1]
   real, intent(in)  :: pressure !< Pressure [Pa]
@@ -469,6 +472,7 @@ end subroutine calculate_density_derivs_elem_Roquet_rho
 !! Free-function form without "this" for use in do concurrent GPU regions with nvfortran.
 elemental subroutine calculate_density_second_derivs_elem_Roquet_rho_loc(T, S, pressure, &
                        drho_ds_ds, drho_ds_dt, drho_dt_dt, drho_ds_dp, drho_dt_dp)
+  !$omp declare target
   real, intent(in)    :: T           !< Conservative temperature [degC]
   real, intent(in)    :: S           !< Absolute salinity [g kg-1]
   real, intent(in)    :: pressure    !< Pressure [Pa]
@@ -584,6 +588,7 @@ end subroutine calculate_density_second_derivs_elem_Roquet_rho
 !> Calculate the partial derivatives of specific volume with temperature and salinity
 !! using the density polynomial fit EOS from Roquet et al. (2015).
 elemental subroutine calculate_specvol_derivs_elem_Roquet_rho_loc(T, S, pressure, dSV_dT, dSV_dS)
+  !$omp declare target
   real, intent(in)    :: T        !< Conservative temperature [degC]
   real, intent(in)    :: S        !< Absolute salinity [g kg-1]
   real, intent(in)    :: pressure !< Pressure [Pa]

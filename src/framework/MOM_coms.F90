@@ -613,10 +613,59 @@ subroutine increment_ints(int_sum, int2, prec_error)
 end subroutine increment_ints
 
 
+#ifdef IFX_WORKAROUNDS_MOM6
+!> Sum the elements of an array in EFP form and append the result to an existing EFP array.
+!!
+!! ifx 2026.1 workaround: when an assumed-shape dummy array is a non-contiguous section of a
+!! larger array (e.g. array(isc:iec,jsc:jec) from the checksum routines), the OpenMP runtime
+!! transfers only size(array) consecutive elements from the start of the section, so a device
+!! loop reads zeros for the trailing columns.  See bug_reports/ifx_map_noncontiguous_section.
+!! Non-contiguous arrays are copied into a contiguous temporary before the device loop.
+subroutine increment_block_ints(array, is, ie, js, je, descale, ints_sum, &
+    max_mag_term, prec_error)
+  real, intent(in) :: array(:,:)
+    !< The field being added, in arbitrary units [A ~> a]
+  integer, intent(in) :: is
+    !< Start i-index of the summed domain
+  integer, intent(in) :: ie
+    !< End i-index of the summed domain
+  integer, intent(in) :: js
+    !< Start j-index of the summed domain
+  integer, intent(in) :: je
+    !< End j-index of the summed domain
+  real, intent(in) :: descale
+    !< Factor to descale array to physical value [a A-1 ~> 1]
+  integer(kind=int64), intent(inout) :: ints_sum(efp_digits)
+    !< The array of EFP integers being incremented
+  real, intent(inout) :: max_mag_term
+    !< A running maximum magnitude of the r's, in arbitrary units [a]
+  integer(kind=int64), intent(in) :: prec_error
+    !< The maximum resolvable value for a given number of PEs
+
+  real, allocatable :: array_contig(:,:)
+    ! A contiguous copy of array, in arbitrary units [A ~> a]
+
+  if (is_contiguous(array)) then
+    call increment_block_ints_dev(array, is, ie, js, je, descale, ints_sum, &
+                                  max_mag_term, prec_error)
+  else
+    allocate(array_contig, source=array)
+    call increment_block_ints_dev(array_contig, is, ie, js, je, descale, ints_sum, &
+                                  max_mag_term, prec_error)
+    deallocate(array_contig)
+  endif
+end subroutine increment_block_ints
+
+!> Sum the elements of a contiguous array in EFP form and append the result to an
+!! existing EFP array.
+subroutine increment_block_ints_dev(array, is, ie, js, je, descale, ints_sum, &
+    max_mag_term, prec_error)
+#else
 !> Sum the elements of an array in EFP form and append the result to an
 !! existing EFP array.
 subroutine increment_block_ints(array, is, ie, js, je, descale, ints_sum, &
     max_mag_term, prec_error)
+#endif
   real, intent(in) :: array(:,:)
     !< The field being added, in arbitrary units [A ~> a]
   integer, intent(in) :: is
@@ -768,7 +817,11 @@ subroutine increment_block_ints(array, is, ie, js, je, descale, ints_sum, &
   ! Transfer error/warning signals to module flags
   if (inan /= 0) NaN_error = .true.
   if (iovf /= 0) overflow_error = .true.
+#ifdef IFX_WORKAROUNDS_MOM6
+end subroutine increment_block_ints_dev
+#else
 end subroutine increment_block_ints
+#endif
 
 
 !> Decompose one real into its 6 signed EFP bin contributions.  NaNs and

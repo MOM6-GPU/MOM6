@@ -203,9 +203,18 @@ subroutine int_density_dz_generic_pcm(T, S, z_t, z_b, rho_ref, rho_0, G_e, HI, &
       z0pres(i,j) = Z_0p(i,j)
     enddo
   else
+#ifdef IFX_WORKAROUNDS_MOM6
+    ! Avoid an ifx ICE, see bug_reports/ifx_dc_dtype_bounds_ice
+    associate(ifx_jsd=>HI%jsd, ifx_jed=>HI%jed, ifx_isd=>HI%isd, ifx_ied=>HI%ied)
+    do concurrent (j=ifx_jsd:ifx_jed, i=ifx_isd:ifx_ied)
+#else
     do concurrent (j=HI%jsd:HI%jed, i=HI%isd:HI%ied)
+#endif
       z0pres(i,j) = 0.0
     enddo
+#ifdef IFX_WORKAROUNDS_MOM6
+    end associate
+#endif
   endif
   use_rho_ref = .true.
   if (present(use_inaccurate_form)) then
@@ -748,9 +757,18 @@ subroutine int_density_dz_generic_plm(kstart, kend, tv, T_t, T_b, S_t, S_b, e, r
       z0pres(i,j) = Z_0p(i,j)
     enddo
   else
+#ifdef IFX_WORKAROUNDS_MOM6
+    ! Avoid an ifx ICE, see bug_reports/ifx_dc_dtype_bounds_ice
+    associate(ifx_jsd=>HI%jsd, ifx_jed=>HI%jed, ifx_isd=>HI%isd, ifx_ied=>HI%ied)
+    do concurrent (j=ifx_jsd:ifx_jed, i=ifx_isd:ifx_ied)
+#else
     do concurrent (j=HI%jsd:HI%jed, i=HI%isd:HI%ied)
+#endif
       z0pres(i,j) = 0.0
     enddo
+#ifdef IFX_WORKAROUNDS_MOM6
+    end associate
+#endif
   endif
   massWeightToggle = 0. ; TopWeightToggle = 0.
   if (present(MassWghtInterp)) then

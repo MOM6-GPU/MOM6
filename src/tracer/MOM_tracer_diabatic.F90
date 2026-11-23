@@ -22,7 +22,7 @@ public applyTracerBoundaryFluxesInOut
 public tracer_diabatic_init, tracer_diabatic_end
 
 integer, parameter :: default_niblock = 0 !< Default i block size for tracer_vertdiff [nondim]
-#ifdef __NVCOMPILER_OPENMP_GPU
+#if defined(__NVCOMPILER_OPENMP_GPU) || defined(MOM_OPENMP_GPU)
 integer, parameter :: default_njblock = 0 !< Default j block size for tracer_vertdiff [nondim]
 #else
 integer, parameter :: default_njblock = 1 !< Default j block size for tracer_vertdiff, which works on one

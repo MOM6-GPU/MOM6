@@ -52,7 +52,7 @@ public remap_vertvisc_aux_vars
 ! vary with the Boussinesq approximation, the Boussinesq variant is given first.
 
 integer, parameter :: default_niblock = 0 !< Default i block size for array calculations [nondim].
-#ifdef __NVCOMPILER_OPENMP_GPU
+#if defined(__NVCOMPILER_OPENMP_GPU) || defined(MOM_OPENMP_GPU)
 integer, parameter :: default_njblock = 0  !< Default j block size for array calculations [nondim].
 #else
 integer, parameter :: default_njblock = 1  !< Default j block size for array calculations [nondim].
@@ -185,7 +185,14 @@ subroutine set_viscous_BBL(u, v, h, tv, visc, G, GV, US, CS, pbv)
   type(porous_barrier_type),intent(in)    :: pbv  !< porous barrier fractional cell metrics
 
   ! Local variables
+  ! With IFX_WORKAROUNDS_MOM6 the 2-d and 3-d work arrays are allocatable, because ifx passes 4 extra
+  ! kernel arguments per explicit-shape array and two kernels below would exceed the 2048-byte
+  ! kernel argument limit of Intel GPUs, see bug_reports/ifx_kernel_args_explicit_shape_bounds.
+#ifdef IFX_WORKAROUNDS_MOM6
+  real, dimension(:,:), allocatable :: &
+#else
   real, dimension(SZIB_(G),SZJB_(G)) :: &
+#endif
     ustar, &    !   The bottom friction velocity [H T-1 ~> m s-1 or kg m-2 s-1].
     T_EOS, &    !   The temperature used to calculate the partial derivatives
                 ! of density with T and S [C ~> degC].
@@ -206,15 +213,27 @@ subroutine set_viscous_BBL(u, v, h, tv, visc, G, GV, US, CS, pbv)
 
   real :: Rhtot ! Running sum of thicknesses times the layer potential
                 ! densities [H R ~> kg m-2 or kg2 m-5].
+#ifdef IFX_WORKAROUNDS_MOM6
+  real, dimension(:,:), allocatable :: &
+#else
   real, dimension(SZIB_(G),SZJ_(G)) :: &
+#endif
     D_u, &      ! Bottom depth linearly interpolated to u points [Z ~> m].
     mask_u      ! A mask that disables any contributions from u points that
                 ! are land or past open boundary conditions [nondim], 0 or 1.
+#ifdef IFX_WORKAROUNDS_MOM6
+  real, dimension(:,:), allocatable :: &
+#else
   real, dimension(SZI_(G),SZJB_(G)) :: &
+#endif
     D_v, &      ! Bottom depth linearly interpolated to v points [Z ~> m].
     mask_v      ! A mask that disables any contributions from v points that
                 ! are land or past open boundary conditions [nondim], 0 or 1.
+#ifdef IFX_WORKAROUNDS_MOM6
+  real, dimension(:,:,:), allocatable :: &
+#else
   real, dimension(SZIB_(G),SZJB_(G),SZK_(GV)) :: &
+#endif
     h_at_vel, & ! Layer thickness at a velocity point, using an upwind-biased
                 ! second order accurate estimate based on the previous velocity
                 ! direction [H ~> m or kg m-2].
@@ -233,7 +252,11 @@ subroutine set_viscous_BBL(u, v, h, tv, visc, G, GV, US, CS, pbv)
                 ! velocity point [R-1 ~> m3 kg-1].
     Rml_vel     ! Arithmetic mean of the layer coordinate densities adjacent
                 ! to a velocity point [R ~> kg m-3].
+#ifdef IFX_WORKAROUNDS_MOM6
+  real, allocatable :: dz(:,:,:) ! Height change across layers [Z ~> m]
+#else
   real :: dz(SZI_(G),SZJ_(G),SZK_(GV)) ! Height change across layers [Z ~> m]
+#endif
 
   real :: h_vel_pos        ! The arithmetic mean thickness at a velocity point
                            ! plus H_neglect to avoid 0 values [H ~> m or kg m-2].
@@ -265,7 +288,11 @@ subroutine set_viscous_BBL(u, v, h, tv, visc, G, GV, US, CS, pbv)
   real :: BBL_thick_max    ! A huge upper bound on the boundary layer thickness [Z ~> m].
   real :: kv_bbl           ! The bottom boundary layer viscosity [H Z T-1 ~> m2 s-1 or Pa s]
   real :: C2f              ! C2f = 2*f at velocity points [T-1 ~> s-1].
+#ifdef IFX_WORKAROUNDS_MOM6
+  real, allocatable :: u2_bg(:,:) ! The square of an assumed background velocity, for calculating the mean
+#else
   real :: u2_bg(SZIB_(G),SZJB_(G))  ! The square of an assumed background velocity, for calculating the mean
+#endif
                            ! magnitude near the bottom for use in the quadratic bottom drag [L2 T-2 ~> m2 s-2].
   real :: hwtot            ! Sum of the thicknesses used to calculate
                            ! the near-bottom velocity magnitude [H ~> m or kg m-2].
@@ -284,9 +311,17 @@ subroutine set_viscous_BBL(u, v, h, tv, visc, G, GV, US, CS, pbv)
   real :: Rho0x400_G       ! 400*Rho0/G_Earth, times unit conversion factors
                            ! [R T2 H-1 ~> kg s2 m-4 or s2 m-1].
                            ! The 400 is a constant proposed by Killworth and Edwards, 1999.
+#ifdef IFX_WORKAROUNDS_MOM6
+  real, dimension(:,:,:), allocatable :: &
+#else
   real, dimension(SZI_(G),SZJ_(G),max(GV%nk_rho_varies,1)) :: &
+#endif
     Rml                    ! The mixed layer coordinate density [R ~> kg m-3].
+#ifdef IFX_WORKAROUNDS_MOM6
+  real, allocatable :: p_ref(:,:)  !   The pressure used to calculate the coordinate
+#else
   real :: p_ref(SZI_(G),SZJ_(G))   !   The pressure used to calculate the coordinate
+#endif
                            ! density [R L2 T-2 ~> Pa] (usually set to 2e7 Pa = 2000 dbar).
 
   real :: D_vel            ! The bottom depth relative to the shelfbreak depth at a velocity point [Z ~> m].
@@ -341,7 +376,12 @@ subroutine set_viscous_BBL(u, v, h, tv, visc, G, GV, US, CS, pbv)
   real :: tideampfac2_x_0p5 ! tideampfac2 multiplied by the c-grid averaging factor of 0.5
   real, parameter :: C1_3 = 1.0/3.0, C1_6 = 1.0/6.0, C1_12 = 1.0/12.0 ! Rational constants [nondim]
   real :: tmp              ! A temporary variable, sometimes in [Z ~> m]
+#ifdef IFX_WORKAROUNDS_MOM6
+  logical :: use_BBL_EOS
+  logical, allocatable :: do_i(:,:)
+#else
   logical :: use_BBL_EOS, do_i(SZIB_(G),SZJB_(G))
+#endif
   integer, dimension(2,2) :: EOSdom ! The computational domain for the equation of state
   integer :: i, j, k, is, ie, js, je, Isq, Ieq, Jsq, Jeq, nz, m, n, K2, nkmb, nkml, jstart
   integer :: is_OBC, ie_OBC, js_OBC, je_OBC
@@ -388,6 +428,20 @@ subroutine set_viscous_BBL(u, v, h, tv, visc, G, GV, US, CS, pbv)
   endif
   BBL_thick_max = G%Rad_Earth_L * US%L_to_Z
   K2 = max(nkmb+1, 2)
+
+#ifdef IFX_WORKAROUNDS_MOM6
+  allocate(ustar(SZIB_(G),SZJB_(G)), T_EOS(SZIB_(G),SZJB_(G)), S_EOS(SZIB_(G),SZJB_(G)))
+  allocate(dR_dT(SZIB_(G),SZJB_(G)), dR_dS(SZIB_(G),SZJB_(G)), press(SZIB_(G),SZJB_(G)))
+  allocate(umag_avg(SZIB_(G),SZJB_(G)), h_bbl_drag(SZIB_(G),SZJB_(G)), dz_bbl_drag(SZIB_(G),SZJB_(G)))
+  allocate(u2_bg(SZIB_(G),SZJB_(G)), do_i(SZIB_(G),SZJB_(G)))
+  allocate(D_u(SZIB_(G),SZJ_(G)), mask_u(SZIB_(G),SZJ_(G)), D_v(SZI_(G),SZJB_(G)), mask_v(SZI_(G),SZJB_(G)))
+  allocate(h_at_vel(SZIB_(G),SZJB_(G),SZK_(GV)), h_vel(SZIB_(G),SZJB_(G),SZK_(GV)))
+  allocate(dz_at_vel(SZIB_(G),SZJB_(G),SZK_(GV)), dz_vel(SZIB_(G),SZJB_(G),SZK_(GV)))
+  allocate(T_vel(SZIB_(G),SZJB_(G),SZK_(GV)), S_vel(SZIB_(G),SZJB_(G),SZK_(GV)))
+  allocate(SpV_vel(SZIB_(G),SZJB_(G),SZK_(GV)), Rml_vel(SZIB_(G),SZJB_(G),SZK_(GV)))
+  allocate(dz(SZI_(G),SZJ_(G),SZK_(GV)), Rml(SZI_(G),SZJ_(G),max(GV%nk_rho_varies,1)))
+  allocate(p_ref(SZI_(G),SZJ_(G)))
+#endif
 
   !$omp target enter data map(alloc: dz)
 
@@ -489,21 +543,48 @@ subroutine set_viscous_BBL(u, v, h, tv, visc, G, GV, US, CS, pbv)
   endif
 
   if (.not.use_BBL_EOS) then
+#ifdef IFX_WORKAROUNDS_MOM6
+    ! Avoid an ifx ICE, see bug_reports/ifx_dc_dtype_bounds_ice
+    associate(ifx_jsdb=>G%jsdB, ifx_jedb=>G%Jedb, ifx_isdb=>G%isdB, ifx_iedb=>G%iedB)
+    do concurrent (k=1:nz, j=ifx_jsdb:ifx_jedb, i=ifx_isdb:ifx_iedb)
+#else
     do concurrent (k=1:nz, j=G%jsdB:G%Jedb, i=G%isdB:G%iedB)
+#endif
       Rml_vel(i,j,k) = 0.0
     enddo
+#ifdef IFX_WORKAROUNDS_MOM6
+    end associate
+#endif
   endif
 
   ! Resetting Ray_[uv] is required by body force drag.
   if (allocated(visc%Ray_u)) then
+#ifdef IFX_WORKAROUNDS_MOM6
+    ! Avoid an ifx ICE, see bug_reports/ifx_dc_dtype_bounds_ice
+    associate(ifx_jsd=>G%jsd, ifx_jed=>G%jed, ifx_isdb=>G%isdB, ifx_iedb=>G%iedB)
+    do concurrent (k=1:nz, j=ifx_jsd:ifx_jed, i=ifx_isdb:ifx_iedb)
+#else
     do concurrent (k=1:nz, j=G%jsd:G%jed, i=G%isdB:G%iedB)
+#endif
       visc%Ray_u(i,j,k) = 0.0
     enddo
+#ifdef IFX_WORKAROUNDS_MOM6
+    end associate
+#endif
   endif
   if (allocated(visc%Ray_v)) then
+#ifdef IFX_WORKAROUNDS_MOM6
+    ! Avoid an ifx ICE, see bug_reports/ifx_dc_dtype_bounds_ice
+    associate(ifx_jsdb=>G%jsdB, ifx_jedb=>G%jedB, ifx_isd=>G%isd, ifx_ied=>G%ied)
+    do concurrent (k=1:nz, j=ifx_jsdb:ifx_jedb, i=ifx_isd:ifx_ied)
+#else
     do concurrent (k=1:nz, j=G%jsdB:G%jedB, i=G%isd:G%ied)
+#endif
       visc%Ray_v(i,j,k) = 0.0
     enddo
+#ifdef IFX_WORKAROUNDS_MOM6
+    end associate
+#endif
   endif
 
   !$omp target enter data map(alloc: S_vel, T_vel, SpV_vel, h_vel, h_at_vel, dz_vel, &
@@ -2407,7 +2488,7 @@ subroutine set_viscous_ML(u, v, h, tv, forces, visc, dt, G, GV, US, CS, nIIB, nJ
 
         !$omp target teams
         do k=nkml+1,nz
-#ifndef __NVCOMPILER_OPENMP_GPU
+#if !defined(__NVCOMPILER_OPENMP_GPU) && !defined(MOM_OPENMP_GPU)
           do_any = .false.
 #endif
 
@@ -2455,13 +2536,13 @@ subroutine set_viscous_ML(u, v, h, tv, forces, visc, dt, G, GV, US, CS, nIIB, nJ
                 k_massive(II,jj) = k
               endif ! hlay > h_tiny
 
-#ifndef __NVCOMPILER_OPENMP_GPU
+#if !defined(__NVCOMPILER_OPENMP_GPU) && !defined(MOM_OPENMP_GPU)
               if (do_ij(II,jj)) do_any = .true.
 #endif
             endif
           enddo ; enddo
 
-#ifndef __NVCOMPILER_OPENMP_GPU
+#if !defined(__NVCOMPILER_OPENMP_GPU) && !defined(MOM_OPENMP_GPU)
           if (.not.do_any) exit ! All columns are done.
 #endif
 
@@ -2781,7 +2862,7 @@ subroutine set_viscous_ML(u, v, h, tv, forces, visc, dt, G, GV, US, CS, nIIB, nJ
         !$omp target teams
         do k=nkml+1,nz
 ! no tracking of early exit on GPU
-#ifndef __NVCOMPILER_OPENMP_GPU
+#if !defined(__NVCOMPILER_OPENMP_GPU) && !defined(MOM_OPENMP_GPU)
           do_any = .false.
 #endif
 
@@ -2830,14 +2911,14 @@ subroutine set_viscous_ML(u, v, h, tv, forces, visc, dt, G, GV, US, CS, nIIB, nJ
               endif ! hlay > h_tiny
 
 ! no early exit on GPU
-#ifndef __NVCOMPILER_OPENMP_GPU
+#if !defined(__NVCOMPILER_OPENMP_GPU) && !defined(MOM_OPENMP_GPU)
               if (do_ij(ii,JJ)) do_any = .true.
 #endif
             endif
           enddo ; enddo
 
 ! on GPU, faster to do all k iterations, instead of exit early.
-#ifndef __NVCOMPILER_OPENMP_GPU
+#if !defined(__NVCOMPILER_OPENMP_GPU) && !defined(MOM_OPENMP_GPU)
           if (.not.do_any) exit ! All columns are done.
 #endif
           !$omp loop LOOP_BIND_TEAMS_PARALLEL collapse(2) private(i,j)
@@ -3708,6 +3789,15 @@ subroutine set_visc_init(Time, G, GV, US, param_file, diag, visc, CS, restart_CS
   call register_restart_field_as_obsolete('Kv_turb','Kv_shear', restart_CS)
 
   CS%id_clock_ML = cpu_clock_id('(Ocean set_viscous_ML)', grain=CLOCK_ROUTINE)
+
+#ifdef IFX_WORKAROUNDS_MOM6
+  ! ifx 2026.1 workaround: visc was sent to the device (target update to(visc) above) before
+  ! most of its allocatable components were allocated.  Mapping those components afterwards only
+  ! attaches their device addresses, so the device copy of visc keeps the unallocated descriptors:
+  ! allocated(visc%Kv_bbl_u) is false in kernels and writes to visc%bbl_thick_u are lost.
+  ! Resending visc refreshes the descriptors, see bug_reports/ifx_dt_component_write_lost.
+  !$omp target update to(visc)
+#endif
 
 end subroutine set_visc_init
 

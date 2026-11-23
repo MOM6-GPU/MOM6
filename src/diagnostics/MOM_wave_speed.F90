@@ -1855,7 +1855,7 @@ subroutine wave_speed_init(CS, GV, param_file, use_ebt_mode, mono_N2_column_frac
   ! treats one in a Fortran comment as the start of a character literal that spans lines, and
   ! if that literal closes between the #ifdef and the #endif, doxygen reports the #endif as
   ! having no matching #if.
-#ifdef __NVCOMPILER_OPENMP_GPU
+#if defined(__NVCOMPILER_OPENMP_GPU) || defined(MOM_OPENMP_GPU)
   ! The whole computational domain is worked on at once so that the offloaded loops have as
   ! much parallelism as possible.
   integer, parameter :: default_niblock = 0 ! Default i block size for the wave speed calculations

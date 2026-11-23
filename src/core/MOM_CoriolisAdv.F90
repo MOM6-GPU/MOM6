@@ -2130,7 +2130,7 @@ subroutine CoriolisAdv_init(Time, G, GV, US, param_file, diag, AD, CS)
   character(len=400) :: mesg
   logical :: use_weno
   integer :: isd, ied, jsd, jed, IsdB, IedB, JsdB, JedB, nz
-#ifdef __NVCOMPILER_OPENMP_GPU
+#if defined(__NVCOMPILER_OPENMP_GPU) || defined(MOM_OPENMP_GPU)
   integer, parameter :: default_nkblock = 0
 #else
   integer, parameter :: default_nkblock = 1

@@ -2922,7 +2922,7 @@ subroutine hor_visc_init(Time, G, GV, US, param_file, diag, CS, ADp)
   integer :: i, j
   ! This include declares and sets the variable "version".
 # include "version_variable.h"
-#ifdef __NVCOMPILER_OPENMP_GPU
+#if defined(__NVCOMPILER_OPENMP_GPU) || defined(MOM_OPENMP_GPU)
   integer, parameter :: default_nkblock = 0
 #else
   integer, parameter :: default_nkblock = 1

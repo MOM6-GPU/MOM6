@@ -40,7 +40,7 @@ public PressureForce_FV_Bouss, PressureForce_FV_nonBouss
 ! their mks counterparts with notation like "a velocity [Z T-1 ~> m s-1]".  If the units
 ! vary with the Boussinesq approximation, the Boussinesq variant is given first.
 
-#ifdef __NVCOMPILER_OPENMP_GPU
+#if defined(__NVCOMPILER_OPENMP_GPU) || defined(MOM_OPENMP_GPU)
 integer, parameter :: default_nkblock = 0  !< Default k block size for PLM density integrals [nondim]
 integer, parameter :: default_njblock_plm = 0 !< Default j block size for PLM density integrals [nondim]
 #else
@@ -2192,7 +2192,7 @@ subroutine PressureForce_FV_init(Time, G, GV, US, param_file, diag, CS, ADp, SAL
   logical :: use_ALE       ! If true, use the Vertical Lagrangian Remap algorithm
   logical :: stoch_eos     ! Can't use Stanley param here unless stoch_eos is true
   integer :: isd, ied, jsd, jed, IsdB, IedB, JsdB, JedB, nz
-#ifdef __NVCOMPILER_OPENMP_GPU
+#if defined(__NVCOMPILER_OPENMP_GPU) || defined(MOM_OPENMP_GPU)
   integer, parameter :: default_njblock_pcm = 0  !< Default j block size for PCM density integrals [nondim]
 #else
   integer, parameter :: default_njblock_pcm = 1  !< Default j block size for PCM density integrals [nondim]

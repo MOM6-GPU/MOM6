@@ -26,7 +26,7 @@ implicit none ; private
 public geothermal_entraining, geothermal_in_place, geothermal_init, geothermal_end
 
 integer, parameter :: default_niblock = 0 !< Default i block size for geothermal_in_place [nondim]
-#ifdef __NVCOMPILER_OPENMP_GPU
+#if defined(__NVCOMPILER_OPENMP_GPU) || defined(MOM_OPENMP_GPU)
 integer, parameter :: default_njblock = 0 !< Default j block size for geothermal_in_place [nondim]
 #else
 integer, parameter :: default_njblock = 1 !< Default j block size for geothermal_in_place, which works on one
@@ -483,14 +483,32 @@ subroutine geothermal_in_place_block(h, tv, dt, G, GV, US, CS, BFlx_geothermal, 
   !$omp target enter data map(alloc: heat_rem, bottom_pressure, T_bot, S_bot, dRhodT, dRhodS, &
   !$omp                              dSpVdT, dSpVdS, dTdt_diag)
 
+#ifdef IFX_WORKAROUNDS_MOM6
+  ! Avoid an ifx ICE, see bug_reports/ifx_dc_dtype_bounds_ice
+  associate(ifx_jsd=>G%jsd, ifx_jed=>G%jed, ifx_isd=>G%isd, ifx_ied=>G%ied)
+  do concurrent (j=ifx_jsd:ifx_jed, i=ifx_isd:ifx_ied)
+#else
   do concurrent (j=G%jsd:G%jed, i=G%isd:G%ied)
+#endif
     BFlx_geothermal(i,j) = 0.0
   enddo
+#ifdef IFX_WORKAROUNDS_MOM6
+  end associate
+#endif
 
   if (calc_diags) then
+#ifdef IFX_WORKAROUNDS_MOM6
+    ! Avoid an ifx ICE, see bug_reports/ifx_dc_dtype_bounds_ice
+    associate(ifx_jsd=>G%jsd, ifx_jed=>G%jed, ifx_isd=>G%isd, ifx_ied=>G%ied)
+    do concurrent (k=1:nz, j=ifx_jsd:ifx_jed, i=ifx_isd:ifx_ied)
+#else
     do concurrent (k=1:nz, j=G%jsd:G%jed, i=G%isd:G%ied)
+#endif
       dTdt_diag(i,j,k) = 0.0
     enddo
+#ifdef IFX_WORKAROUNDS_MOM6
+    end associate
+#endif
   endif
 
   do jsb=js,je,njj ; do isb=is,ie,nii

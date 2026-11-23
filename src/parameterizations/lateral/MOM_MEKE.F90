@@ -1878,7 +1878,7 @@ subroutine ML_MEKE_init(diag, G, US, Time, param_file, dbcomms_CS, CS)
   character(len=200)  :: inputdir, backend, model_filename
   integer :: db_return_code, batch_size
   character(len=40) :: mdl = "MOM_ML_MEKE"
-#ifdef __NVCOMPILER_OPENMP_GPU
+#if defined(__NVCOMPILER_OPENMP_GPU) || defined(MOM_OPENMP_GPU)
   integer, parameter :: default_niblock = 0
   integer, parameter :: default_njblock = 0
   integer, parameter :: default_nkblock = 0

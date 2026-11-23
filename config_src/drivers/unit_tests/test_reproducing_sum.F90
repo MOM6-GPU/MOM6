@@ -192,7 +192,13 @@ subroutine generate_array_of_values(D, HI, n_global)
   PI = 4.0*atan(1.0)
 
   !  Calculate the depth of the bottom.
+#ifdef IFX_WORKAROUNDS_MOM6
+  ! Avoid an ifx ICE, see bug_reports/ifx_dc_dtype_bounds_ice
+  associate(ifx_jsc=>HI%jsc, ifx_jec=>HI%jec, ifx_isc=>HI%isc, ifx_iec=>HI%iec)
+  do concurrent (j=ifx_jsc:ifx_jec, i=ifx_isc:ifx_iec)
+#else
   do concurrent( j=HI%jsc:HI%jec, i=HI%isc:HI%iec )
+#endif
     x = real( i + HI%idg_offset ) / real( n_global(1) )
     y = real( j + HI%idg_offset ) / real( n_global(2) )
     D(i,j) = -3000.0  * ( y*(1.0 + 0.6*cos(4.0*PI*x)) &
@@ -201,6 +207,9 @@ subroutine generate_array_of_values(D, HI, n_global)
     if (D(i,j) > 3000.0) D(i,j) = 3000.0
     if (D(i,j) < 1.) D(i,j) = 0.
   enddo
+#ifdef IFX_WORKAROUNDS_MOM6
+  end associate
+#endif
 
 end subroutine generate_array_of_values
 

@@ -620,6 +620,14 @@ subroutine alloc_BT_cont_type(BT_cont, G, GV, alloc_faces)
     !$omp target enter data map(to: BT_cont%h_u, BT_cont%h_v)
   endif ; endif
 
+#ifdef IFX_WORKAROUNDS_MOM6
+  ! ifx 2026.1 workaround: BT_cont was mapped before its components were allocated; mapping a
+  ! component only attaches its device address, so the device copy of BT_cont keeps unallocated
+  ! descriptors and kernel writes to BT_cont%FA_u_E0 etc. are lost.  Resend it now that all
+  ! components exist, see bug_reports/ifx_dt_component_write_lost.
+  !$omp target update to(BT_cont)
+#endif
+
 end subroutine alloc_BT_cont_type
 
 !> Deallocates the arrays contained within a BT_cont_type.

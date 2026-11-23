@@ -4274,6 +4274,14 @@ subroutine vertvisc_init(MIS, Time, G, GV, US, param_file, diag, ADp, dirs, &
   if ((len_trim(CS%u_trunc_file) > 0) .or. (len_trim(CS%v_trunc_file) > 0)) &
     call PointAccel_init(MIS, Time, G, param_file, diag, dirs, CS%PointAccel_CSp)
 
+#ifdef IFX_WORKAROUNDS_MOM6
+  ! ifx 2026.1 workaround: CS was sent to the device before some of its allocatable
+  ! components were allocated and mapped; mapping a component only attaches its device address,
+  ! so the device copy keeps stale descriptors.  Resend it now that all components exist,
+  ! see bug_reports/ifx_dt_component_write_lost.
+  !$omp target update to(CS)
+#endif
+
 end subroutine vertvisc_init
 
 !> Update the CFL truncation value as a function of time.
