@@ -414,6 +414,9 @@ subroutine write_energy(u, v, h, tv, day, n, G, GV, US, CS, tracer_CSp, dt_forci
   real :: CFL_trans    ! A transport-based definition of the CFL number [nondim].
   real :: CFL_lin      ! A simpler definition of the CFL number [nondim].
   real :: max_CFL(2)   ! The maxima of the CFL numbers [nondim].
+  real :: dt_in_T      ! The model time step used to calculate the CFL numbers [T ~> s].
+  real :: max_CFL_trans ! The maximum of the transport-based CFL number on this PE [nondim].
+  real :: max_CFL_lin   ! The maximum of the simpler definition of the CFL number on this PE [nondim].
   real, dimension(SZI_(G),SZJ_(G),SZK_(GV)) :: &
     tmp1               ! A temporary array used in reproducing sums [various]
   real, dimension(SZI_(G),SZJ_(G),SZK_(GV)+1) :: &
@@ -566,6 +569,9 @@ subroutine write_energy(u, v, h, tv, day, n, G, GV, US, CS, tracer_CSp, dt_forci
 
   if (.not.CS%initialized) call MOM_error(FATAL, &
          "write_energy: Module must be initialized before it is used.")
+
+  ! The tracer stock calculations read the host copy of h, which must be copied from the device.
+  !$omp target update from(h)
 
   !$omp target enter data map(alloc: areaTm, tmp1, PE_pt, Salt_int, Temp_int, eta, Z_0APE)
 
@@ -804,27 +810,33 @@ subroutine write_energy(u, v, h, tv, day, n, G, GV, US, CS, tracer_CSp, dt_forci
   !$omp target exit data map(delete: areaTm, tmp1, PE_pt, Salt_int, Temp_int, eta, Z_0APE)
 
   ! Calculate the maximum CFL numbers.
-  max_CFL(1:2) = 0.0
-  do k=1,nz ; do j=js,je ; do I=Isq,Ieq
+  dt_in_T = CS%dt_in_T
+  max_CFL_trans = 0.0 ; max_CFL_lin = 0.0
+  do concurrent (k=1:nz, j=js:je, I=Isq:Ieq) &
+      DO_LOCALITY(local(CFL_Iarea, CFL_trans, CFL_lin)) &
+      DO_LOCALITY(reduce(max: max_CFL_trans, max_CFL_lin))
     CFL_Iarea = G%IareaT(i,j)
     if (u(I,j,k) < 0.0) &
       CFL_Iarea = G%IareaT(i+1,j)
 
-    CFL_trans = abs(u(I,j,k) * CS%dt_in_T) * (G%dy_Cu(I,j) * CFL_Iarea)
-    CFL_lin = abs(u(I,j,k) * CS%dt_in_T) * G%IdxCu(I,j)
-    max_CFL(1) = max(max_CFL(1), CFL_trans)
-    max_CFL(2) = max(max_CFL(2), CFL_lin)
-  enddo ; enddo ; enddo
-  do k=1,nz ; do J=Jsq,Jeq ; do i=is,ie
+    CFL_trans = abs(u(I,j,k) * dt_in_T) * (G%dy_Cu(I,j) * CFL_Iarea)
+    CFL_lin = abs(u(I,j,k) * dt_in_T) * G%IdxCu(I,j)
+    max_CFL_trans = max(max_CFL_trans, CFL_trans)
+    max_CFL_lin = max(max_CFL_lin, CFL_lin)
+  enddo
+  do concurrent (k=1:nz, J=Jsq:Jeq, i=is:ie) &
+      DO_LOCALITY(local(CFL_Iarea, CFL_trans, CFL_lin)) &
+      DO_LOCALITY(reduce(max: max_CFL_trans, max_CFL_lin))
     CFL_Iarea = G%IareaT(i,j)
     if (v(i,J,k) < 0.0) &
       CFL_Iarea = G%IareaT(i,j+1)
 
-    CFL_trans = abs(v(i,J,k) * CS%dt_in_T) * (G%dx_Cv(i,J) * CFL_Iarea)
-    CFL_lin = abs(v(i,J,k) * CS%dt_in_T) * G%IdyCv(i,J)
-    max_CFL(1) = max(max_CFL(1), CFL_trans)
-    max_CFL(2) = max(max_CFL(2), CFL_lin)
-  enddo ; enddo ; enddo
+    CFL_trans = abs(v(i,J,k) * dt_in_T) * (G%dx_Cv(i,J) * CFL_Iarea)
+    CFL_lin = abs(v(i,J,k) * dt_in_T) * G%IdyCv(i,J)
+    max_CFL_trans = max(max_CFL_trans, CFL_trans)
+    max_CFL_lin = max(max_CFL_lin, CFL_lin)
+  enddo
+  max_CFL(1) = max_CFL_trans ; max_CFL(2) = max_CFL_lin
 
   call sum_across_PEs(CS%ntrunc)
 
