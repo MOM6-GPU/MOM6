@@ -3,6 +3,12 @@
 ! SPDX-License-Identifier: Apache-2.0
 
 #include "do_concurrent_compat.h"
+#include "omp_loop_bind_compat.h"
+
+! LOOP_BIND_TEAMS_PARALLEL keeps nvfortran from running loops with calls on teams only, where they race
+! with other loops in the region.  With distribute parallel do, k must be innermost to be efficient.
+! There is no barrier between teams, so loops in a region must be pointwise with the same bounds.
+! Without HAVE_FC_OMP_LOOP_BIND (set by configure), the clause is dropped and the race can return.
 
 !> Solve the layer continuity equation using the PPM method for layer fluxes.
 module MOM_continuity_PPM
@@ -792,8 +798,8 @@ subroutine zonal_mass_flux(u, h_in, h_W, h_E, uh, dt, G, GV, US, CS, OBC, por_fa
       endif
       !   Set limits on du that will keep the CFL number between -1 and 1.
       ! This should be adequate to keep the root bracketed in all cases.
-      !$omp target
-      !$omp loop collapse(2) private(I,j,I_vrm,dx_W,dx_E)
+      !$omp target teams
+      !$omp loop collapse(2) private(I,j,I_vrm,dx_W,dx_E) LOOP_BIND_TEAMS_PARALLEL
       do jj=1,jje ; do II=1,IIe
         I = IsbB + II - 1
         j = jsb + jj - 1
@@ -816,13 +822,13 @@ subroutine zonal_mass_flux(u, h_in, h_W, h_E, uh, dt, G, GV, US, CS, OBC, por_fa
           uh_tot_0(II,jj) = uh_tot_0(II,jj) + uh_b(II,jj,k)
         enddo ; enddo
       enddo
-      !$omp end target
+      !$omp end target teams
 
       if (use_visc_rem) then
         if (CS%aggress_adjust) then
-          !$omp target
+          !$omp target teams
           do k=1,nz
-            !$omp loop collapse(2) private(I,j,dx_W,dx_E,du_lim)
+            !$omp loop collapse(2) private(I,j,dx_W,dx_E,du_lim) LOOP_BIND_TEAMS_PARALLEL
             do jj=1,jje ; do II=1,IIe
               I = IsbB + II - 1
               j = jsb + jj - 1
@@ -841,11 +847,11 @@ subroutine zonal_mass_flux(u, h_in, h_W, h_E, uh, dt, G, GV, US, CS, OBC, por_fa
                 du_min_CFL(II,jj) = du_lim / visc_rem(II,jj,k)
             enddo ; enddo
           enddo
-          !$omp end target
+          !$omp end target teams
         else
-          !$omp target
+          !$omp target teams
           do k=1,nz
-            !$omp loop collapse(2) private(I,j,dx_W,dx_E)
+            !$omp loop collapse(2) private(I,j,dx_W,dx_E) LOOP_BIND_TEAMS_PARALLEL
             do jj=1,jje ; do II=1,IIe
               I = IsbB + II - 1
               j = jsb + jj - 1
@@ -861,13 +867,13 @@ subroutine zonal_mass_flux(u, h_in, h_W, h_E, uh, dt, G, GV, US, CS, OBC, por_fa
                 du_min_CFL(II,jj) = -(dx_E*CFL_dt + u(I,j,k)) / visc_rem(II,jj,k)
             enddo ; enddo
           enddo
-          !$omp end target
+          !$omp end target teams
         endif
       else
         if (CS%aggress_adjust) then
-          !$omp target
+          !$omp target teams
           do k=1,nz
-            !$omp loop collapse(2) private(I,j,dx_W,dx_E)
+            !$omp loop collapse(2) private(I,j,dx_W,dx_E) LOOP_BIND_TEAMS_PARALLEL
             do jj=1,jje ; do II=1,IIe
               I = IsbB + II - 1
               j = jsb + jj - 1
@@ -883,11 +889,11 @@ subroutine zonal_mass_flux(u, h_in, h_W, h_E, uh, dt, G, GV, US, CS, OBC, por_fa
                           ((-dx_E*I_dt - u(I,j,k)) + MAX(0.0,u(I+1,j,k))) )
             enddo ; enddo
           enddo
-          !$omp end target
+          !$omp end target teams
         else
-          !$omp target
+          !$omp target teams
           do k=1,nz
-            !$omp loop collapse(2) private(I,j,dx_W,dx_E)
+            !$omp loop collapse(2) private(I,j,dx_W,dx_E) LOOP_BIND_TEAMS_PARALLEL
             do jj=1,jje ; do II=1,IIe
               I = IsbB + II - 1
               j = jsb + jj - 1
@@ -901,7 +907,7 @@ subroutine zonal_mass_flux(u, h_in, h_W, h_E, uh, dt, G, GV, US, CS, OBC, por_fa
               du_min_CFL(II,jj) = MAX(du_min_CFL(II,jj), -(dx_E*CFL_dt + u(I,j,k)))
             enddo ; enddo
           enddo
-          !$omp end target
+          !$omp end target teams
         endif
       endif
       do concurrent (jj=1:jje, II=1:IIe)
@@ -1728,9 +1734,9 @@ subroutine set_zonal_BT_cont(u, h_in, h_W, h_E, BT_cont, uh_tot_0, duhdu_tot_0, 
   enddo
   !$omp end target
 
-  !$omp target
+  !$omp target teams
   do k=1,nz
-    !$omp loop collapse(2) private(I,j,u_L,u_R,u_0,duhdu_0,duhdu_L,duhdu_R,uh_0,uh_L,uh_R)
+    !$omp loop collapse(2) private(I,j,u_L,u_R,u_0,duhdu_0,duhdu_L,duhdu_R,uh_0,uh_L,uh_R) LOOP_BIND_TEAMS_PARALLEL
     do jj=1,jje ; do II=1,IIe
       I = IsbB + II - 1
       j = jsb + jj - 1
@@ -1827,7 +1833,7 @@ subroutine set_zonal_BT_cont(u, h_in, h_W, h_E, BT_cont, uh_tot_0, duhdu_tot_0, 
       BT_cont%uBT_EE(I,j) = 0.
     endif
   enddo ; enddo
-  !$omp end target
+  !$omp end target teams
   !$omp target exit data &
   !$omp   map(release:du0,duL,duR,du_CFL,FAmt_L,FAmt_R,FAmt_0,uhtot_L,uhtot_R,zeros)
 end subroutine set_zonal_BT_cont
@@ -2036,8 +2042,8 @@ subroutine meridional_mass_flux(v, h_in, h_S, h_N, vh, dt, G, GV, US, CS, OBC, p
 
       !   Set limits on dv that will keep the CFL number between -1 and 1.
       ! This should be adequate to keep the root bracketed in all cases.
-      !$omp target
-      !$omp loop collapse(2) private(i,J,I_vrm,dy_S,dy_N)
+      !$omp target teams
+      !$omp loop collapse(2) private(i,J,I_vrm,dy_S,dy_N) LOOP_BIND_TEAMS_PARALLEL
       do JJ=1,JJe ; do ii=1,iie
         i = isb + ii - 1
         J = JsbB + JJ - 1
@@ -2060,13 +2066,13 @@ subroutine meridional_mass_flux(v, h_in, h_S, h_N, vh, dt, G, GV, US, CS, OBC, p
           vh_tot_0(ii,JJ) = vh_tot_0(ii,JJ) + vh_b(ii,JJ,k)
         enddo
       enddo ; enddo
-      !$omp end target
+      !$omp end target teams
 
       if (use_visc_rem) then
         if (CS%aggress_adjust) then
-          !$omp target
+          !$omp target teams
           do k=1,nz
-            !$omp loop collapse(2) private(i,J,dy_S,dy_N,dv_lim)
+            !$omp loop collapse(2) private(i,J,dy_S,dy_N,dv_lim) LOOP_BIND_TEAMS_PARALLEL
             do JJ=1,JJe ; do ii=1,iie
               i = isb + ii - 1
               J = JsbB + JJ - 1
@@ -2084,11 +2090,11 @@ subroutine meridional_mass_flux(v, h_in, h_S, h_N, vh, dt, G, GV, US, CS, OBC, p
                 dv_min_CFL(ii,JJ) = dv_lim / visc_rem(ii,JJ,k)
             enddo
           enddo ; enddo
-          !$omp end target
+          !$omp end target teams
         else
-          !$omp target
+          !$omp target teams
           do k=1,nz
-            !$omp loop collapse(2) private(i,J,dy_S,dy_N)
+            !$omp loop collapse(2) private(i,J,dy_S,dy_N) LOOP_BIND_TEAMS_PARALLEL
             do JJ=1,JJe ; do ii=1,iie
               i = isb + ii - 1
               J = JsbB + JJ - 1
@@ -2105,13 +2111,13 @@ subroutine meridional_mass_flux(v, h_in, h_S, h_N, vh, dt, G, GV, US, CS, OBC, p
                 dv_min_CFL(ii,JJ) = -(dy_N*CFL_dt + v(i,J,k)) / visc_rem(ii,JJ,k)
             enddo ; enddo
           enddo
-          !$omp end target
+          !$omp end target teams
         endif
       else
         if (CS%aggress_adjust) then
-          !$omp target
+          !$omp target teams
           do k=1,nz
-            !$omp loop collapse(2) private(i,J,dy_S,dy_N)
+            !$omp loop collapse(2) private(i,J,dy_S,dy_N) LOOP_BIND_TEAMS_PARALLEL
             do JJ=1,JJe ; do ii=1,iie
               i = isb + ii - 1
               J = JsbB + JJ - 1
@@ -2126,11 +2132,11 @@ subroutine meridional_mass_flux(v, h_in, h_S, h_N, vh, dt, G, GV, US, CS, OBC, p
                           ((-dy_N*I_dt - v(i,J,k)) + MAX(0.0,v(i,J+1,k))) )
             enddo ; enddo
           enddo
-          !$omp end target
+          !$omp end target teams
         else
-          !$omp target
+          !$omp target teams
           do k=1,nz
-            !$omp loop collapse(2) private(i,J,dy_S,dy_N)
+            !$omp loop collapse(2) private(i,J,dy_S,dy_N) LOOP_BIND_TEAMS_PARALLEL
             do JJ=1,JJe ; do ii=1,iie
               i = isb + ii - 1
               J = JsbB + JJ - 1
@@ -2143,7 +2149,7 @@ subroutine meridional_mass_flux(v, h_in, h_S, h_N, vh, dt, G, GV, US, CS, OBC, p
               dv_min_CFL(ii,JJ) = max(dv_min_CFL(ii,JJ), -(dy_N*CFL_dt + v(i,J,k)))
             enddo ; enddo
           enddo
-          !$omp end target
+          !$omp end target teams
         endif
       endif
       do concurrent (JJ=1:JJe, ii=1:iie)
@@ -2836,9 +2842,9 @@ subroutine set_merid_BT_cont(v, h_in, h_S, h_N, BT_cont, vh_tot_0, dvhdv_tot_0, 
   enddo
   !$omp end target
 
-  !$omp target
+  !$omp target teams
   do k=1,nz
-    !$omp loop collapse(2) private(i,J,v_L,v_R,v_0,dvhdv_0,dvhdv_L,dvhdv_R,vh_0,vh_L,vh_R)
+    !$omp loop collapse(2) private(i,J,v_L,v_R,v_0,dvhdv_0,dvhdv_L,dvhdv_R,vh_0,vh_L,vh_R) LOOP_BIND_TEAMS_PARALLEL
     do JJ=1,JJe ; do ii=1,iie
       i = isb + ii - 1
       J = JsbB + JJ - 1
@@ -2933,7 +2939,7 @@ subroutine set_merid_BT_cont(v, h_in, h_S, h_N, BT_cont, vh_tot_0, dvhdv_tot_0, 
       BT_cont%vBT_NN(i,J) = 0.
     endif
   enddo ; enddo
-  !$omp end target
+  !$omp end target teams
   !$omp target exit data &
   !$omp   map(release:dv0,dvL,dvR,dv_CFL,FAmt_L,FAmt_R,FAmt_0,vhtot_L,vhtot_R,zeros)
 end subroutine set_merid_BT_cont
