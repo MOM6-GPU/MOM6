@@ -1,6 +1,7 @@
 ! This file is part of MOM6, the Modular Ocean Model version 6.
 ! See the LICENSE file for licensing information.
 ! SPDX-License-Identifier: Apache-2.0
+#include "do_concurrent_compat.h"
 
 !> A column-wise toolbox for implementing neutral diffusion
 module MOM_neutral_diffusion
@@ -45,6 +46,8 @@ public neutral_diffusion_unit_tests
 type, public :: neutral_diffusion_CS ; private
   integer :: nkp1     !< Number of interfaces for a column = nk + 1
   integer :: nsurf    !< Number of neutral surfaces
+  integer :: niblock  !< The i block size used in array calculations
+  integer :: njblock  !< The j block size used in array calculations
   integer :: deg = 2  !< Degree of polynomial used for reconstructions
   logical :: continuous_reconstruction = .true. !< True if using continuous PPM reconstruction at interfaces
   logical :: debug = .false. !< If true, write verbose debugging messages
@@ -156,6 +159,17 @@ logical function neutral_diffusion_init(Time, G, GV, US, param_file, diag, EOS, 
                                   !! extrapolation should be used within boundary cells.
   logical :: om4_remap_via_sub_cells ! If true, use the OM4 remapping algorithm
   logical :: KhTh_use_ebt_struct, KhTh_use_sqg_struct
+#ifdef __NVCOMPILER_OPENMP_GPU
+  integer, parameter :: default_niblock = 0
+    ! Default i block size for array calculations
+  integer, parameter :: default_njblock = 0
+    ! Default j block size for array calculations
+#else
+  integer, parameter :: default_niblock = 0
+    ! Default i block size for array calculations
+  integer, parameter :: default_njblock = 1
+    ! Default j block size for array calculations
+#endif
 
   if (associated(CS)) then
     call MOM_error(FATAL, "neutral_diffusion_init called with associated control structure.")
@@ -222,6 +236,20 @@ logical function neutral_diffusion_init(Time, G, GV, US, param_file, diag, EOS, 
                  "neutral diffusion code, while higher values use mathematically equivalent "//&
                  "expressions that recover rotational symmetry.", &
                  default=default_answer_date)
+  call get_param(param_file, mdl, "NDIFF_NIBLOCK", CS%niblock, &
+                 "The i-direction block size used in the neutral diffusion "//&
+                 "calculations. A value of 0 uses the full computational "//&
+                 "i-domain extent.", &
+                 default=default_niblock, layoutParam=.true.)
+  call get_param(param_file, mdl, "NDIFF_NJBLOCK", CS%njblock, &
+                 "The j-direction block size used in the neutral diffusion "//&
+                 "calculations. A value of 0 uses the full computational "//&
+                 "j-domain extent.", &
+                 default=default_njblock, layoutParam=.true.)
+  if (CS%niblock < 0) &
+    call MOM_error(FATAL, "NDIFF_NIBLOCK must be nonnegative.")
+  if (CS%njblock < 0) &
+    call MOM_error(FATAL, "NDIFF_NJBLOCK must be nonnegative.")
 
   ! Initialize and configure remapping
   if ( .not.CS%continuous_reconstruction ) then
@@ -364,14 +392,14 @@ subroutine neutral_diffusion_calc_coeffs(G, GV, US, h, T, S, visc, CS, p_surf)
                                                               !! for equation of state calculations [R L2 T-2 ~> Pa]
 
   ! Local variables
-  integer, dimension(2) :: EOSdom ! The i-computational domain for the equation of state
+  integer, dimension(3,2) :: EOSdom ! The i-computational domain for the equation of state
   integer :: i, j, k
   ! Variables used for reconstructions
   real, dimension(SZK_(GV),2) :: ppoly_r_S  ! Reconstruction slopes that are unused here, in units of a vertical
                               ! gradient, which for temperature would be [C H-1 ~> degC m-1 or degC m2 kg-1].
   real, dimension(SZI_(G), SZJ_(G)) :: hEff_sum ! Summed effective face thicknesses [H ~> m or kg m-2]
   integer :: iMethod
-  real, dimension(SZI_(G)) :: ref_pres ! Reference pressure used to calculate alpha/beta [R L2 T-2 ~> Pa]
+  real, dimension(SZI_(G),SZJ_(G),SZK_(GV)+1) :: ref_pres ! Reference pressure used to calculate alpha/beta [R L2 T-2 ~> Pa]
   real :: h_neglect, h_neglect_edge    ! Negligible thicknesses [H ~> m or kg m-2]
   integer, dimension(SZI_(G), SZJ_(G)) :: k_top  ! Index of the first layer within the boundary
   real,    dimension(SZI_(G), SZJ_(G)) :: zeta_top ! Distance from the top of a layer to the intersection of the
@@ -380,11 +408,24 @@ subroutine neutral_diffusion_calc_coeffs(G, GV, US, h, T, S, visc, CS, p_surf)
   real,    dimension(SZI_(G), SZJ_(G)) :: zeta_bot ! Distance of the lower layer to the boundary layer depth [nondim]
   real :: pa_to_H                      ! A conversion factor from rescaled pressure to thickness
                                        ! (H) units [H T2 R-1 Z-2 ~> m Pa-1 or s2 m-1]
+  integer :: isb, ieb, jsb, jeb, iie, jje, nii, njj
+
+  ! block sizes
+  njj = (G%jec+1) - (G%jsc-1) + 1
+  nii = (G%iec+1) - (G%isc-1) + 1
 
   pa_to_H = 1. / (GV%H_to_RZ * GV%g_Earth)
 
-  k_top(:,:) = 1     ; k_bot(:,:) = 1
-  zeta_top(:,:) = 0. ; zeta_bot(:,:) = 0.
+  !$omp target enter data map(alloc: k_top, k_bot, zeta_top, zeta_bot)
+  !$omp target enter data map(to: CS)
+  !$omp target enter data map(alloc: CS%dRdS, CS%dRdT, CS%Pint) map(to: CS%Tint, CS%Sint)
+
+  do concurrent (j=G%jsd:G%jed, i=G%isd:G%ied)
+    k_top(i,j) = 1     ; k_bot(i,j) = 1
+    zeta_top(i,j) = 0. ; zeta_bot(i,j) = 0.
+  enddo
+
+  !$omp target exit data map(from: k_top, k_bot, zeta_top, zeta_bot)
 
   ! Check if hbl needs to be extracted
   if (CS%interior_only) then
@@ -419,12 +460,14 @@ subroutine neutral_diffusion_calc_coeffs(G, GV, US, h, T, S, visc, CS, p_surf)
 
   ! If doing along isopycnal diffusion (as opposed to neutral diffusion, set the reference pressure)
   if (CS%ref_pres>=0.) then
-    ref_pres(:) = CS%ref_pres
+    ref_pres(:,:,:) = CS%ref_pres
   endif
 
   if (CS%continuous_reconstruction) then
-    CS%dRdT(:,:,:) = 0.
-    CS%dRdS(:,:,:) = 0.
+    do concurrent (k=1:GV%ke+1, j=G%jsd:G%jed, i=G%isd:G%ied)
+      CS%dRdT(i,j,k) = 0.
+      CS%dRdS(i,j,k) = 0.
+    enddo
   else
     CS%T_i(:,:,:,:) = 0.
     CS%S_i(:,:,:,:) = 0.
@@ -436,15 +479,20 @@ subroutine neutral_diffusion_calc_coeffs(G, GV, US, h, T, S, visc, CS, p_surf)
 
   ! Calculate pressure at interfaces and layer averaged alpha/beta
   if (present(p_surf)) then
-    do j=G%jsc-1,G%jec+1 ; do i=G%isc-1,G%iec+1
+    do concurrent (j=G%jsc-1:G%jec+1, i=G%isc-1:G%iec+1)
       CS%Pint(i,j,1) = p_surf(i,j)
-    enddo ; enddo
+    enddo
   else
     CS%Pint(:,:,1) = 0.
   endif
-  do k=1,GV%ke ; do j=G%jsc-1,G%jec+1 ; do i=G%isc-1,G%iec+1
-    CS%Pint(i,j,k+1) = CS%Pint(i,j,k) + h(i,j,k)*(GV%g_Earth*GV%H_to_RZ)
-  enddo ; enddo ; enddo
+  do concurrent (j=G%jsc-1:G%jec+1)
+    do k=1,GV%ke
+      do concurrent (i=G%isc-1:G%iec+1)
+        CS%Pint(i,j,k+1) = CS%Pint(i,j,k) + h(i,j,k)*(GV%g_Earth*GV%H_to_RZ)
+      enddo
+    enddo
+  enddo
+  !$omp target update from(CS%Pint)
 
   ! Pressures at the interfaces, this is redundant as P_i(k,1) = P_i(k-1,2) however retain this
   ! for now to ensure consistency of indexing for discontinuous reconstructions
@@ -466,49 +514,86 @@ subroutine neutral_diffusion_calc_coeffs(G, GV, US, h, T, S, visc, CS, p_surf)
     enddo ; enddo ; enddo
   endif
 
-  EOSdom(:) = EOS_domain(G%HI, halo=1)
-  do j = G%jsc-1, G%jec+1
-    ! Interpolate state to interface
-    do i = G%isc-1, G%iec+1
-      if (CS%continuous_reconstruction) then
-        call interface_scalar(GV%ke, h(i,j,:), T(i,j,:), CS%Tint(i,j,:), 2, h_neglect)
-        call interface_scalar(GV%ke, h(i,j,:), S(i,j,:), CS%Sint(i,j,:), 2, h_neglect)
-      else
+  ! EOSdom(:) = EOS_domain(G%HI, halo=1)
+  do jsb=G%jsc-1,G%jec+1,njj ; do isb=G%isc-1,G%iec+1,nii
+    jeb = min(jsb+njj-1, G%jec+1)
+    ieb = min(isb+nii-1, G%iec+1)
+
+    EOSdom(1,1) = isb - G%isd + 1 ; EOSdom(1,2) = ieb - G%isd + 1
+    EOSdom(2,1) = jsb - G%jsd + 1 ; EOSdom(2,2) = jeb - G%jsd + 1
+    EOSdom(3,1) = 1               ; EOSdom(3,2) = merge(GV%ke+1, GV%ke, CS%continuous_reconstruction)
+
+    if (CS%continuous_reconstruction) then
+      call interface_scalar_block(G, isb, ieb, jsb, jeb, GV%ke, h, T, CS%Tint, 2, h_neglect)
+      call interface_scalar_block(G, isb, ieb, jsb, jeb, GV%ke, h, S, CS%Sint, 2, h_neglect)
+      if (CS%ref_pres<0) ref_pres(:,:,:) = CS%Pint(:,:,:)
+      call calculate_density_derivs(CS%Tint, CS%Sint, ref_pres, CS%dRdT, CS%dRdS, CS%EOS, EOSdom)
+      !$omp target update from(CS%dRdT, CS%dRdS, CS%Tint, CS%Sint)
+    else
+      do j=jsb,jeb ; do i=isb,ieb
         call build_reconstructions_1d( CS%remap_CS, GV%ke, h(i,j,:), T(i,j,:), CS%ppoly_coeffs_T(i,j,:,:), &
                                        CS%T_i(i,j,:,:), ppoly_r_S, iMethod, h_neglect, h_neglect_edge )
         call build_reconstructions_1d( CS%remap_CS, GV%ke, h(i,j,:), S(i,j,:), CS%ppoly_coeffs_S(i,j,:,:), &
                                        CS%S_i(i,j,:,:), ppoly_r_S, iMethod, h_neglect, h_neglect_edge )
-        ! In the current ALE formulation, interface values are not exactly at the 0. or 1. of the
-        ! polynomial reconstructions
         do k=1,GV%ke
-           CS%T_i(i,j,k,1) = evaluation_polynomial( CS%ppoly_coeffs_T(i,j,k,:), CS%deg+1, 0. )
-           CS%T_i(i,j,k,2) = evaluation_polynomial( CS%ppoly_coeffs_T(i,j,k,:), CS%deg+1, 1. )
-           CS%S_i(i,j,k,1) = evaluation_polynomial( CS%ppoly_coeffs_S(i,j,k,:), CS%deg+1, 0. )
-           CS%S_i(i,j,k,2) = evaluation_polynomial( CS%ppoly_coeffs_S(i,j,k,:), CS%deg+1, 1. )
+          CS%T_i(i,j,k,1) = evaluation_polynomial( CS%ppoly_coeffs_T(i,j,k,:), CS%deg+1, 0. )
+          CS%T_i(i,j,k,2) = evaluation_polynomial( CS%ppoly_coeffs_T(i,j,k,:), CS%deg+1, 1. )
+          CS%S_i(i,j,k,1) = evaluation_polynomial( CS%ppoly_coeffs_S(i,j,k,:), CS%deg+1, 0. )
+          CS%S_i(i,j,k,2) = evaluation_polynomial( CS%ppoly_coeffs_S(i,j,k,:), CS%deg+1, 1. )
         enddo
-      endif
-    enddo
+      enddo ; enddo
+      if (CS%ref_pres<0) ref_pres(:,:,:) = CS%Pint(:,:,:)
+      ! Calculate derivatives for the top interface
+      call calculate_density_derivs(CS%T_i(:,:,:,1), CS%S_i(:,:,:,1), ref_pres(:,:,1:GV%ke), CS%dRdT_i(:,:,:,1), &
+                                    CS%dRdS_i(:,:,:,1), CS%EOS, EOSdom)
+      ! Calculate derivatives at the bottom interface
+      call calculate_density_derivs(CS%T_i(:,:,:,2), CS%S_i(:,:,:,2), ref_pres(:,:,2:GV%ke+1), CS%dRdT_i(:,:,:,2), &
+                                    CS%dRdS_i(:,:,:,2), CS%EOS, EOSdom)
 
-    ! Continuous reconstruction
-    if (CS%continuous_reconstruction) then
-      do k = 1, GV%ke+1
-        if (CS%ref_pres<0) ref_pres(:) = CS%Pint(:,j,k)
-        call calculate_density_derivs(CS%Tint(:,j,k), CS%Sint(:,j,k), ref_pres, CS%dRdT(:,j,k), &
-                                      CS%dRdS(:,j,k), CS%EOS, EOSdom)
-      enddo
-    else ! Discontinuous reconstruction
-      do k = 1, GV%ke
-        if (CS%ref_pres<0) ref_pres(:) = CS%Pint(:,j,k)
-        ! Calculate derivatives for the top interface
-        call calculate_density_derivs(CS%T_i(:,j,k,1), CS%S_i(:,j,k,1), ref_pres, CS%dRdT_i(:,j,k,1), &
-                                      CS%dRdS_i(:,j,k,1), CS%EOS, EOSdom)
-        if (CS%ref_pres<0) ref_pres(:) = CS%Pint(:,j,k+1)
-        ! Calculate derivatives at the bottom interface
-        call calculate_density_derivs(CS%T_i(:,j,k,2), CS%S_i(:,j,k,2), ref_pres, CS%dRdT_i(:,j,k,2), &
-                                      CS%dRdS_i(:,j,k,2), CS%EOS, EOSdom)
-      enddo
     endif
-  enddo
+  enddo ; enddo
+  ! do j = G%jsc-1, G%jec+1
+  !   ! Interpolate state to interface
+  !   do i = G%isc-1, G%iec+1
+  !     if (CS%continuous_reconstruction) then
+  !       ! call interface_scalar(GV%ke, h(i,j,:), T(i,j,:), CS%Tint(i,j,:), 2, h_neglect)
+  !       ! call interface_scalar(GV%ke, h(i,j,:), S(i,j,:), CS%Sint(i,j,:), 2, h_neglect)
+  !     else
+  !       call build_reconstructions_1d( CS%remap_CS, GV%ke, h(i,j,:), T(i,j,:), CS%ppoly_coeffs_T(i,j,:,:), &
+  !                                      CS%T_i(i,j,:,:), ppoly_r_S, iMethod, h_neglect, h_neglect_edge )
+  !       call build_reconstructions_1d( CS%remap_CS, GV%ke, h(i,j,:), S(i,j,:), CS%ppoly_coeffs_S(i,j,:,:), &
+  !                                      CS%S_i(i,j,:,:), ppoly_r_S, iMethod, h_neglect, h_neglect_edge )
+  !       ! In the current ALE formulation, interface values are not exactly at the 0. or 1. of the
+  !       ! polynomial reconstructions
+  !       do k=1,GV%ke
+  !          CS%T_i(i,j,k,1) = evaluation_polynomial( CS%ppoly_coeffs_T(i,j,k,:), CS%deg+1, 0. )
+  !          CS%T_i(i,j,k,2) = evaluation_polynomial( CS%ppoly_coeffs_T(i,j,k,:), CS%deg+1, 1. )
+  !          CS%S_i(i,j,k,1) = evaluation_polynomial( CS%ppoly_coeffs_S(i,j,k,:), CS%deg+1, 0. )
+  !          CS%S_i(i,j,k,2) = evaluation_polynomial( CS%ppoly_coeffs_S(i,j,k,:), CS%deg+1, 1. )
+  !       enddo
+  !     endif
+  !   enddo
+
+  !   ! Continuous reconstruction
+  !   if (CS%continuous_reconstruction) then
+  !     do k = 1, GV%ke+1
+  !       if (CS%ref_pres<0) ref_pres(:) = CS%Pint(:,j,k)
+  !       call calculate_density_derivs(CS%Tint(:,j,k), CS%Sint(:,j,k), ref_pres, CS%dRdT(:,j,k), &
+  !                                     CS%dRdS(:,j,k), CS%EOS, EOSdom)
+  !     enddo
+  !   else ! Discontinuous reconstruction
+  !     do k = 1, GV%ke
+  !       if (CS%ref_pres<0) ref_pres(:) = CS%Pint(:,j,k)
+  !       ! Calculate derivatives for the top interface
+  !       call calculate_density_derivs(CS%T_i(:,j,k,1), CS%S_i(:,j,k,1), ref_pres, CS%dRdT_i(:,j,k,1), &
+  !                                     CS%dRdS_i(:,j,k,1), CS%EOS, EOSdom)
+  !       if (CS%ref_pres<0) ref_pres(:) = CS%Pint(:,j,k+1)
+  !       ! Calculate derivatives at the bottom interface
+  !       call calculate_density_derivs(CS%T_i(:,j,k,2), CS%S_i(:,j,k,2), ref_pres, CS%dRdT_i(:,j,k,2), &
+  !                                     CS%dRdS_i(:,j,k,2), CS%EOS, EOSdom)
+  !     enddo
+  !   endif
+  ! enddo
 
   if (.not. CS%continuous_reconstruction) then
     do j = G%jsc-1, G%jec+1 ; do i = G%isc-1, G%iec+1
@@ -615,6 +700,9 @@ subroutine neutral_diffusion_calc_coeffs(G, GV, US, h, T, S, visc, CS, p_surf)
     call post_data(CS%id_vhEff_2d, hEff_sum, CS%diag)
   endif
 
+  !$omp target exit data map(release: CS%dRdS, CS%dRdT, CS%Pint, CS%Tint, CS%Sint)
+  !$omp target exit data map(release: CS)
+
 end subroutine neutral_diffusion_calc_coeffs
 
 !> Update tracer concentration due to neutral diffusion; layer thickness unchanged by this update.
@@ -701,6 +789,8 @@ subroutine neutral_diffusion(G, GV, h, Coef_x, Coef_y, dt, Reg, US, CS)
 
   nk = GV%ke
 
+  !$omp target enter data map(alloc: uFlx, vFlx)
+
   do m = 1,Reg%ntr ! Loop over tracer registry
 
     tracer => Reg%Tr(m)
@@ -712,8 +802,14 @@ subroutine neutral_diffusion(G, GV, h, Coef_x, Coef_y, dt, Reg, US, CS)
       tendency(:,:,:)  = 0.0
     endif
 
-    uFlx(:,:,:) = 0.
-    vFlx(:,:,:) = 0.
+    do concurrent (k=1:CS%nsurf-1, j=G%jsd:G%jed, i=G%isdB:G%iedB)
+      uFlx(i,j,k) = 0.
+    enddo
+    do concurrent (k=1:CS%nsurf-1, j=G%jsdB:G%jedB, i=G%isd:G%ied)
+      vFlx(i,j,k) = 0.
+    enddo
+
+    !$omp target update from(uFlx, vFlx)
 
     ! x-flux
     if (CS%KhTh_use_vert_struct) then
@@ -1031,6 +1127,8 @@ subroutine neutral_diffusion(G, GV, h, Coef_x, Coef_y, dt, Reg, US, CS)
     endif
   enddo ! Loop over tracer registry
 
+  !$omp target exit data map(release: uFlx, vFlx)
+
 end subroutine neutral_diffusion
 
 !> Computes linear tapering coefficients at interfaces of the left and right columns
@@ -1131,10 +1229,67 @@ subroutine interface_scalar(nk, h, S, Si, i_method, h_neglect)
 
 end subroutine interface_scalar
 
+!> Returns interface scalar, Si, for a column of layer values, S.
+subroutine interface_scalar_block(G, isb, ieb, jsb, jeb, nk, h, S, Si, i_method, h_neglect)
+  type(ocean_grid_type), intent(in)    :: G
+  integer,               intent(in)    :: isb      !< This block's starting i index.
+  integer,               intent(in)    :: ieb      !< This block's ending i index.
+  integer,               intent(in)    :: jsb      !< This block's starting j index.
+  integer,               intent(in)    :: jeb      !< This block's ending j index.
+  integer,               intent(in)    :: nk       !< Number of levels
+  real, dimension(SZI_(G),SZJ_(G),nk),   intent(in)    :: h        !< Layer thickness [H ~> m or kg m-2]
+  real, dimension(SZI_(G),SZJ_(G),nk),   intent(in)    :: S        !< Layer scalar (or concentrations) in arbitrary
+                                                   !! concentration units (e.g. [C ~> degC] for temperature)
+  real, dimension(SZI_(G),SZJ_(G),nk+1), intent(inout) :: Si       !< Interface scalar (or concentrations) in arbitrary
+                                                   !! concentration units (e.g. [C ~> degC] for temperature)
+  integer,               intent(in)    :: i_method !< =1 use average of PLM edges
+                                                   !! =2 use continuous PPM edge interpolation
+  real,                  intent(in)    :: h_neglect !< A negligibly small thickness [H ~> m or kg m-2]
+  ! Local variables
+  integer :: i, j, k, km2, kp1
+  real, dimension(SZI_(G),SZJ_(G),nk) :: diff ! Difference in scalar concentrations between layer centers in arbitrary
+                              ! concentration units (e.g. [C ~> degC] for temperature)
+  real :: Sb, Sa ! Values of scalar concentrations at the upper and lower edges of a layer in arbitrary
+                 ! concentration units (e.g. [C ~> degC] for temperature)
+
+  !$omp target enter data map(alloc: diff)
+
+  call PLM_diff_block(G, isb, ieb, jsb, jeb, nk, h, S, 2, 1, diff)
+  
+  do concurrent (j=jsb:jeb, i=isb:ieb)
+    Si(i,j,1) = S(i,j,1) - 0.5 * diff(i,j,1)
+  enddo
+
+  if (i_method==1) then
+    do concurrent (k=2:nk, j=jsb:jeb, i=isb:ieb) DO_LOCALITY(local(Sa, Sb))
+      ! Average of the two edge values (will be bounded and,
+      ! when slopes are unlimited, notionally second-order accurate)
+      Sa = S(i,j,k-1) + 0.5 * diff(i,j,k-1) ! Lower edge value of a PLM reconstruction for layer above
+      Sb = S(i,j,k) - 0.5 * diff(i,j,k) ! Upper edge value of a PLM reconstruction for layer below
+      Si(i,j,k) = 0.5 * ( Sa + Sb )
+    enddo
+  elseif (i_method==2) then
+    do concurrent (k=2:nk, j=jsb:jeb, i=isb:ieb) DO_LOCALITY(local(km2, kp1))
+      ! PPM quasi-fourth order interpolation for edge values following
+      ! equation 1.6 in Colella & Woodward, 1984: JCP 54, 174-201.
+      km2 = max(1, k-2)
+      kp1 = min(nk, k+1)
+      Si(i,j,k) = ppm_edge(h(i,j,km2), h(i,j,k-1), h(i,j,k), h(i,j,kp1),  S(i,j,k-1), S(i,j,k), diff(i,j,k-1), diff(i,j,k), h_neglect)
+    enddo
+  endif
+  
+  do concurrent (j=jsb:jeb, i=isb:ieb)
+    Si(i,j,nk+1) = S(i,j,nk) + 0.5 * diff(i,j,nk)
+  enddo
+
+  !$omp target exit data map(release: diff)
+
+end subroutine interface_scalar_block
+
 !> Returns the PPM quasi-fourth order edge value at k+1/2 following
 !! equation 1.6 in Colella & Woodward, 1984: JCP 54, 174-201.
 !! The returned units are the same as those of Ak (e.g. [C ~> degC] for temperature).
-real function ppm_edge(hkm1, hk, hkp1, hkp2,  Ak, Akp1, Pk, Pkp1, h_neglect)
+pure real function ppm_edge(hkm1, hk, hkp1, hkp2,  Ak, Akp1, Pk, Pkp1, h_neglect)
   real, intent(in) :: hkm1 !< Width of cell k-1 in [H ~> m or kg m-2] or other units
   real, intent(in) :: hk   !< Width of cell k in [H ~> m or kg m-2] or other units
   real, intent(in) :: hkp1 !< Width of cell k+1 in [H ~> m or kg m-2] or other units
@@ -1192,6 +1347,33 @@ real function ppm_ave(xL, xR, aL, aR, aMean)
 
   ! Local variables
   real :: dx   ! Distance between the bounds [nondim]
+
+  dx = xR - xL
+
+  if (dx<0.) then
+    stop 'ppm_ave: dx<0 should not happened!'
+  elseif (dx>1.) then
+    stop 'ppm_ave: dx>1 should not happened!'
+  endif
+  ppm_ave = ppm_ave_unchecked(xL, xR, aL, aR, aMean)
+end function ppm_ave
+
+!> Returns the average of a PPM reconstruction between two fractional positions in the same
+!! arbitrary concentration units as aMean (e.g. usually [C ~> degC] for temperature), without
+!! checking that 0 <= xR - xL <= 1 as ppm_ave does
+pure real function ppm_ave_unchecked(xL, xR, aL, aR, aMean)
+  real, intent(in) :: xL    !< Fraction position of left bound (0,1) [nondim]
+  real, intent(in) :: xR    !< Fraction position of right bound (0,1) [nondim]
+  real, intent(in) :: aL    !< Left edge scalar value, at x=0, in arbitrary concentration
+                            !! units (e.g. usually [C ~> degC] for temperature)
+  real, intent(in) :: aR    !< Right edge scalar value, at x=1 in arbitrary concentration
+                            !! units (e.g. usually [C ~> degC] for temperature)
+  real, intent(in) :: aMean !< Average scalar value of cell in arbitrary concentration
+                            !! units (e.g. usually [C ~> degC] for temperature)
+  !$omp declare target
+
+  ! Local variables
+  real :: dx   ! Distance between the bounds [nondim]
   real :: xave ! Average fractional position [nondim]
   real :: a6, a6o3 ! Terms proportional to the normalized scalar curvature in the same arbitrary
                    ! concentration units as aMean (e.g. usually [C ~> degC] for temperature)
@@ -1201,20 +1383,16 @@ real function ppm_ave(xL, xR, aL, aR, aMean)
   a6o3 = 2. * aMean - ( aL + aR ) ! a6 / 3.
   a6 = 3. * a6o3
 
-  if (dx<0.) then
-    stop 'ppm_ave: dx<0 should not happened!'
-  elseif (dx>1.) then
-    stop 'ppm_ave: dx>1 should not happened!'
-  elseif (dx==0.) then
-    ppm_ave = aL + ( aR - aL ) * xR + a6 * xR * ( 1. - xR )
+  if (dx==0.) then
+    ppm_ave_unchecked = aL + ( aR - aL ) * xR + a6 * xR * ( 1. - xR )
   else
-    ppm_ave = ( aL + xave * ( ( aR - aL ) + a6 ) )  - a6o3 * ( xR**2 + xR * xL + xL**2 )
+    ppm_ave_unchecked = ( aL + xave * ( ( aR - aL ) + a6 ) )  - a6o3 * ( xR**2 + xR * xL + xL**2 )
   endif
-end function ppm_ave
+end function ppm_ave_unchecked
 
 !> A true signum function that returns either -abs(a), when x<0; or abs(a) when x>0; or 0 when x=0.
 !! The returned units are the same as those of a [arbitrary].
-real function signum(a,x)
+pure real function signum(a,x)
   real, intent(in) :: a !< The magnitude argument in arbitrary units [arbitrary]
   real, intent(in) :: x !< The sign (or zero) argument [arbitrary]
 
@@ -1292,11 +1470,95 @@ subroutine PLM_diff(nk, h, S, c_method, b_method, diff)
 
 end subroutine PLM_diff
 
+!> Returns PLM slopes for a column where the slopes are the difference in value across each cell.
+!! The limiting follows equation 1.8 in Colella & Woodward, 1984: JCP 54, 174-201.
+subroutine PLM_diff_block(G, isb, ieb, jsb, jeb, nk, h, S, c_method, b_method, diff)
+  type(ocean_grid_type), intent(in)  :: G
+  integer,             intent(in)    :: nk       !< Number of levels
+  integer,             intent(in)    :: isb      !< The starting i-index of this block
+  integer,             intent(in)    :: ieb      !< The last i-index of this block
+  integer,             intent(in)    :: jsb      !< The starting j-index of this block
+  integer,             intent(in)    :: jeb      !< The last j-index of this block
+  real, dimension(SZI_(G),SZJ_(G),nk), intent(in)    :: h        !< Layer thickness [H ~> m or kg m-2] or other units
+  real, dimension(SZI_(G),SZJ_(G),nk), intent(in)    :: S        !< Layer salinity (conc, e.g. ppt) or other tracer
+                                                 !! concentration in arbitrary units [A ~> a]
+  integer,             intent(in)    :: c_method !< Method to use for the centered difference
+  integer,             intent(in)    :: b_method !< =1, use PCM in first/last cell, =2 uses linear extrapolation
+  real, dimension(SZI_(G),SZJ_(G),nk), intent(inout) :: diff     !< Scalar difference across layer (conc, e.g. ppt)
+                                                 !! in the same arbitrary units as S [A ~> a],
+                                                 !! determined by the following values for c_method:
+                                                 !!   1. Second order finite difference (not recommended)
+                                                 !!   2. Second order finite volume (used in original PPM)
+                                                 !!   3. Finite-volume weighted least squares linear fit
+                                                 !! \todo  The use of c_method to choose a scheme is inefficient
+                                                 !! and should eventually be moved up the call tree.
+
+  ! Local variables
+  integer :: i, j, k
+  real :: hkm1, hk, hkp1  ! Successive layer thicknesses [H ~> m or kg m-2] or other units
+  real :: Skm1, Sk, Skp1  ! Successive layer tracer concentrations in the same arbitrary units as S [A ~> a]
+  real :: diff_l, diff_r, diff_c ! Differences in tracer concentrations in arbitrary units [A ~> a]
+
+  do concurrent (j=jsb:jeb, i=isb:ieb)
+    if (b_method == 1) then
+      diff(i,j,1) = 0.0
+    elseif (b_method == 2) then
+      diff(i,j,1) = ( S(i,j,2) - S(i,j,1) ) * 2. * ( h(i,j,1) / ( h(i,j,1) + h(i,j,2) ) )
+    endif
+  enddo
+
+  do concurrent (k=2:nk-1, j=jsb:jeb, i=isb:ieb) &
+      DO_LOCALITY(local(hkm1, hk, hkp1, Skm1, Sk, Skp1, diff_l, diff_r, diff_c))
+    hkm1 = h(i,j,k-1)
+    hk = h(i,j,k)
+    hkp1 = h(i,j,k+1)
+
+    if ( ( hkp1 + hk ) * ( hkm1 + hk ) > 0.) then
+      Skm1 = S(i,j,k-1)
+      Sk = S(i,j,k)
+      Skp1 = S(i,j,k+1)
+      if (c_method==1) then
+        ! Simple centered diff (from White)
+        if ( hk + 0.5 * (hkm1 + hkp1) /= 0. ) then
+          diff_c = ( Skp1 - Skm1 ) * ( hk / ( hk + 0.5 * (hkm1 + hkp1) ) )
+        else
+          diff_c = 0.
+        endif
+      elseif (c_method==2) then
+        ! Second order accurate centered finite-volume slope (from Colella and Woodward, JCP 1984)
+        diff_c = fv_diff(hkm1, hk, hkp1, Skm1, Sk, Skp1)
+      elseif (c_method==3) then
+        ! Second order accurate finite-volume least squares slope
+        diff_c = hk * fvlsq_slope(hkm1, hk, hkp1, Skm1, Sk, Skp1)
+      endif
+      ! Limit centered slope by twice the side differenced slopes
+      diff_l = 2. * ( Sk - Skm1 )
+      diff_r = 2. * ( Skp1 - Sk )
+      if ( signum(1., diff_l) * signum(1., diff_r) <= 0. ) then
+        diff(i,j,k) = 0. ! PCM for local extrema
+      else
+        diff(i,j,k) = sign( min( abs(diff_l), abs(diff_c), abs(diff_r) ), diff_c )
+      endif
+    else
+      diff(i,j,k) = 0. ! PCM next to vanished layers
+    endif
+  enddo
+
+  do concurrent (j=jsb:jeb, i=isb:ieb)
+    if (b_method == 1) then
+      diff(i,j,nk) = 0.0
+    elseif (b_method == 2) then
+      diff(i,j,nk) = S(i,j,nk) - S(i,j,nk-1) * 2. * ( h(i,j,nk) / ( h(i,j,nk-1) + h(i,j,nk) ) )
+    endif
+  enddo
+  
+end subroutine PLM_diff_block
+
 !> Returns the cell-centered second-order finite volume (unlimited PLM) slope using three
 !! consecutive cell widths and average values. Slope is returned as a difference across
 !! the central cell (i.e. units of scalar S, e.g. [C ~> degC] for temperature).
 !! Discretization follows equation 1.7 in Colella & Woodward, 1984: JCP 54, 174-201.
-real function fv_diff(hkm1, hk, hkp1, Skm1, Sk, Skp1)
+pure real function fv_diff(hkm1, hk, hkp1, Skm1, Sk, Skp1)
   real, intent(in) :: hkm1 !< Left cell width [H ~> m or kg m-2] or other arbitrary units
   real, intent(in) :: hk   !< Center cell width [H ~> m or kg m-2] or other arbitrary units
   real, intent(in) :: hkp1 !< Right cell width [H ~> m or kg m-2] or other arbitrary units
@@ -1327,7 +1589,7 @@ end function fv_diff
 !! using three consecutive cell widths and average values.  Slope is returned
 !! as a gradient (i.e. units of scalar S over width units).  For example, for temperature
 !! fvlsq_slope would usually be returned in units of [C H-1 ~> degC m-1 or degC m2 kg-1].
-real function fvlsq_slope(hkm1, hk, hkp1, Skm1, Sk, Skp1)
+pure real function fvlsq_slope(hkm1, hk, hkp1, Skm1, Sk, Skp1)
   real, intent(in) :: hkm1 !< Left cell width [H ~> m or kg m-2] or other arbitrary units
   real, intent(in) :: hk   !< Center cell width [H ~> m or kg m-2] or other arbitrary units
   real, intent(in) :: hkp1 !< Right cell width [H ~> m or kg m-2] or other arbitrary units
