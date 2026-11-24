@@ -517,10 +517,6 @@ subroutine tracer_hordiff(h, dt, MEKE, VarMix, visc, G, GV, US, CS, Reg, tv, do_
 
     call do_group_pass(CS%pass_t, G%Domain, clock=id_clock_pass, omp_offload=.true.)
 
-    !$ do m = 1, ntr
-      !$omp target update from(Reg%Tr(m)%t)
-    !$ enddo
-
     ! We are assuming that neutral surfaces do not evolve (much) as a result of multiple
     !horizontal diffusion iterations. Otherwise the call to neutral_diffusion_calc_coeffs()
     ! would be inside the itt-loop. -AJA
@@ -588,7 +584,7 @@ subroutine tracer_hordiff(h, dt, MEKE, VarMix, visc, G, GV, US, CS, Reg, tv, do_
       if (CS%show_call_tree) call callTree_waypoint("Calling neutral diffusion (tracer_hordiff)",itt)
       if (itt>1) then ! Update halos for subsequent iterations
         ! The tracers are updated on the device by neutral_diffusion, so exchange their halos there.
-        call do_group_pass(CS%pass_t, G%Domain, clock=id_clock_pass)
+        call do_group_pass(CS%pass_t, G%Domain, clock=id_clock_pass, omp_offload=.true.)
         if (CS%recalc_neutral_surf) then
           if (associated(tv%p_surf)) then
             call neutral_diffusion_calc_coeffs(G, GV, US, h, tv%T, tv%S, visc, CS%neutral_diffusion_CSp, &
@@ -603,7 +599,6 @@ subroutine tracer_hordiff(h, dt, MEKE, VarMix, visc, G, GV, US, CS, Reg, tv, do_
 
     ! neutral_diffusion leaves the updated tracers on the device.
     !$ do m = 1, ntr
-      !$omp target update to(Reg%Tr(m)%t)
       !$omp target update to(Reg%Tr(m)%df_x) if(associated(Reg%Tr(m)%df_x))
       !$omp target update to(Reg%Tr(m)%df_y) if(associated(Reg%Tr(m)%df_y))
       !$omp target update to(Reg%Tr(m)%df2d_x) if(associated(Reg%Tr(m)%df2d_x))
