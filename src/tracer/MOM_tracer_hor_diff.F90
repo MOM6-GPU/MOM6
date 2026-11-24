@@ -511,10 +511,12 @@ subroutine tracer_hordiff(h, dt, MEKE, VarMix, visc, G, GV, US, CS, Reg, tv, do_
 
   if (CS%use_neutral_diffusion) then
     !$omp target update from(h)
+    !$omp target update from(khdt_x, khdt_y)
 
     if (CS%show_call_tree) call callTree_waypoint("Calling neutral diffusion coeffs (tracer_hordiff)")
 
-    call do_group_pass(CS%pass_t, G%Domain, clock=id_clock_pass)
+    call do_group_pass(CS%pass_t, G%Domain, clock=id_clock_pass, omp_offload=.true.)
+
     ! We are assuming that neutral surfaces do not evolve (much) as a result of multiple
     !horizontal diffusion iterations. Otherwise the call to neutral_diffusion_calc_coeffs()
     ! would be inside the itt-loop. -AJA
@@ -581,7 +583,8 @@ subroutine tracer_hordiff(h, dt, MEKE, VarMix, visc, G, GV, US, CS, Reg, tv, do_
     do itt=1,num_itts
       if (CS%show_call_tree) call callTree_waypoint("Calling neutral diffusion (tracer_hordiff)",itt)
       if (itt>1) then ! Update halos for subsequent iterations
-        call do_group_pass(CS%pass_t, G%Domain, clock=id_clock_pass)
+        ! The tracers are updated on the device by neutral_diffusion, so exchange their halos there.
+        call do_group_pass(CS%pass_t, G%Domain, clock=id_clock_pass, omp_offload=.true.)
         if (CS%recalc_neutral_surf) then
           if (associated(tv%p_surf)) then
             call neutral_diffusion_calc_coeffs(G, GV, US, h, tv%T, tv%S, visc, CS%neutral_diffusion_CSp, &
@@ -593,6 +596,14 @@ subroutine tracer_hordiff(h, dt, MEKE, VarMix, visc, G, GV, US, CS, Reg, tv, do_
       endif
       call neutral_diffusion(G, GV,  h, Coef_x, Coef_y, I_numitts*dt, Reg, US, CS%neutral_diffusion_CSp)
     enddo ! itt
+
+    ! neutral_diffusion leaves the updated tracers on the device.
+    !$ do m = 1, ntr
+      !$omp target update to(Reg%Tr(m)%df_x) if(associated(Reg%Tr(m)%df_x))
+      !$omp target update to(Reg%Tr(m)%df_y) if(associated(Reg%Tr(m)%df_y))
+      !$omp target update to(Reg%Tr(m)%df2d_x) if(associated(Reg%Tr(m)%df2d_x))
+      !$omp target update to(Reg%Tr(m)%df2d_y) if(associated(Reg%Tr(m)%df2d_y))
+    !$ enddo
 
   else    ! following if not using neutral diffusion, but instead along-surface diffusion
 
