@@ -374,6 +374,11 @@ logical function neutral_diffusion_init(Time, G, GV, US, param_file, diag, EOS, 
   allocate(CS%vKoR(G%isd:G%ied,G%jsd:G%jed, CS%nsurf), source=0)
   allocate(CS%vHeff(G%isd:G%ied,G%jsd:G%jed,CS%nsurf-1), source=0.)
 
+  !$omp target enter data map(to: CS)
+  !$omp target enter data map(to: CS%dRdT, CS%dRdS, CS%Tint, CS%Sint, CS%Pint, &
+  !$omp                          CS%uPoL, CS%uPoR, CS%uKoL, CS%uKoR, CS%uhEff, &
+  !$omp                          CS%vPoL, CS%vPoR, CS%vKoL, CS%vKoR, CS%vhEff)
+
 end function neutral_diffusion_init
 
 !> Calculate remapping factors for u/v columns used to map adjoining columns to
@@ -406,19 +411,24 @@ subroutine neutral_diffusion_calc_coeffs(G, GV, US, h, T, S, visc, CS, p_surf)
                                                    ! top extent of the boundary layer (0 at top, 1 at bottom) [nondim]
   integer, dimension(SZI_(G), SZJ_(G)) :: k_bot    ! Index of the last layer within the boundary
   real,    dimension(SZI_(G), SZJ_(G)) :: zeta_bot ! Distance of the lower layer to the boundary layer depth [nondim]
+  real :: H_to_pa                      ! A conversion factor from thickness to rescaled pressure
+                                       ! [R L2 T-2 H-1 ~> Pa m-1 or Pa m2 kg-1]
   real :: pa_to_H                      ! A conversion factor from rescaled pressure to thickness
                                        ! (H) units [H T2 R-1 Z-2 ~> m Pa-1 or s2 m-1]
   integer :: isb, ieb, jsb, jeb, iie, jje, nii, njj
+  integer :: nIIB ! The I block size for the zonal faces
+  integer :: nJJB ! The J block size for the meridional faces
 
   ! block sizes
-  njj = (G%jec+1) - (G%jsc-1) + 1
-  nii = (G%iec+1) - (G%isc-1) + 1
+  nii = CS%niblock
+  if (CS%niblock == 0) nii = (G%iec+1) - (G%isc-1) + 1
+  njj = CS%njblock
+  if (CS%njblock == 0) njj = (G%jec+1) - (G%jsc-1) + 1
 
   pa_to_H = 1. / (GV%H_to_RZ * GV%g_Earth)
+  H_to_pa = GV%H_to_pa
 
   !$omp target enter data map(alloc: k_top, k_bot, zeta_top, zeta_bot)
-  !$omp target enter data map(to: CS)
-  !$omp target enter data map(alloc: CS%dRdS, CS%dRdT, CS%Pint) map(to: CS%Tint, CS%Sint)
 
   do concurrent (j=G%jsd:G%jed, i=G%isd:G%ied)
     k_top(i,j) = 1     ; k_bot(i,j) = 1
@@ -516,6 +526,8 @@ subroutine neutral_diffusion_calc_coeffs(G, GV, US, h, T, S, visc, CS, p_surf)
     enddo ; enddo ; enddo
   endif
 
+  if (CS%ref_pres<0) ref_pres(:,:,:) = CS%Pint(:,:,:)
+
   ! EOSdom(:) = EOS_domain(G%HI, halo=1)
   do jsb=G%jsc-1,G%jec+1,njj ; do isb=G%isc-1,G%iec+1,nii
     jeb = min(jsb+njj-1, G%jec+1)
@@ -530,7 +542,6 @@ subroutine neutral_diffusion_calc_coeffs(G, GV, US, h, T, S, visc, CS, p_surf)
                                   CS%Tint, 2, h_neglect)
       call interface_scalar_block(G, isb, ieb, jsb, jeb, GV%ke, h, S, G%isd, G%ied, G%jsd, G%jed, &
                                   CS%Sint, 2, h_neglect)
-      if (CS%ref_pres<0) ref_pres(:,:,:) = CS%Pint(:,:,:)
       call calculate_density_derivs(CS%Tint, CS%Sint, ref_pres, CS%dRdT, CS%dRdS, CS%EOS, EOSdom)
       !$omp target update from(CS%dRdT, CS%dRdS, CS%Tint, CS%Sint)
     else
@@ -546,7 +557,6 @@ subroutine neutral_diffusion_calc_coeffs(G, GV, US, h, T, S, visc, CS, p_surf)
           CS%S_i(i,j,k,2) = evaluation_polynomial( CS%ppoly_coeffs_S(i,j,k,:), CS%deg+1, 1. )
         enddo
       enddo ; enddo
-      if (CS%ref_pres<0) ref_pres(:,:,:) = CS%Pint(:,:,:)
       ! Calculate derivatives for the top interface
       call calculate_density_derivs(CS%T_i(:,:,:,1), CS%S_i(:,:,:,1), ref_pres(:,:,1:GV%ke), CS%dRdT_i(:,:,:,1), &
                                     CS%dRdS_i(:,:,:,1), CS%EOS, EOSdom)
@@ -612,27 +622,38 @@ subroutine neutral_diffusion_calc_coeffs(G, GV, US, h, T, S, visc, CS, p_surf)
     enddo ; enddo
   endif
 
-  CS%uhEff(:,:,:) = 0.
-  CS%vhEff(:,:,:) = 0.
-  CS%uPoL(:,:,:) = 0.
-  CS%vPoL(:,:,:) = 0.
-  CS%uPoR(:,:,:) = 0.
-  CS%vPoR(:,:,:) = 0.
-  CS%uKoL(:,:,:) = 1
-  CS%vKoL(:,:,:) = 1
-  CS%uKoR(:,:,:) = 1
-  CS%vKoR(:,:,:) = 1
+  !$omp target enter data map(to: k_bot, zeta_bot)
+
+  if (.not.CS%continuous_reconstruction) then
+    CS%uhEff(:,:,:) = 0.
+    CS%vhEff(:,:,:) = 0.
+    CS%uPoL(:,:,:) = 0.
+    CS%vPoL(:,:,:) = 0.
+    CS%uPoR(:,:,:) = 0.
+    CS%vPoR(:,:,:) = 0.
+    CS%uKoL(:,:,:) = 1
+    CS%vKoL(:,:,:) = 1
+    CS%uKoR(:,:,:) = 1
+    CS%vKoR(:,:,:) = 1
+  endif
 
   ! Neutral surface factors at U points
-  do j = G%jsc, G%jec ; do I = G%isc-1, G%iec
-    if (G%mask2dCu(I,j) > 0.0) then
-      if (CS%continuous_reconstruction) then
-        call find_neutral_surface_positions_continuous(GV%ke,                                    &
-                CS%Pint(i,j,:), CS%Tint(i,j,:), CS%Sint(i,j,:), CS%dRdT(i,j,:), CS%dRdS(i,j,:),            &
-                CS%Pint(i+1,j,:), CS%Tint(i+1,j,:), CS%Sint(i+1,j,:), CS%dRdT(i+1,j,:), CS%dRdS(i+1,j,:),  &
-                CS%uPoL(I,j,:), CS%uPoR(I,j,:), CS%uKoL(I,j,:), CS%uKoR(I,j,:), CS%uhEff(I,j,:),           &
-                k_bot(I,j), k_bot(I+1,j), zeta_bot(I,j), zeta_bot(I+1,j))
-      else
+  if (CS%continuous_reconstruction) then
+    do concurrent (k=1:CS%nsurf, j=G%jsd:G%jed, i=G%isd:G%ied)
+      CS%uPoL(i,j,k) = 0. ; CS%uPoR(i,j,k) = 0. ; CS%uKoL(i,j,k) = 1 ; CS%uKoR(i,j,k) = 1
+    enddo
+    do concurrent (k=1:CS%nsurf-1, j=G%jsd:G%jed, i=G%isd:G%ied)
+      CS%uhEff(i,j,k) = 0.
+    enddo
+    nIIB = CS%niblock
+    if (CS%niblock == 0) nIIB = G%iec - G%isc + 2
+    njj = CS%njblock
+    if (CS%njblock == 0) njj = G%jec - G%jsc + 1
+    call zonal_neutral_positions(G, GV%ke, CS%nsurf, CS%Pint, CS%Tint, CS%Sint, CS%dRdT, CS%dRdS, k_bot, zeta_bot, &
+                                 CS%uPoL, CS%uPoR, CS%uKoL, CS%uKoR, CS%uhEff, nIIB, njj)
+  else
+    do j = G%jsc, G%jec ; do I = G%isc-1, G%iec
+      if (G%mask2dCu(I,j) > 0.0) then
         call find_neutral_surface_positions_discontinuous(CS, GV%ke, &
             CS%P_i(i,j,:,:), h(i,j,:), CS%T_i(i,j,:,:), CS%S_i(i,j,:,:), CS%ppoly_coeffs_T(i,j,:,:),           &
             CS%ppoly_coeffs_S(i,j,:,:),CS%stable_cell(i,j,:),                                                  &
@@ -641,19 +662,26 @@ subroutine neutral_diffusion_calc_coeffs(G, GV, US, h, T, S, visc, CS, p_surf)
             CS%uPoL(I,j,:), CS%uPoR(I,j,:), CS%uKoL(I,j,:), CS%uKoR(I,j,:), CS%uhEff(I,j,:),                   &
             hard_fail_heff = CS%hard_fail_heff)
       endif
-    endif
-  enddo ; enddo
+    enddo ; enddo
+  endif
 
   ! Neutral surface factors at V points
-  do J = G%jsc-1, G%jec ; do i = G%isc, G%iec
-    if (G%mask2dCv(i,J) > 0.0) then
-      if (CS%continuous_reconstruction) then
-        call find_neutral_surface_positions_continuous(GV%ke,                                              &
-                CS%Pint(i,j,:), CS%Tint(i,j,:), CS%Sint(i,j,:), CS%dRdT(i,j,:), CS%dRdS(i,j,:),           &
-                CS%Pint(i,j+1,:), CS%Tint(i,j+1,:), CS%Sint(i,j+1,:), CS%dRdT(i,j+1,:), CS%dRdS(i,j+1,:), &
-                CS%vPoL(i,J,:), CS%vPoR(i,J,:), CS%vKoL(i,J,:), CS%vKoR(i,J,:), CS%vhEff(i,J,:),          &
-                k_bot(i,J), k_bot(i,J+1), zeta_bot(i,J), zeta_bot(i,J+1))
-      else
+  if (CS%continuous_reconstruction) then
+    do concurrent (k=1:CS%nsurf, j=G%jsd:G%jed, i=G%isd:G%ied)
+      CS%vPoL(i,j,k) = 0. ; CS%vPoR(i,j,k) = 0. ; CS%vKoL(i,j,k) = 1 ; CS%vKoR(i,j,k) = 1
+    enddo
+    do concurrent (k=1:CS%nsurf-1, j=G%jsd:G%jed, i=G%isd:G%ied)
+      CS%vhEff(i,j,k) = 0.
+    enddo
+    nii = CS%niblock
+    if (CS%niblock == 0) nii = G%iec - G%isc + 1
+    nJJB = CS%njblock
+    if (CS%njblock == 0) nJJB = G%jec - G%jsc + 2
+    call meridional_neutral_positions(G, GV%ke, CS%nsurf, CS%Pint, CS%Tint, CS%Sint, CS%dRdT, CS%dRdS, &
+                                      k_bot, zeta_bot, CS%vPoL, CS%vPoR, CS%vKoL, CS%vKoR, CS%vhEff, nii, nJJB)
+  else
+    do J = G%jsc-1, G%jec ; do i = G%isc, G%iec
+      if (G%mask2dCv(i,J) > 0.0) then
         call find_neutral_surface_positions_discontinuous(CS, GV%ke, &
             CS%P_i(i,j,:,:), h(i,j,:), CS%T_i(i,j,:,:), CS%S_i(i,j,:,:), CS%ppoly_coeffs_T(i,j,:,:),           &
             CS%ppoly_coeffs_S(i,j,:,:),CS%stable_cell(i,j,:),                                                  &
@@ -662,8 +690,8 @@ subroutine neutral_diffusion_calc_coeffs(G, GV, US, h, T, S, visc, CS, p_surf)
             CS%vPoL(I,j,:), CS%vPoR(I,j,:), CS%vKoL(I,j,:), CS%vKoR(I,j,:), CS%vhEff(I,j,:),                   &
             hard_fail_heff = CS%hard_fail_heff)
       endif
-    endif
-  enddo ; enddo
+    enddo ; enddo
+  endif
 
   ! Continuous reconstructions calculate hEff as the difference between the pressures of the
   ! neutral surfaces which need to be reconverted to thickness units. The discontinuous version
@@ -673,19 +701,19 @@ subroutine neutral_diffusion_calc_coeffs(G, GV, US, h, T, S, visc, CS, p_surf)
     if (CS%use_unmasked_transport_bug) then
       ! This option is not recommended but needed to recover answers prior to Jan 2018.
       ! It is independent of the other 2018 answers flags.
-      do k = 1, CS%nsurf-1 ; do j = G%jsc, G%jec ; do I = G%isc-1, G%iec
-        CS%uhEff(I,j,k) = CS%uhEff(I,j,k) / GV%H_to_pa
-      enddo ; enddo ; enddo
-      do k = 1, CS%nsurf-1 ; do J = G%jsc-1, G%jec ; do i = G%isc, G%iec
-        CS%vhEff(I,j,k) = CS%vhEff(I,j,k) / GV%H_to_pa
-      enddo ; enddo ; enddo
+      do concurrent (k=1:CS%nsurf-1, j=G%jsc:G%jec, I=G%isc-1:G%iec)
+        CS%uhEff(I,j,k) = CS%uhEff(I,j,k) / H_to_pa
+      enddo
+      do concurrent (k=1:CS%nsurf-1, J=G%jsc-1:G%jec, i=G%isc:G%iec)
+        CS%vhEff(I,j,k) = CS%vhEff(I,j,k) / H_to_pa
+      enddo
     else
-      do k = 1, CS%nsurf-1 ; do j = G%jsc, G%jec ; do I = G%isc-1, G%iec
-        if (G%mask2dCu(I,j) > 0.0) CS%uhEff(I,j,k) = CS%uhEff(I,j,k) * pa_to_H
-      enddo ; enddo ; enddo
-      do k = 1, CS%nsurf-1 ; do J = G%jsc-1, G%jec ; do i = G%isc, G%iec
-        if (G%mask2dCv(i,J) > 0.0) CS%vhEff(i,J,k) = CS%vhEff(i,J,k) * pa_to_H
-      enddo ; enddo ; enddo
+      do concurrent (k=1:CS%nsurf-1, j=G%jsc:G%jec, I=G%isc-1:G%iec, G%mask2dCu(I,j) > 0.0)
+        CS%uhEff(I,j,k) = CS%uhEff(I,j,k) * pa_to_H
+      enddo
+      do concurrent (k=1:CS%nsurf-1, J=G%jsc-1:G%jec, i=G%isc:G%iec, G%mask2dCv(i,J) > 0.0)
+        CS%vhEff(i,J,k) = CS%vhEff(i,J,k) * pa_to_H
+      enddo
     endif
   endif
 
@@ -704,8 +732,10 @@ subroutine neutral_diffusion_calc_coeffs(G, GV, US, h, T, S, visc, CS, p_surf)
     call post_data(CS%id_vhEff_2d, hEff_sum, CS%diag)
   endif
 
-  !$omp target exit data map(release: CS%dRdS, CS%dRdT, CS%Pint, CS%Tint, CS%Sint)
-  !$omp target exit data map(release: CS)
+  !$omp target update to(CS%uPoL, CS%uPoR, CS%uKoL, CS%uKoR, CS%uhEff, &
+  !$omp                    CS%vPoL, CS%vPoR, CS%vKoL, CS%vKoR, CS%vhEff) if(.not.CS%continuous_reconstruction)
+
+  !$omp target exit data map(release: k_bot, zeta_bot)
 
 end subroutine neutral_diffusion_calc_coeffs
 
@@ -809,9 +839,6 @@ subroutine neutral_diffusion(G, GV, h, Coef_x, Coef_y, dt, Reg, US, CS)
   if (CS%njblock == 0) nJJB = G%jec - G%jsc + 2
 
   !$omp target enter data map(alloc: uFlx, vFlx, tendency, trans_x_2d, trans_y_2d) map(to: Coef_x, Coef_y)
-  !$omp target enter data map(to: CS)
-  !$omp target enter data map(to: CS%uPoL, CS%uPoR, CS%uKoL, CS%uKoR, CS%uhEff, &
-  !$omp                          CS%vPoL, CS%vPoR, CS%vKoL, CS%vKoR, CS%vhEff)
 
   do m = 1,Reg%ntr ! Loop over tracer registry
 
@@ -836,7 +863,7 @@ subroutine neutral_diffusion(G, GV, h, Coef_x, Coef_y, dt, Reg, US, CS)
 
     ! x-flux
     if (CS%KhTh_use_vert_struct) then
-      !$omp target update from(uFlx, Reg%Tr(m)%t)
+      !$omp target update from(uFlx, Reg%Tr(m)%t, CS%uPoL, CS%uPoR, CS%uKoL, CS%uKoR, CS%uhEff)
       if (CS%tapering) then
         do j = G%jsc,G%jec ; do I = G%isc-1,G%iec
           if (G%mask2dCu(I,j)>0.) then
@@ -870,7 +897,7 @@ subroutine neutral_diffusion(G, GV, h, Coef_x, Coef_y, dt, Reg, US, CS)
       !$omp target update to(uFlx)
     else
       if (CS%tapering) then
-        !$omp target update from(uFlx, Reg%Tr(m)%t)
+        !$omp target update from(uFlx, Reg%Tr(m)%t, CS%uPoL, CS%uPoR, CS%uKoL, CS%uKoR, CS%uhEff)
         do j = G%jsc,G%jec ; do I = G%isc-1,G%iec
           if (G%mask2dCu(I,j)>0.) then
             ! compute coeff_l and coeff_r and pass them to neutral_surface_flux
@@ -891,7 +918,7 @@ subroutine neutral_diffusion(G, GV, h, Coef_x, Coef_y, dt, Reg, US, CS)
         call zonal_neutral_flux(G, GV, h, tracer%t, CS%nsurf, CS%uPoL, CS%uPoR, CS%uKoL, CS%uKoR, &
                                 CS%uhEff, uFlx, h_neglect, nIIB, njj)
       else
-        !$omp target update from(uFlx, Reg%Tr(m)%t)
+        !$omp target update from(uFlx, Reg%Tr(m)%t, CS%uPoL, CS%uPoR, CS%uKoL, CS%uKoR, CS%uhEff)
         do j = G%jsc,G%jec ; do I = G%isc-1,G%iec
           if (G%mask2dCu(I,j)>0.) then
             call neutral_surface_flux(nk, CS%nsurf, CS%deg, h(i,j,:), h(i+1,j,:),       &
@@ -909,7 +936,7 @@ subroutine neutral_diffusion(G, GV, h, Coef_x, Coef_y, dt, Reg, US, CS)
 
     ! y-flux
     if (CS%KhTh_use_vert_struct) then
-      !$omp target update from(vFlx, Reg%Tr(m)%t)
+      !$omp target update from(vFlx, Reg%Tr(m)%t, CS%vPoL, CS%vPoR, CS%vKoL, CS%vKoR, CS%vhEff)
       if (CS%tapering) then
         do J = G%jsc-1,G%jec ; do i = G%isc,G%iec
           if (G%mask2dCv(i,J)>0.) then
@@ -944,7 +971,7 @@ subroutine neutral_diffusion(G, GV, h, Coef_x, Coef_y, dt, Reg, US, CS)
       !$omp target update to(vFlx)
     else
       if (CS%tapering) then
-        !$omp target update from(vFlx, Reg%Tr(m)%t)
+        !$omp target update from(vFlx, Reg%Tr(m)%t, CS%vPoL, CS%vPoR, CS%vKoL, CS%vKoR, CS%vhEff)
         do J = G%jsc-1,G%jec ; do i = G%isc,G%iec
           if (G%mask2dCv(i,J)>0.) then
             ! compute coeff_l and coeff_r and pass them to neutral_surface_flux
@@ -966,7 +993,7 @@ subroutine neutral_diffusion(G, GV, h, Coef_x, Coef_y, dt, Reg, US, CS)
         call meridional_neutral_flux(G, GV, h, tracer%t, CS%nsurf, CS%vPoL, CS%vPoR, CS%vKoL, CS%vKoR, &
                                      CS%vhEff, vFlx, h_neglect, nii, nJJB)
       else
-        !$omp target update from(vFlx, Reg%Tr(m)%t)
+        !$omp target update from(vFlx, Reg%Tr(m)%t, CS%vPoL, CS%vPoR, CS%vKoL, CS%vKoR, CS%vhEff)
         do J = G%jsc-1,G%jec ; do i = G%isc,G%iec
           if (G%mask2dCv(i,J)>0.) then
             call neutral_surface_flux(nk, CS%nsurf, CS%deg, h(i,j,:), h(i,j+1,:),       &
@@ -1134,9 +1161,6 @@ subroutine neutral_diffusion(G, GV, h, Coef_x, Coef_y, dt, Reg, US, CS)
     endif
   enddo ! Loop over tracer registry
 
-  !$omp target exit data map(release: CS%uPoL, CS%uPoR, CS%uKoL, CS%uKoR, CS%uhEff, &
-  !$omp                               CS%vPoL, CS%vPoR, CS%vKoL, CS%vKoR, CS%vhEff)
-  !$omp target exit data map(release: CS)
   !$omp target exit data map(release: uFlx, vFlx, tendency, trans_x_2d, trans_y_2d, Coef_x, Coef_y)
 
 end subroutine neutral_diffusion
@@ -1850,6 +1874,520 @@ subroutine find_neutral_surface_positions_continuous(nk, Pl, Tl, Sl, dRdTl, dRdS
 
 end subroutine find_neutral_surface_positions_continuous
 
+!> Finds the positions of the neutral surfaces between the pairs of columns on either side of a block of
+!! faces, with continuous reconstructions, as find_neutral_surface_positions_continuous does for one face,
+!! stepping all of the faces through the neutral surfaces together.  The columns are passed in block-sized
+!! arrays, so the same search serves the zonal and the meridional faces.  Instead of stopping, the search
+!! returns in ierr the largest code of the failures that find_neutral_surface_positions_continuous stops on:
+!! 1 (klm1 out of bounds), 2 (krm1 out of bounds), 3 (no column to search), 4 (from
+!! interpolate_for_nondim_position) and 5 (from absolute_position).
+subroutine neutral_positions_block(nIb, nJb, IIe, JJe, nk, ns, do_face, Pl, Tl, Sl, dRdTl, dRdSl, &
+                                   Pr, Tr, Sr, dRdTr, dRdSr, interior_limit, bl_kl, bl_kr, bl_zl, bl_zr, &
+                                   PoL, PoR, KoL, KoR, hEff, ierr)
+  integer, intent(in) :: nIb  !< The first dimension of the block-sized arrays
+  integer, intent(in) :: nJb  !< The second dimension of the block-sized arrays
+  integer, intent(in) :: IIe  !< The number of faces of this block in the first dimension
+  integer, intent(in) :: JJe  !< The number of faces of this block in the second dimension
+  integer, intent(in) :: nk   !< Number of levels
+  integer, intent(in) :: ns   !< Number of neutral surfaces
+  logical, dimension(nIb,nJb),      intent(in) :: do_face !< True for the faces to search
+  real,    dimension(nIb,nJb,nk+1), intent(in) :: Pl    !< Left-column interface pressure [R L2 T-2 ~> Pa]
+  real,    dimension(nIb,nJb,nk+1), intent(in) :: Tl    !< Left-column interface potential temperature [C ~> degC]
+  real,    dimension(nIb,nJb,nk+1), intent(in) :: Sl    !< Left-column interface salinity [S ~> ppt]
+  real,    dimension(nIb,nJb,nk+1), intent(in) :: dRdTl !< Left-column dRho/dT [R C-1 ~> kg m-3 degC-1]
+  real,    dimension(nIb,nJb,nk+1), intent(in) :: dRdSl !< Left-column dRho/dS [R S-1 ~> kg m-3 ppt-1]
+  real,    dimension(nIb,nJb,nk+1), intent(in) :: Pr    !< Right-column interface pressure [R L2 T-2 ~> Pa]
+  real,    dimension(nIb,nJb,nk+1), intent(in) :: Tr    !< Right-column interface potential temperature [C ~> degC]
+  real,    dimension(nIb,nJb,nk+1), intent(in) :: Sr    !< Right-column interface salinity [S ~> ppt]
+  real,    dimension(nIb,nJb,nk+1), intent(in) :: dRdTr !< Right-column dRho/dT [R C-1 ~> kg m-3 degC-1]
+  real,    dimension(nIb,nJb,nk+1), intent(in) :: dRdSr !< Right-column dRho/dS [R S-1 ~> kg m-3 ppt-1]
+  logical,                          intent(in) :: interior_limit !< If true, limit the neutral surfaces
+                                                         !! to below the boundary layers given by bl_*
+  integer, dimension(nIb,nJb),      intent(in) :: bl_kl !< Layer index of the boundary layer (left)
+  integer, dimension(nIb,nJb),      intent(in) :: bl_kr !< Layer index of the boundary layer (right)
+  real,    dimension(nIb,nJb),      intent(in) :: bl_zl !< Fractional position of the boundary layer (left) [nondim]
+  real,    dimension(nIb,nJb),      intent(in) :: bl_zr !< Fractional position of the boundary layer (right) [nondim]
+  real,    dimension(nIb,nJb,ns),   intent(inout) :: PoL  !< Fractional position of neutral surface within
+                                                         !! layer KoL of left column [nondim]
+  real,    dimension(nIb,nJb,ns),   intent(inout) :: PoR  !< Fractional position of neutral surface within
+                                                         !! layer KoR of right column [nondim]
+  integer, dimension(nIb,nJb,ns),   intent(inout) :: KoL  !< Index of first left interface above neutral surface
+  integer, dimension(nIb,nJb,ns),   intent(inout) :: KoR  !< Index of first right interface above neutral surface
+  real,    dimension(nIb,nJb,ns-1), intent(inout) :: hEff !< Effective thickness between two neutral surfaces
+                                                         !! [R L2 T-2 ~> Pa] or other units following Pl and Pr.
+  integer,                          intent(out) :: ierr  !< 0, or the largest code of the failures found
+
+  ! Local variables
+  ! The search state of each face of the block, carried from one neutral surface to the next
+  integer, dimension(nIb,nJb) :: kl_b, kr_b   ! Indices of the left and right interfaces
+  integer, dimension(nIb,nJb) :: lastK_left_b, lastK_right_b ! Layers used during the last step
+  real,    dimension(nIb,nJb) :: lastP_left_b, lastP_right_b ! Fractional positions during the last step [nondim]
+  logical, dimension(nIb,nJb) :: reached_bottom_b  ! True if one of the bottom-most interfaces has been used
+  logical, dimension(nIb,nJb) :: searching_left_b  ! True if searching for a position in the left column
+  logical, dimension(nIb,nJb) :: searching_right_b ! True if searching for a position in the right column
+  integer, dimension(nIb,nJb) :: err_b        ! The largest failure code found for each face
+  integer :: k_surface              ! Index of neutral surface
+  integer :: kl                     ! Index of left interface
+  integer :: kr                     ! Index of right interface
+  logical :: searching_left_column  ! True if searching for the position of a right interface in the left column
+  logical :: searching_right_column ! True if searching for the position of a left interface in the right column
+  logical :: reached_bottom         ! True if one of the bottom-most interfaces has been used as the target
+  integer :: krm1, klm1
+  real    :: dRho, dRhoTop, dRhoBot ! Potential density differences at various points [R ~> kg m-3]
+  real    :: hL, hR                 ! Pressure thicknesses [R L2 T-2 ~> Pa]
+  integer :: lastK_left, lastK_right ! Layers used during the last iteration
+  real    :: lastP_left, lastP_right ! Fractional positions during the last iteration [nondim]
+  real    :: pos                    ! A fractional position from interpolate_for_nondim_position_unchecked [nondim]
+  logical :: bad                    ! True if interpolate_for_nondim_position_unchecked failed
+  integer :: err                    ! The largest failure code found for a face
+  integer :: kt, kb                 ! Layers of the top and bottom neutral surfaces of a neutral layer
+  integer :: II, JJ
+
+  !$omp target enter data map(alloc: kl_b, kr_b, lastK_left_b, lastK_right_b, lastP_left_b, lastP_right_b, &
+  !$omp                              reached_bottom_b, searching_left_b, searching_right_b, err_b)
+
+  ! Initialize variables for the search
+  do concurrent (JJ=1:JJe, II=1:IIe)
+    kr_b(II,JJ) = 1
+    kl_b(II,JJ) = 1
+    lastP_right_b(II,JJ) = 0.
+    lastP_left_b(II,JJ) = 0.
+    lastK_right_b(II,JJ) = 1
+    lastK_left_b(II,JJ)  = 1
+    reached_bottom_b(II,JJ) = .false.
+    searching_left_b(II,JJ) = .false.
+    searching_right_b(II,JJ) = .false.
+    err_b(II,JJ) = 0
+  enddo
+
+  ! Loop over each neutral surface, working from top to bottom
+  do concurrent (JJ=1:JJe) DO_LOCALITY(local(k_surface))
+    do k_surface = 1, ns
+      do concurrent (II=1:IIe, do_face(II,JJ) .and. (err_b(II,JJ) == 0)) &
+          DO_LOCALITY(local(kl, kr, klm1, krm1, lastK_left, lastK_right, kt, kb, err)) &
+          DO_LOCALITY(local(dRho, dRhoTop, dRhoBot, hL, hR, lastP_left, lastP_right, pos)) &
+          DO_LOCALITY(local(searching_left_column, searching_right_column, reached_bottom, bad))
+        kl = kl_b(II,JJ) ; kr = kr_b(II,JJ)
+        lastK_left = lastK_left_b(II,JJ) ; lastK_right = lastK_right_b(II,JJ)
+        lastP_left = lastP_left_b(II,JJ) ; lastP_right = lastP_right_b(II,JJ)
+        reached_bottom = reached_bottom_b(II,JJ)
+        searching_left_column = searching_left_b(II,JJ) ; searching_right_column = searching_right_b(II,JJ)
+        err = 0
+
+        klm1 = max(kl-1, 1)
+        if (klm1>nk) err = max(err, 1)
+        krm1 = max(kr-1, 1)
+        if (krm1>nk) err = max(err, 2)
+
+        ! Potential density difference, rho(kr) - rho(kl)
+        dRho = 0.5 * ( ( dRdTr(II,JJ,kr) + dRdTl(II,JJ,kl) ) * ( Tr(II,JJ,kr) - Tl(II,JJ,kl) ) &
+                     + ( dRdSr(II,JJ,kr) + dRdSl(II,JJ,kl) ) * ( Sr(II,JJ,kr) - Sl(II,JJ,kl) ) )
+        ! Which column has the lighter surface for the current indexes, kr and kl
+        if (.not. reached_bottom) then
+          if (dRho < 0.) then
+            searching_left_column = .true.
+            searching_right_column = .false.
+          elseif (dRho > 0.) then
+            searching_right_column = .true.
+            searching_left_column = .false.
+          else ! dRho == 0.
+            if (kl + kr == 2) then ! Still at surface
+              searching_left_column = .true.
+              searching_right_column = .false.
+            else ! Not the surface so we simply change direction
+              searching_left_column = .not.  searching_left_column
+              searching_right_column = .not.  searching_right_column
+            endif
+          endif
+        endif
+
+        if (err > 0) then
+          continue ! Stop searching this face; ierr reports why.
+        elseif (searching_left_column) then
+          ! Interpolate for the neutral surface position within the left column, layer klm1
+          ! Potential density difference, rho(kl-1) - rho(kr) (should be negative)
+          dRhoTop = 0.5 * ( ( dRdTl(II,JJ,klm1) + dRdTr(II,JJ,kr) ) * ( Tl(II,JJ,klm1) - Tr(II,JJ,kr) ) &
+                         + ( dRdSl(II,JJ,klm1) + dRdSr(II,JJ,kr) ) * ( Sl(II,JJ,klm1) - Sr(II,JJ,kr) ) )
+          ! Potential density difference, rho(kl) - rho(kr) (will be positive)
+          dRhoBot = 0.5 * ( ( dRdTl(II,JJ,klm1+1) + dRdTr(II,JJ,kr) ) * ( Tl(II,JJ,klm1+1) - Tr(II,JJ,kr) ) &
+                          + ( dRdSl(II,JJ,klm1+1) + dRdSr(II,JJ,kr) ) * ( Sl(II,JJ,klm1+1) - Sr(II,JJ,kr) ) )
+
+          ! Because we are looking left, the right surface, kr, is lighter than klm1+1 and should be denser than klm1
+          ! unless we are still at the top of the left column (kl=1)
+          if (dRhoTop > 0. .or. kr+kl==2) then
+            PoL(II,JJ,k_surface) = 0. ! The right surface is lighter than anything in layer klm1
+          elseif (dRhoTop >= dRhoBot) then ! Left layer is unstratified
+            PoL(II,JJ,k_surface) = 1.
+          else
+            ! Linearly interpolate for the position between Pl(kl-1) and Pl(kl) where the density difference
+            ! between right and left is zero. The Pl here are only used to handle massless layers.
+            call interpolate_for_nondim_position_unchecked(dRhoTop, Pl(II,JJ,klm1), dRhoBot, Pl(II,JJ,klm1+1), &
+                                                           pos, bad)
+            PoL(II,JJ,k_surface) = pos
+            if (bad) err = max(err, 4)
+          endif
+          if (PoL(II,JJ,k_surface)>=1. .and. klm1<nk) then ! >= is really ==, when PoL==1 we point to the bottom
+            klm1 = klm1 + 1
+            PoL(II,JJ,k_surface) = PoL(II,JJ,k_surface) - 1.
+          endif
+          if (real(klm1-lastK_left)+(PoL(II,JJ,k_surface)-lastP_left)<0.) then
+            PoL(II,JJ,k_surface) = lastP_left
+            klm1 = lastK_left
+          endif
+          KoL(II,JJ,k_surface) = klm1
+          if (kr <= nk) then
+            PoR(II,JJ,k_surface) = 0.
+            KoR(II,JJ,k_surface) = kr
+          else
+            PoR(II,JJ,k_surface) = 1.
+            KoR(II,JJ,k_surface) = nk
+          endif
+          if (kr <= nk) then
+            kr = kr + 1
+          else
+            reached_bottom = .true.
+            searching_right_column = .true.
+            searching_left_column = .false.
+          endif
+        elseif (searching_right_column) then
+          ! Interpolate for the neutral surface position within the right column, layer krm1
+          ! Potential density difference, rho(kr-1) - rho(kl) (should be negative)
+          dRhoTop = 0.5 * ( ( dRdTr(II,JJ,krm1) + dRdTl(II,JJ,kl) ) * ( Tr(II,JJ,krm1) - Tl(II,JJ,kl) ) + &
+                            ( dRdSr(II,JJ,krm1) + dRdSl(II,JJ,kl) ) * ( Sr(II,JJ,krm1) - Sl(II,JJ,kl) ) )
+          ! Potential density difference, rho(kr) - rho(kl) (will be positive)
+          dRhoBot = 0.5 * ( ( dRdTr(II,JJ,krm1+1) + dRdTl(II,JJ,kl) ) * ( Tr(II,JJ,krm1+1) - Tl(II,JJ,kl) ) + &
+                            ( dRdSr(II,JJ,krm1+1) + dRdSl(II,JJ,kl) ) * ( Sr(II,JJ,krm1+1) - Sl(II,JJ,kl) ) )
+
+          ! Because we are looking right, the left surface, kl, is lighter than krm1+1 and should be denser than krm1
+          ! unless we are still at the top of the right column (kr=1)
+          if (dRhoTop >= 0. .or. kr+kl==2) then
+            PoR(II,JJ,k_surface) = 0. ! The left surface is lighter than anything in layer krm1
+          elseif (dRhoTop >= dRhoBot) then ! Right layer is unstratified
+            PoR(II,JJ,k_surface) = 1.
+          else
+            ! Linearly interpolate for the position between Pr(kr-1) and Pr(kr) where the density difference
+            ! between right and left is zero. The Pr here are only used to handle massless layers.
+            call interpolate_for_nondim_position_unchecked(dRhoTop, Pr(II,JJ,krm1), dRhoBot, Pr(II,JJ,krm1+1), &
+                                                           pos, bad)
+            PoR(II,JJ,k_surface) = pos
+            if (bad) err = max(err, 4)
+          endif
+          if (PoR(II,JJ,k_surface)>=1. .and. krm1<nk) then ! >= is really ==, when PoR==1 we point to the bottom
+            krm1 = krm1 + 1
+            PoR(II,JJ,k_surface) = PoR(II,JJ,k_surface) - 1.
+          endif
+          if (real(krm1-lastK_right)+(PoR(II,JJ,k_surface)-lastP_right)<0.) then
+            PoR(II,JJ,k_surface) = lastP_right
+            krm1 = lastK_right
+          endif
+          KoR(II,JJ,k_surface) = krm1
+          if (kl <= nk) then
+            PoL(II,JJ,k_surface) = 0.
+            KoL(II,JJ,k_surface) = kl
+          else
+            PoL(II,JJ,k_surface) = 1.
+            KoL(II,JJ,k_surface) = nk
+          endif
+          if (kl <= nk) then
+            kl = kl + 1
+          else
+            reached_bottom = .true.
+            searching_right_column = .false.
+            searching_left_column = .true.
+          endif
+        else
+          err = max(err, 3)
+        endif
+        if (interior_limit .and. (err == 0)) then
+          if (KoL(II,JJ,k_surface)<=bl_kl(II,JJ)) then
+            KoL(II,JJ,k_surface) = bl_kl(II,JJ)
+            if (PoL(II,JJ,k_surface)<bl_zl(II,JJ)) then
+              PoL(II,JJ,k_surface) = bl_zl(II,JJ)
+            endif
+          endif
+          if (KoR(II,JJ,k_surface)<=bl_kr(II,JJ)) then
+            KoR(II,JJ,k_surface) = bl_kr(II,JJ)
+            if (PoR(II,JJ,k_surface)<bl_zr(II,JJ)) then
+              PoR(II,JJ,k_surface) = bl_zr(II,JJ)
+            endif
+          endif
+        endif
+
+        if (err == 0) then
+          lastK_left = KoL(II,JJ,k_surface) ; lastP_left = PoL(II,JJ,k_surface)
+          lastK_right = KoR(II,JJ,k_surface) ; lastP_right = PoR(II,JJ,k_surface)
+          ! Effective thickness, from the absolute positions of the neutral surfaces as absolute_position gives them
+          ! NOTE: This would be better expressed in terms of the layers thicknesses rather
+          ! than as differences of position - AJA
+          if (k_surface>1) then
+            if (max(KoL(II,JJ,k_surface), KoL(II,JJ,k_surface-1), KoR(II,JJ,k_surface), &
+                    KoR(II,JJ,k_surface-1)) > nk) then
+              err = max(err, 5)
+            else
+              kb = KoL(II,JJ,k_surface) ; kt = KoL(II,JJ,k_surface-1)
+              hL = (Pl(II,JJ,kb) + PoL(II,JJ,k_surface) * ( Pl(II,JJ,kb+1) - Pl(II,JJ,kb) )) - &
+                   (Pl(II,JJ,kt) + PoL(II,JJ,k_surface-1) * ( Pl(II,JJ,kt+1) - Pl(II,JJ,kt) ))
+              kb = KoR(II,JJ,k_surface) ; kt = KoR(II,JJ,k_surface-1)
+              hR = (Pr(II,JJ,kb) + PoR(II,JJ,k_surface) * ( Pr(II,JJ,kb+1) - Pr(II,JJ,kb) )) - &
+                   (Pr(II,JJ,kt) + PoR(II,JJ,k_surface-1) * ( Pr(II,JJ,kt+1) - Pr(II,JJ,kt) ))
+              if ( hL + hR > 0.) then
+                hEff(II,JJ,k_surface-1) = 2. * hL * hR / ( hL + hR ) ! Harmonic mean of layer thicknesses
+              else
+                hEff(II,JJ,k_surface-1) = 0.
+              endif
+            endif
+          endif
+        endif
+
+        kl_b(II,JJ) = kl ; kr_b(II,JJ) = kr
+        lastK_left_b(II,JJ) = lastK_left ; lastK_right_b(II,JJ) = lastK_right
+        lastP_left_b(II,JJ) = lastP_left ; lastP_right_b(II,JJ) = lastP_right
+        reached_bottom_b(II,JJ) = reached_bottom
+        searching_left_b(II,JJ) = searching_left_column ; searching_right_b(II,JJ) = searching_right_column
+        err_b(II,JJ) = err
+      enddo
+    enddo
+  enddo
+
+  ierr = 0
+  do concurrent (JJ=1:JJe, II=1:IIe) DO_LOCALITY(reduce(max: ierr))
+    ierr = max(ierr, err_b(II,JJ))
+  enddo
+
+  !$omp target exit data map(release: kl_b, kr_b, lastK_left_b, lastK_right_b, lastP_left_b, lastP_right_b, &
+  !$omp                              reached_bottom_b, searching_left_b, searching_right_b, err_b)
+
+end subroutine neutral_positions_block
+
+!> Finds the positions of the neutral surfaces between the columns on either side of each zonal face, a
+!! block of faces at a time in the form of zonal_mass_flux, with continuous reconstructions.  The positions
+!! are left unchanged at land faces.
+subroutine zonal_neutral_positions(G, nk, ns, Pint, Tint, Sint, dRdT, dRdS, k_bot, zeta_bot, &
+                                   PoL, PoR, KoL, KoR, hEff, nIIB, njj)
+  type(ocean_grid_type), intent(in) :: G    !< Ocean grid structure
+  integer,               intent(in) :: nk   !< Number of levels
+  integer,               intent(in) :: ns   !< Number of neutral surfaces
+  real, dimension(SZI_(G),SZJ_(G),nk+1), intent(in) :: Pint !< Interface pressure [R L2 T-2 ~> Pa]
+  real, dimension(SZI_(G),SZJ_(G),nk+1), intent(in) :: Tint !< Interface potential temperature [C ~> degC]
+  real, dimension(SZI_(G),SZJ_(G),nk+1), intent(in) :: Sint !< Interface salinity [S ~> ppt]
+  real, dimension(SZI_(G),SZJ_(G),nk+1), intent(in) :: dRdT !< dRho/dT at interfaces [R C-1 ~> kg m-3 degC-1]
+  real, dimension(SZI_(G),SZJ_(G),nk+1), intent(in) :: dRdS !< dRho/dS at interfaces [R S-1 ~> kg m-3 ppt-1]
+  integer, dimension(SZI_(G),SZJ_(G)),   intent(in) :: k_bot    !< Index of the last layer within the boundary
+  real,    dimension(SZI_(G),SZJ_(G)),   intent(in) :: zeta_bot !< Fractional position of the bottom of the
+                                                                !! boundary layer within layer k_bot [nondim]
+  real,    dimension(SZI_(G),SZJ_(G),ns),   intent(inout) :: PoL  !< Fractional position of neutral surface
+                                                                !! within layer KoL of the western column [nondim]
+  real,    dimension(SZI_(G),SZJ_(G),ns),   intent(inout) :: PoR  !< Fractional position of neutral surface
+                                                                !! within layer KoR of the eastern column [nondim]
+  integer, dimension(SZI_(G),SZJ_(G),ns),   intent(inout) :: KoL  !< Index of first western interface above
+                                                                !! neutral surface
+  integer, dimension(SZI_(G),SZJ_(G),ns),   intent(inout) :: KoR  !< Index of first eastern interface above
+                                                                !! neutral surface
+  real,    dimension(SZI_(G),SZJ_(G),ns-1), intent(inout) :: hEff !< Effective thickness between two neutral
+                                                                !! surfaces [R L2 T-2 ~> Pa]
+  integer,               intent(in) :: nIIB !< I block size for array calculations
+  integer,               intent(in) :: njj  !< j block size for array calculations
+
+  ! Local variables
+  ! The block-sized work arrays below hold the western (l) and eastern (r) columns of the block's zonal faces.
+  real, dimension(nIIB,njj,nk+1) :: Pl_b, Pr_b       ! Interface pressures [R L2 T-2 ~> Pa]
+  real, dimension(nIIB,njj,nk+1) :: Tl_b, Tr_b       ! Interface potential temperatures [C ~> degC]
+  real, dimension(nIIB,njj,nk+1) :: Sl_b, Sr_b       ! Interface salinities [S ~> ppt]
+  real, dimension(nIIB,njj,nk+1) :: dRdTl_b, dRdTr_b ! dRho/dT at interfaces [R C-1 ~> kg m-3 degC-1]
+  real, dimension(nIIB,njj,nk+1) :: dRdSl_b, dRdSr_b ! dRho/dS at interfaces [R S-1 ~> kg m-3 ppt-1]
+  real,    dimension(nIIB,njj,ns)   :: PoL_b, PoR_b  ! Fractional positions of the neutral surfaces [nondim]
+  integer, dimension(nIIB,njj,ns)   :: KoL_b, KoR_b  ! Layer indices of the neutral surfaces
+  real,    dimension(nIIB,njj,ns-1) :: hEff_b        ! Effective thicknesses [R L2 T-2 ~> Pa]
+  logical, dimension(nIIB,njj) :: do_face            ! True for the ocean faces of the block
+  integer, dimension(nIIB,njj) :: bl_kl, bl_kr       ! Layer indices of the boundary layers
+  real,    dimension(nIIB,njj) :: bl_zl, bl_zr       ! Fractional positions of the boundary layers [nondim]
+  integer :: ierr, ierr_max  ! Failure codes from neutral_positions_block
+  integer :: I, j, k, ks, II, jj
+  integer :: jsb, jeb   ! The j-index bounds of the current block.
+  integer :: IsbB, IebB ! The I-index bounds of the current block.
+  integer :: jje, IIe   ! The block-local j- and I-index end bounds.
+
+  !$omp target enter data map(alloc: Pl_b, Pr_b, Tl_b, Tr_b, Sl_b, Sr_b, dRdTl_b, dRdTr_b, dRdSl_b, dRdSr_b, &
+  !$omp                              PoL_b, PoR_b, KoL_b, KoR_b, hEff_b, do_face, bl_kl, bl_kr, bl_zl, bl_zr)
+
+  ierr_max = 0
+  do jsb=G%jsc,G%jec,njj ; do IsbB=G%isc-1,G%iec,nIIB
+    IebB = min(IsbB + nIIB - 1, G%iec)
+    jeb = min(jsb + njj - 1, G%jec)
+    IIe = IebB - IsbB + 1
+    jje = jeb - jsb + 1
+
+    do concurrent (k=1:nk+1, jj=1:jje, II=1:IIe) DO_LOCALITY(local(I, j))
+      I = IsbB + II - 1
+      j = jsb + jj - 1
+
+      Pl_b(II,jj,k) = Pint(i,j,k) ; Pr_b(II,jj,k) = Pint(i+1,j,k)
+      Tl_b(II,jj,k) = Tint(i,j,k) ; Tr_b(II,jj,k) = Tint(i+1,j,k)
+      Sl_b(II,jj,k) = Sint(i,j,k) ; Sr_b(II,jj,k) = Sint(i+1,j,k)
+      dRdTl_b(II,jj,k) = dRdT(i,j,k) ; dRdTr_b(II,jj,k) = dRdT(i+1,j,k)
+      dRdSl_b(II,jj,k) = dRdS(i,j,k) ; dRdSr_b(II,jj,k) = dRdS(i+1,j,k)
+    enddo
+    do concurrent (jj=1:jje, II=1:IIe) DO_LOCALITY(local(I, j))
+      I = IsbB + II - 1
+      j = jsb + jj - 1
+
+      do_face(II,jj) = (G%mask2dCu(I,j) > 0.0)
+      bl_kl(II,jj) = k_bot(I,j) ; bl_kr(II,jj) = k_bot(I+1,j)
+      bl_zl(II,jj) = zeta_bot(I,j) ; bl_zr(II,jj) = zeta_bot(I+1,j)
+    enddo
+
+    call neutral_positions_block(nIIB, njj, IIe, jje, nk, ns, do_face, Pl_b, Tl_b, Sl_b, dRdTl_b, dRdSl_b, &
+                                 Pr_b, Tr_b, Sr_b, dRdTr_b, dRdSr_b, .true., bl_kl, bl_kr, bl_zl, bl_zr, &
+                                 PoL_b, PoR_b, KoL_b, KoR_b, hEff_b, ierr)
+    ierr_max = max(ierr_max, ierr)
+
+    do concurrent (ks=1:ns, jj=1:jje, II=1:IIe, do_face(II,jj)) DO_LOCALITY(local(I, j))
+      I = IsbB + II - 1
+      j = jsb + jj - 1
+
+      PoL(I,j,ks) = PoL_b(II,jj,ks) ; PoR(I,j,ks) = PoR_b(II,jj,ks)
+      KoL(I,j,ks) = KoL_b(II,jj,ks) ; KoR(I,j,ks) = KoR_b(II,jj,ks)
+    enddo
+    do concurrent (ks=1:ns-1, jj=1:jje, II=1:IIe, do_face(II,jj)) DO_LOCALITY(local(I, j))
+      I = IsbB + II - 1
+      j = jsb + jj - 1
+
+      hEff(I,j,ks) = hEff_b(II,jj,ks)
+    enddo
+  enddo ; enddo
+
+  !$omp target exit data map(release: Pl_b, Pr_b, Tl_b, Tr_b, Sl_b, Sr_b, dRdTl_b, dRdTr_b, dRdSl_b, dRdSr_b, &
+  !$omp                              PoL_b, PoR_b, KoL_b, KoR_b, hEff_b, do_face, bl_kl, bl_kr, bl_zl, bl_zr)
+
+  if (ierr_max > 0) call neutral_positions_error(ierr_max, "zonal_neutral_positions")
+
+end subroutine zonal_neutral_positions
+
+!> Finds the positions of the neutral surfaces between the columns on either side of each meridional face,
+!! a block of faces at a time in the form of meridional_mass_flux, with continuous reconstructions.  The positions
+!! are left unchanged at land faces.
+subroutine meridional_neutral_positions(G, nk, ns, Pint, Tint, Sint, dRdT, dRdS, k_bot, zeta_bot, &
+                                        PoL, PoR, KoL, KoR, hEff, nii, nJJB)
+  type(ocean_grid_type), intent(in) :: G    !< Ocean grid structure
+  integer,               intent(in) :: nk   !< Number of levels
+  integer,               intent(in) :: ns   !< Number of neutral surfaces
+  real, dimension(SZI_(G),SZJ_(G),nk+1), intent(in) :: Pint !< Interface pressure [R L2 T-2 ~> Pa]
+  real, dimension(SZI_(G),SZJ_(G),nk+1), intent(in) :: Tint !< Interface potential temperature [C ~> degC]
+  real, dimension(SZI_(G),SZJ_(G),nk+1), intent(in) :: Sint !< Interface salinity [S ~> ppt]
+  real, dimension(SZI_(G),SZJ_(G),nk+1), intent(in) :: dRdT !< dRho/dT at interfaces [R C-1 ~> kg m-3 degC-1]
+  real, dimension(SZI_(G),SZJ_(G),nk+1), intent(in) :: dRdS !< dRho/dS at interfaces [R S-1 ~> kg m-3 ppt-1]
+  integer, dimension(SZI_(G),SZJ_(G)),   intent(in) :: k_bot    !< Index of the last layer within the boundary
+  real,    dimension(SZI_(G),SZJ_(G)),   intent(in) :: zeta_bot !< Fractional position of the bottom of the
+                                                                !! boundary layer within layer k_bot [nondim]
+  real,    dimension(SZI_(G),SZJ_(G),ns),   intent(inout) :: PoL  !< Fractional position of neutral surface
+                                                                !! within layer KoL of the southern column [nondim]
+  real,    dimension(SZI_(G),SZJ_(G),ns),   intent(inout) :: PoR  !< Fractional position of neutral surface
+                                                                !! within layer KoR of the northern column [nondim]
+  integer, dimension(SZI_(G),SZJ_(G),ns),   intent(inout) :: KoL  !< Index of first southern interface above
+                                                                !! neutral surface
+  integer, dimension(SZI_(G),SZJ_(G),ns),   intent(inout) :: KoR  !< Index of first northern interface above
+                                                                !! neutral surface
+  real,    dimension(SZI_(G),SZJ_(G),ns-1), intent(inout) :: hEff !< Effective thickness between two neutral
+                                                                !! surfaces [R L2 T-2 ~> Pa]
+  integer,               intent(in) :: nii  !< i block size for array calculations
+  integer,               intent(in) :: nJJB !< J block size for array calculations
+
+  ! Local variables
+  ! The block-sized work arrays below hold the southern (l) and northern (r) columns of the block's meridional
+  ! faces.
+  real, dimension(nii,nJJB,nk+1) :: Pl_b, Pr_b       ! Interface pressures [R L2 T-2 ~> Pa]
+  real, dimension(nii,nJJB,nk+1) :: Tl_b, Tr_b       ! Interface potential temperatures [C ~> degC]
+  real, dimension(nii,nJJB,nk+1) :: Sl_b, Sr_b       ! Interface salinities [S ~> ppt]
+  real, dimension(nii,nJJB,nk+1) :: dRdTl_b, dRdTr_b ! dRho/dT at interfaces [R C-1 ~> kg m-3 degC-1]
+  real, dimension(nii,nJJB,nk+1) :: dRdSl_b, dRdSr_b ! dRho/dS at interfaces [R S-1 ~> kg m-3 ppt-1]
+  real,    dimension(nii,nJJB,ns)   :: PoL_b, PoR_b  ! Fractional positions of the neutral surfaces [nondim]
+  integer, dimension(nii,nJJB,ns)   :: KoL_b, KoR_b  ! Layer indices of the neutral surfaces
+  real,    dimension(nii,nJJB,ns-1) :: hEff_b        ! Effective thicknesses [R L2 T-2 ~> Pa]
+  logical, dimension(nii,nJJB) :: do_face            ! True for the ocean faces of the block
+  integer, dimension(nii,nJJB) :: bl_kl, bl_kr       ! Layer indices of the boundary layers
+  real,    dimension(nii,nJJB) :: bl_zl, bl_zr       ! Fractional positions of the boundary layers [nondim]
+  integer :: ierr, ierr_max  ! Failure codes from neutral_positions_block
+  integer :: i, J, k, ks, ii, JJ
+  integer :: isb, ieb   ! The i-index bounds of the current block.
+  integer :: JsbB, JebB ! The J-index bounds of the current block.
+  integer :: iie, JJe   ! The block-local i- and J-index end bounds.
+
+  !$omp target enter data map(alloc: Pl_b, Pr_b, Tl_b, Tr_b, Sl_b, Sr_b, dRdTl_b, dRdTr_b, dRdSl_b, dRdSr_b, &
+  !$omp                              PoL_b, PoR_b, KoL_b, KoR_b, hEff_b, do_face, bl_kl, bl_kr, bl_zl, bl_zr)
+
+  ierr_max = 0
+  do JsbB=G%jsc-1,G%jec,nJJB ; do isb=G%isc,G%iec,nii
+    ieb = min(isb + nii - 1, G%iec)
+    JebB = min(JsbB + nJJB - 1, G%jec)
+    iie = ieb - isb + 1
+    JJe = JebB - JsbB + 1
+
+    do concurrent (k=1:nk+1, JJ=1:JJe, ii=1:iie) DO_LOCALITY(local(i, J))
+      i = isb + ii - 1
+      J = JsbB + JJ - 1
+
+      Pl_b(ii,JJ,k) = Pint(i,j,k) ; Pr_b(ii,JJ,k) = Pint(i,j+1,k)
+      Tl_b(ii,JJ,k) = Tint(i,j,k) ; Tr_b(ii,JJ,k) = Tint(i,j+1,k)
+      Sl_b(ii,JJ,k) = Sint(i,j,k) ; Sr_b(ii,JJ,k) = Sint(i,j+1,k)
+      dRdTl_b(ii,JJ,k) = dRdT(i,j,k) ; dRdTr_b(ii,JJ,k) = dRdT(i,j+1,k)
+      dRdSl_b(ii,JJ,k) = dRdS(i,j,k) ; dRdSr_b(ii,JJ,k) = dRdS(i,j+1,k)
+    enddo
+    do concurrent (JJ=1:JJe, ii=1:iie) DO_LOCALITY(local(i, J))
+      i = isb + ii - 1
+      J = JsbB + JJ - 1
+
+      do_face(ii,JJ) = (G%mask2dCv(i,J) > 0.0)
+      bl_kl(ii,JJ) = k_bot(i,J) ; bl_kr(ii,JJ) = k_bot(i,J+1)
+      bl_zl(ii,JJ) = zeta_bot(i,J) ; bl_zr(ii,JJ) = zeta_bot(i,J+1)
+    enddo
+
+    call neutral_positions_block(nii, nJJB, iie, JJe, nk, ns, do_face, Pl_b, Tl_b, Sl_b, dRdTl_b, dRdSl_b, &
+                                 Pr_b, Tr_b, Sr_b, dRdTr_b, dRdSr_b, .true., bl_kl, bl_kr, bl_zl, bl_zr, &
+                                 PoL_b, PoR_b, KoL_b, KoR_b, hEff_b, ierr)
+    ierr_max = max(ierr_max, ierr)
+
+    do concurrent (ks=1:ns, JJ=1:JJe, ii=1:iie, do_face(ii,JJ)) DO_LOCALITY(local(i, J))
+      i = isb + ii - 1
+      J = JsbB + JJ - 1
+
+      PoL(i,J,ks) = PoL_b(ii,JJ,ks) ; PoR(i,J,ks) = PoR_b(ii,JJ,ks)
+      KoL(i,J,ks) = KoL_b(ii,JJ,ks) ; KoR(i,J,ks) = KoR_b(ii,JJ,ks)
+    enddo
+    do concurrent (ks=1:ns-1, JJ=1:JJe, ii=1:iie, do_face(ii,JJ)) DO_LOCALITY(local(i, J))
+      i = isb + ii - 1
+      J = JsbB + JJ - 1
+
+      hEff(i,J,ks) = hEff_b(ii,JJ,ks)
+    enddo
+  enddo ; enddo
+
+  !$omp target exit data map(release: Pl_b, Pr_b, Tl_b, Tr_b, Sl_b, Sr_b, dRdTl_b, dRdTr_b, dRdSl_b, dRdSr_b, &
+  !$omp                              PoL_b, PoR_b, KoL_b, KoR_b, hEff_b, do_face, bl_kl, bl_kr, bl_zl, bl_zr)
+
+  if (ierr_max > 0) call neutral_positions_error(ierr_max, "meridional_neutral_positions")
+
+end subroutine meridional_neutral_positions
+
+!> Brings the model down with the message that find_neutral_surface_positions_continuous and the functions it
+!! calls stop with, for a failure code returned by neutral_positions_block.
+subroutine neutral_positions_error(ierr, caller)
+  integer,          intent(in) :: ierr   !< The failure code from neutral_positions_block
+  character(len=*), intent(in) :: caller !< The name of the calling routine
+
+  character(len=120) :: mesg
+
+  select case (ierr)
+    case (1) ; mesg = 'find_neutral_surface_positions(): klm1 went out of bounds!'
+    case (2) ; mesg = 'find_neutral_surface_positions(): krm1 went out of bounds!'
+    case (3) ; mesg = 'find_neutral_surface_positions(): Else what?'
+    case (4) ; mesg = 'interpolate_for_nondim_position: (Ppos < Pneg) or (dRhoNeg > dRhoPos)'
+    case (5) ; mesg = 'absolute_position: k>nk is out of bounds!'
+    case default ; mesg = 'Unexpected failure.'
+  end select
+  call MOM_error(FATAL, "MOM_neutral_diffusion, "//trim(caller)//": "//trim(mesg))
+
+end subroutine neutral_positions_error
+
 !> Returns the non-dimensional position between Pneg and Ppos where the
 !! interpolated density difference equals zero [nondim].
 !! The result is always bounded to be between 0 and 1.
@@ -1860,24 +2398,11 @@ real function interpolate_for_nondim_position(dRhoNeg, Pneg, dRhoPos, Ppos)
   real, intent(in) :: Ppos    !< Position of positive density difference [R L2 T-2 ~> Pa] or [nondim]
 
   character(len=120) :: mesg
+  logical :: bad  ! True if the positions or density differences are out of order
 
-  if ((Ppos > Pneg) .and. (dRhoPos - dRhoNeg >= 0. )) then
-    if ( dRhoPos - dRhoNeg > 0. ) then
-      interpolate_for_nondim_position = min( 1., max( 0., -dRhoNeg / ( dRhoPos - dRhoNeg ) ) )
-    elseif (dRhoPos - dRhoNeg == 0) then
-      if (dRhoNeg > 0.) then
-        interpolate_for_nondim_position = 0.
-      elseif (dRhoNeg < 0.) then
-        interpolate_for_nondim_position = 1.
-      else ! dRhoPos = dRhoNeg = 0
-        interpolate_for_nondim_position = 0.5
-      endif
-    else ! dRhoPos - dRhoNeg < 0
-      interpolate_for_nondim_position = 0.5
-    endif
-  elseif (Ppos == Pneg) then ! Handle vanished or inverted layers
-    interpolate_for_nondim_position = 0.5
-  else ! ((Ppos < Pneg) .or. (dRhoNeg > dRhoPos) )
+  call interpolate_for_nondim_position_unchecked(dRhoNeg, Pneg, dRhoPos, Ppos, &
+                                                 interpolate_for_nondim_position, bad)
+  if (bad) then ! ((Ppos < Pneg) .or. (dRhoNeg > dRhoPos) )
     ! Error handling for problematic cases.  It is expected that this should never occur.
     write(mesg,*) 'dRhoNeg, Pneg, dRhoPos, Ppos', dRhoNeg, Pneg, dRhoPos, Ppos
     call MOM_error(WARNING, 'interpolate_for_nondim_position: '//trim(mesg))
@@ -1895,6 +2420,42 @@ real function interpolate_for_nondim_position(dRhoNeg, Pneg, dRhoPos, Ppos)
   endif
 
 end function interpolate_for_nondim_position
+
+!> Calculates the non-dimensional position between Pneg and Ppos where the interpolated density difference
+!! equals zero, as interpolate_for_nondim_position does, but returns a flag instead of stopping on the
+!! problematic cases.
+pure subroutine interpolate_for_nondim_position_unchecked(dRhoNeg, Pneg, dRhoPos, Ppos, pos, bad)
+  real,    intent(in)  :: dRhoNeg !< Negative density difference [R ~> kg m-3]
+  real,    intent(in)  :: Pneg    !< Position of negative density difference [R L2 T-2 ~> Pa] or [nondim]
+  real,    intent(in)  :: dRhoPos !< Positive density difference [R ~> kg m-3]
+  real,    intent(in)  :: Ppos    !< Position of positive density difference [R L2 T-2 ~> Pa] or [nondim]
+  real,    intent(out) :: pos     !< The position between Pneg and Ppos where the interpolated density
+                                  !! difference is zero, bounded between 0 and 1 [nondim]
+  logical, intent(out) :: bad     !< True if Ppos < Pneg or dRhoNeg > dRhoPos, which is not expected
+
+  bad = .false.
+  if ((Ppos > Pneg) .and. (dRhoPos - dRhoNeg >= 0. )) then
+    if ( dRhoPos - dRhoNeg > 0. ) then
+      pos = min( 1., max( 0., -dRhoNeg / ( dRhoPos - dRhoNeg ) ) )
+    elseif (dRhoPos - dRhoNeg == 0) then
+      if (dRhoNeg > 0.) then
+        pos = 0.
+      elseif (dRhoNeg < 0.) then
+        pos = 1.
+      else ! dRhoPos = dRhoNeg = 0
+        pos = 0.5
+      endif
+    else ! dRhoPos - dRhoNeg < 0
+      pos = 0.5
+    endif
+  elseif (Ppos == Pneg) then ! Handle vanished or inverted layers
+    pos = 0.5
+  else ! ((Ppos < Pneg) .or. (dRhoNeg > dRhoPos) )
+    pos = 0.5
+    bad = .true.
+  endif
+
+end subroutine interpolate_for_nondim_position_unchecked
 
 !> Higher order version of find_neutral_surface_positions. Returns positions within left/right columns
 !! of combined interfaces using intracell reconstructions of T/S. Note that the polynomial reconstructions
@@ -3412,6 +3973,10 @@ logical function ndiff_unit_tests_continuous(verbose)
                                    (/0.,0.,0.,0.,0.,0.,1.,1./), & ! pR
                                    (/0.,10.,0.,10.,0.,10.,0./), & ! hEff
                                    'Identical columns')
+  ndiff_unit_tests_continuous = ndiff_unit_tests_continuous .or. test_positions_block(v, 3, &
+             (/0.,10.,20.,30./), (/22.,18.,14.,10./), (/0.,0.,0.,0./), (/-1.,-1.,-1.,-1./), (/1.,1.,1.,1./), &
+             (/0.,10.,20.,30./), (/22.,18.,14.,10./), (/0.,0.,0.,0./), (/-1.,-1.,-1.,-1./), (/1.,1.,1.,1./), &
+             '... positions from neutral_positions_block')
   ndiff_unit_tests_continuous = ndiff_unit_tests_continuous .or. test_data1d(v, 8, &
                                    absolute_positions(3, 8, (/0.,10.,20.,30./), KoL, PiLRo), &
                                    (/0.,0.,10.,10.,20.,20.,30.,30./), '... left positions')
@@ -3446,6 +4011,15 @@ logical function ndiff_unit_tests_continuous(verbose)
                                    (/0.,0.,0.5,0.,0.5,0.,0.5,1./), & ! pR
                                    (/0.,5.,5.,5.,5.,5.,0./), & ! hEff
                                    'Right column slightly cooler')
+  ndiff_unit_tests_continuous = ndiff_unit_tests_continuous .or. test_positions_block(v, 3, &
+             (/0.,10.,20.,30./), (/22.,18.,14.,10./), (/0.,0.,0.,0./), (/-1.,-1.,-1.,-1./), (/1.,1.,1.,1./), &
+             (/0.,10.,20.,30./), (/20.,16.,12.,8./), (/0.,0.,0.,0./), (/-1.,-1.,-1.,-1./), (/1.,1.,1.,1./), &
+             '... positions from neutral_positions_block')
+  ndiff_unit_tests_continuous = ndiff_unit_tests_continuous .or. test_positions_block(v, 3, &
+             (/0.,10.,20.,30./), (/22.,18.,14.,10./), (/0.,0.,0.,0./), (/-1.,-1.,-1.,-1./), (/1.,1.,1.,1./), &
+             (/0.,10.,20.,30./), (/20.,16.,12.,8./), (/0.,0.,0.,0./), (/-1.,-1.,-1.,-1./), (/1.,1.,1.,1./), &
+             '... interior positions from neutral_positions_block', &
+             bl_kl=2, bl_kr=1, bl_zl=0.5, bl_zr=0.25)
   ndiff_unit_tests_continuous = ndiff_unit_tests_continuous .or. test_data1d(v, 8, &
                                    absolute_positions(3, 8, (/0.,10.,20.,30./), KoL, PiLRo), &
                                    (/0.,5.,10.,15.,20.,25.,30.,30./), '... left positions')
@@ -3470,6 +4044,10 @@ logical function ndiff_unit_tests_continuous(verbose)
                                    (/0.,0.5,0.,0.5,0.,0.5,1.,1./), & ! pR
                                    (/0.,5.,5.,5.,5.,5.,0./), & ! hEff
                                    'Right column slightly warmer')
+  ndiff_unit_tests_continuous = ndiff_unit_tests_continuous .or. test_positions_block(v, 3, &
+             (/0.,10.,20.,30./), (/22.,18.,14.,10./), (/0.,0.,0.,0./), (/-1.,-1.,-1.,-1./), (/1.,1.,1.,1./), &
+             (/0.,10.,20.,30./), (/24.,20.,16.,12./), (/0.,0.,0.,0./), (/-1.,-1.,-1.,-1./), (/1.,1.,1.,1./), &
+             '... positions from neutral_positions_block')
   ndiff_unit_tests_continuous = ndiff_unit_tests_continuous .or. test_flux_cores(v, 3, 8, &
                                    (/10.,10.,10./), (/10.,10.,10./), (/1.,3.,2./), (/2.,0.5,4./), &
                                    PiLRo, PiRLo, KoL, KoR, hEff, '... test tracer flux from the shared cores')
@@ -3503,6 +4081,10 @@ logical function ndiff_unit_tests_continuous(verbose)
                                    (/0.,0.,0.,0.,0.,0.,0.,1./), & ! pR
                                    (/0.,0.,0.,0.,0.,0.,0./), & ! hEff
                                    'Right column much cooler')
+  ndiff_unit_tests_continuous = ndiff_unit_tests_continuous .or. test_positions_block(v, 3, &
+             (/0.,10.,20.,30./), (/22.,18.,14.,10./), (/0.,0.,0.,0./), (/-1.,-1.,-1.,-1./), (/1.,1.,1.,1./), &
+             (/0.,10.,20.,30./), (/9.,7.,5.,3./), (/0.,0.,0.,0./), (/-1.,-1.,-1.,-1./), (/1.,1.,1.,1./), &
+             '... positions from neutral_positions_block')
   ndiff_unit_tests_continuous = ndiff_unit_tests_continuous .or. test_flux_cores(v, 3, 8, &
                                    (/10.,10.,10./), (/10.,10.,10./), (/1.,3.,2./), (/2.,0.5,4./), &
                                    PiLRo, PiRLo, KoL, KoR, hEff, '... test tracer flux from the shared cores')
@@ -3521,6 +4103,10 @@ logical function ndiff_unit_tests_continuous(verbose)
                                    (/0.,0.,0.,0.,0.,0.,0.,1./), & ! pR
                                    (/0.,0.,0.,0.,10.,0.,0./), & ! hEff
                                    'Right column with mixed layer')
+  ndiff_unit_tests_continuous = ndiff_unit_tests_continuous .or. test_positions_block(v, 3, &
+             (/0.,10.,20.,30./), (/22.,18.,14.,10./), (/0.,0.,0.,0./), (/-1.,-1.,-1.,-1./), (/1.,1.,1.,1./), &
+             (/0.,10.,20.,30./), (/14.,14.,10.,2./), (/0.,0.,0.,0./), (/-1.,-1.,-1.,-1./), (/1.,1.,1.,1./), &
+             '... positions from neutral_positions_block')
   ndiff_unit_tests_continuous = ndiff_unit_tests_continuous .or. test_flux_cores(v, 3, 8, &
                                    (/10.,10.,10./), (/10.,10.,10./), (/1.,3.,2./), (/2.,0.5,4./), &
                                    PiLRo, PiRLo, KoL, KoR, hEff, '... test tracer flux from the shared cores')
@@ -4124,6 +4710,63 @@ logical function test_flux_cores(verbose, nk, nsurf, hl, hr, Tl, Tr, PiL, PiR, K
 
 end function test_flux_cores
 
+!> Returns true if the neutral surface positions that neutral_positions_block finds for a pair of columns
+!! differ in any bit from those of find_neutral_surface_positions_continuous, or if it reports a failure.
+logical function test_positions_block(verbose, nk, Pl, Tl, Sl, dRdTl, dRdSl, Pr, Tr, Sr, dRdTr, dRdSr, title, &
+                                      bl_kl, bl_kr, bl_zl, bl_zr)
+  logical,               intent(in) :: verbose !< If true, write results to stdout
+  integer,               intent(in) :: nk      !< Number of levels
+  real, dimension(nk+1), intent(in) :: Pl      !< Left-column interface pressure [R L2 T-2 ~> Pa] or other units
+  real, dimension(nk+1), intent(in) :: Tl      !< Left-column interface potential temperature [C ~> degC]
+  real, dimension(nk+1), intent(in) :: Sl      !< Left-column interface salinity [S ~> ppt]
+  real, dimension(nk+1), intent(in) :: dRdTl   !< Left-column dRho/dT [R C-1 ~> kg m-3 degC-1]
+  real, dimension(nk+1), intent(in) :: dRdSl   !< Left-column dRho/dS [R S-1 ~> kg m-3 ppt-1]
+  real, dimension(nk+1), intent(in) :: Pr      !< Right-column interface pressure [R L2 T-2 ~> Pa] or other units
+  real, dimension(nk+1), intent(in) :: Tr      !< Right-column interface potential temperature [C ~> degC]
+  real, dimension(nk+1), intent(in) :: Sr      !< Right-column interface salinity [S ~> ppt]
+  real, dimension(nk+1), intent(in) :: dRdTr   !< Right-column dRho/dT [R C-1 ~> kg m-3 degC-1]
+  real, dimension(nk+1), intent(in) :: dRdSr   !< Right-column dRho/dS [R S-1 ~> kg m-3 ppt-1]
+  character(len=*),      intent(in) :: title   !< Title for messages
+  integer,     optional, intent(in) :: bl_kl   !< Layer index of the boundary layer (left)
+  integer,     optional, intent(in) :: bl_kr   !< Layer index of the boundary layer (right)
+  real,        optional, intent(in) :: bl_zl   !< Fractional position of the boundary layer (left) [nondim]
+  real,        optional, intent(in) :: bl_zr   !< Fractional position of the boundary layer (right) [nondim]
+  ! Local variables
+  real,    dimension(2*nk+2) :: PoL, PoR     ! Fractional positions from the column search [nondim]
+  real,    dimension(2*nk+2) :: PoL_b, PoR_b ! Fractional positions from the block search [nondim]
+  integer, dimension(2*nk+2) :: KoL, KoR     ! Layer indices from the column search
+  integer, dimension(2*nk+2) :: KoL_b, KoR_b ! Layer indices from the block search
+  real,    dimension(2*nk+1) :: hEff, hEff_b ! Effective thicknesses from the column and block searches,
+                                             ! in the units of Pl and Pr [R L2 T-2 ~> Pa]
+  logical, dimension(1,1) :: do_face        ! True for the one face of the block
+  integer, dimension(1,1) :: bkl, bkr       ! Layer indices of the boundary layers
+  real,    dimension(1,1) :: bzl, bzr       ! Fractional positions of the boundary layers [nondim]
+  logical :: interior   ! True if the boundary layer arguments are present
+  integer :: ierr       ! The failure code from neutral_positions_block
+
+  interior = present(bl_kl) .and. present(bl_kr) .and. present(bl_zl) .and. present(bl_zr)
+  bkl(1,1) = 1 ; bkr(1,1) = 1 ; bzl(1,1) = 0. ; bzr(1,1) = 0.
+  if (interior) then
+    call find_neutral_surface_positions_continuous(nk, Pl, Tl, Sl, dRdTl, dRdSl, Pr, Tr, Sr, dRdTr, dRdSr, &
+                                                   PoL, PoR, KoL, KoR, hEff, bl_kl, bl_kr, bl_zl, bl_zr)
+    bkl(1,1) = bl_kl ; bkr(1,1) = bl_kr ; bzl(1,1) = bl_zl ; bzr(1,1) = bl_zr
+  else
+    call find_neutral_surface_positions_continuous(nk, Pl, Tl, Sl, dRdTl, dRdSl, Pr, Tr, Sr, dRdTr, dRdSr, &
+                                                   PoL, PoR, KoL, KoR, hEff)
+  endif
+  do_face(1,1) = .true.
+  PoL_b(:) = 0. ; PoR_b(:) = 0. ; KoL_b(:) = 1 ; KoR_b(:) = 1 ; hEff_b(:) = 0.
+  call neutral_positions_block(1, 1, 1, 1, nk, 2*nk+2, do_face, Pl, Tl, Sl, dRdTl, dRdSl, Pr, Tr, Sr, dRdTr, &
+                               dRdSr, interior, bkl, bkr, bzl, bzr, PoL_b, PoR_b, KoL_b, KoR_b, hEff_b, ierr)
+  test_positions_block = test_nsp(verbose, 2*nk+2, KoL_b, KoR_b, PoL_b, PoR_b, hEff_b, &
+                                  KoL, KoR, PoL, PoR, hEff, title)
+  if (ierr /= 0) then
+    test_positions_block = .true.
+    write(stdout,'(a,i2)') trim(title)//': neutral_positions_block failed with code ', ierr
+  endif
+
+end function test_positions_block
+
 !> Compares a single row, k, of output from find_neutral_surface_positions()
 logical function compare_nsp_row(KoL, KoR, pL, pR, KoL0, KoR0, pL0, pR0)
   integer,  intent(in) :: KoL   !< Index of first left interface above neutral surface
@@ -4163,7 +4806,13 @@ end function test_rnp
 subroutine neutral_diffusion_end(CS)
   type(neutral_diffusion_CS), pointer :: CS  !< Neutral diffusion control structure
 
-  if (associated(CS)) deallocate(CS)
+  if (associated(CS)) then
+    !$omp target exit data map(delete: CS%dRdT, CS%dRdS, CS%Tint, CS%Sint, CS%Pint, &
+    !$omp                              CS%uPoL, CS%uPoR, CS%uKoL, CS%uKoR, CS%uhEff, &
+    !$omp                              CS%vPoL, CS%vPoR, CS%vKoL, CS%vKoR, CS%vhEff)
+    !$omp target exit data map(delete: CS)
+    deallocate(CS)
+  endif
 
 end subroutine neutral_diffusion_end
 
