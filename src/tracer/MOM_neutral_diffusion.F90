@@ -428,14 +428,12 @@ subroutine neutral_diffusion_calc_coeffs(G, GV, US, h, T, S, visc, CS, p_surf)
   pa_to_H = 1. / (GV%H_to_RZ * GV%g_Earth)
   H_to_pa = GV%H_to_pa
 
-  !$omp target enter data map(alloc: k_top, k_bot, zeta_top, zeta_bot)
+  !$omp target enter data map(alloc: k_top, k_bot, zeta_top, zeta_bot, ref_pres)
 
   do concurrent (j=G%jsd:G%jed, i=G%isd:G%ied)
     k_top(i,j) = 1     ; k_bot(i,j) = 1
     zeta_top(i,j) = 0. ; zeta_bot(i,j) = 0.
   enddo
-
-  !$omp target exit data map(from: k_top, k_bot, zeta_top, zeta_bot)
 
   ! Check if hbl needs to be extracted
   if (CS%interior_only) then
@@ -447,6 +445,7 @@ subroutine neutral_diffusion_calc_coeffs(G, GV, US, h, T, S, visc, CS, p_surf)
     call pass_var(CS%hbl, G%Domain, halo=1)
 
     ! get k-indices and zeta
+    !$omp target update from(k_top, k_bot, zeta_top, zeta_bot)
     do jsb=G%jsc-1,G%jec+1,njj ; do isb=G%isc-1,G%iec+1,nii
       jeb = min(jsb+njj-1, G%jec+1)
       ieb = min(isb+nii-1, G%iec+1)
@@ -458,6 +457,7 @@ subroutine neutral_diffusion_calc_coeffs(G, GV, US, h, T, S, visc, CS, p_surf)
         endif
       enddo ; enddo
     enddo ; enddo
+    !$omp target update to(k_top, k_bot, zeta_top, zeta_bot)
     ! TODO: add similar code for BOTTOM boundary layer
   endif
 
@@ -473,19 +473,13 @@ subroutine neutral_diffusion_calc_coeffs(G, GV, US, h, T, S, visc, CS, p_surf)
     endif
   endif
 
-  ! If doing along isopycnal diffusion (as opposed to neutral diffusion, set the reference pressure)
-  if (CS%ref_pres>=0.) then
-    ref_pres(:,:,:) = CS%ref_pres
-  endif
-
-  !$omp target update from(T, S) if(.not.CS%continuous_reconstruction)
-
   if (CS%continuous_reconstruction) then
     do concurrent (k=1:GV%ke+1, j=G%jsd:G%jed, i=G%isd:G%ied)
       CS%dRdT(i,j,k) = 0.
       CS%dRdS(i,j,k) = 0.
     enddo
   else
+    !$omp target update from(T, S)
     CS%T_i(:,:,:,:) = 0.
     CS%S_i(:,:,:,:) = 0.
     CS%dRdT_i(:,:,:,:) = 0.
@@ -509,7 +503,6 @@ subroutine neutral_diffusion_calc_coeffs(G, GV, US, h, T, S, visc, CS, p_surf)
       enddo
     enddo
   enddo
-  !$omp target update from(CS%Pint)
 
   ! Pressures at the interfaces, this is redundant as P_i(k,1) = P_i(k-1,2) however retain this
   ! for now to ensure consistency of indexing for discontinuous reconstructions
@@ -531,7 +524,16 @@ subroutine neutral_diffusion_calc_coeffs(G, GV, US, h, T, S, visc, CS, p_surf)
     enddo ; enddo ; enddo
   endif
 
-  if (CS%ref_pres<0) ref_pres(:,:,:) = CS%Pint(:,:,:)
+  ! If doing along isopycnal diffusion (as opposed to neutral diffusion, set the reference pressure)
+  if (CS%ref_pres>=0.) then
+    do concurrent (k=1:GV%ke+1, j=G%jsd:G%jed, i=G%isd:G%ied)
+      ref_pres(i,j,k) = CS%ref_pres
+    enddo
+  else
+    do concurrent (k=1:GV%ke+1, j=G%jsd:G%jed, i=G%isd:G%ied)
+      ref_pres(i,j,k) = CS%Pint(i,j,k)
+    enddo
+  endif
 
   ! EOSdom(:) = EOS_domain(G%HI, halo=1)
   do jsb=G%jsc-1,G%jec+1,njj ; do isb=G%isc-1,G%iec+1,nii
@@ -548,7 +550,6 @@ subroutine neutral_diffusion_calc_coeffs(G, GV, US, h, T, S, visc, CS, p_surf)
       call interface_scalar_block(G, isb, ieb, jsb, jeb, GV%ke, h, S, G%isd, G%ied, G%jsd, G%jed, &
                                   CS%Sint, 2, h_neglect)
       call calculate_density_derivs(CS%Tint, CS%Sint, ref_pres, CS%dRdT, CS%dRdS, CS%EOS, EOSdom)
-      !$omp target update from(CS%dRdT, CS%dRdS, CS%Tint, CS%Sint)
     else
       do j=jsb,jeb ; do i=isb,ieb
         call build_reconstructions_1d( CS%remap_CS, GV%ke, h(i,j,:), T(i,j,:), CS%ppoly_coeffs_T(i,j,:,:), &
@@ -580,11 +581,10 @@ subroutine neutral_diffusion_calc_coeffs(G, GV, US, h, T, S, visc, CS, p_surf)
             CS%stable_cell(i,j,k) = .false.
           enddo
         enddo ; enddo
+        !$omp target update to(zeta_bot)
       endif
     endif
   enddo ; enddo
-
-  !$omp target enter data map(to: k_bot, zeta_bot)
 
   ! Neutral surface factors at U points
   nIIB = CS%niblock
@@ -641,7 +641,7 @@ subroutine neutral_diffusion_calc_coeffs(G, GV, US, h, T, S, visc, CS, p_surf)
     call post_data(CS%id_vhEff_2d, hEff_sum, CS%diag)
   endif
 
-  !$omp target exit data map(release: k_bot, zeta_bot)
+  !$omp target exit data map(release: k_top, k_bot, zeta_top, zeta_bot, ref_pres)
 
 end subroutine neutral_diffusion_calc_coeffs
 
@@ -694,6 +694,9 @@ subroutine neutral_diffusion(G, GV, h, Coef_x, Coef_y, dt, Reg, US, CS)
   integer :: ns      ! The number of neutral surfaces
   real :: Idt  ! The inverse of the time step [T-1 ~> s-1]
   real :: h_neglect, h_neglect_edge ! Negligible thicknesses [H ~> m or kg m-2]
+
+  !$omp target enter data map(alloc: uFlx, vFlx, tendency, trans_x_2d, trans_y_2d) map(to: Coef_x, Coef_y)
+
   h_neglect = GV%H_subroundoff ; h_neglect_edge = GV%H_subroundoff
 
   if (.not. CS%continuous_reconstruction) then
@@ -727,8 +730,6 @@ subroutine neutral_diffusion(G, GV, h, Coef_x, Coef_y, dt, Reg, US, CS)
   if (CS%niblock == 0) nii = G%iec - G%isc + 1
   nJJB = CS%njblock
   if (CS%njblock == 0) nJJB = G%jec - G%jsc + 2
-
-  !$omp target enter data map(alloc: uFlx, vFlx, tendency, trans_x_2d, trans_y_2d) map(to: Coef_x, Coef_y)
 
   do m = 1,Reg%ntr ! Loop over tracer registry
 
@@ -3731,6 +3732,8 @@ subroutine neutral_flux_divergence(G, GV, h, Coef_x, Coef_y, nsurf, uKoL, uKoR, 
   nk = GV%ke
   H_subroundoff = GV%H_subroundoff
 
+  !$omp target enter data map(alloc: dTr_b, dTrN_b, dTrS_b, dTrE_b, dTrW_b) if(.not.vert_struct)
+
   if (vert_struct) then
     !$omp target update from(uKoL, uKoR, vKoL, vKoR, uFlx, vFlx, T)
     do jsb=G%jsc,G%jec,njj ; do isb=G%isc,G%iec,nii
@@ -3797,8 +3800,6 @@ subroutine neutral_flux_divergence(G, GV, h, Coef_x, Coef_y, nsurf, uKoL, uKoR, 
     !$omp target update to(tendency) if(do_tend)
     return
   endif
-
-  !$omp target enter data map(alloc: dTr_b, dTrN_b, dTrS_b, dTrE_b, dTrW_b)
 
   do jsb=G%jsc,G%jec,njj ; do isb=G%isc,G%iec,nii
     ieb = min(isb + nii - 1, G%iec)
