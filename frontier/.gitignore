@@ -1,0 +1,6 @@
+# Crash dumps and build products from the MRE run.sh scripts
+core
+core.*
+*.mod
+*.o
+*.x

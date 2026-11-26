@@ -344,6 +344,11 @@ subroutine set_viscous_BBL(u, v, h, tv, visc, G, GV, US, CS, pbv)
   logical :: use_BBL_EOS, do_i(SZIB_(G),SZJB_(G))
   integer, dimension(2,2) :: EOSdom ! The computational domain for the equation of state
   integer :: i, j, k, is, ie, js, je, Isq, Ieq, Jsq, Jeq, nz, m, n, K2, nkmb, nkml, jstart
+#ifdef AMD_WORKAROUNDS
+  ! AMD_WORKAROUNDS: AFAR flang clashes OpenMP private(x) with do concurrent local(x)
+  ! (src/MOM6/frontier/bug_reports/01); renamed loop indices avoid it.
+  integer :: kc
+#endif
   integer :: is_OBC, ie_OBC, js_OBC, je_OBC
   type(ocean_OBC_type), pointer :: OBC => NULL()
 
@@ -594,6 +599,87 @@ subroutine set_viscous_BBL(u, v, h, tv, visc, G, GV, US, CS, pbv)
       if (associated(OBC)) then ; if (OBC%number_of_segments > 0) then
         ! Apply a zero gradient projection of thickness across OBC points.
         if (m==1) then
+#ifdef AMD_WORKAROUNDS
+          ! AMD_WORKAROUNDS: AFAR flang clashes OpenMP private(x) with do concurrent local(x)
+          ! (src/MOM6/frontier/bug_reports/01); renamed loop indices avoid it.
+          do concurrent (I=is:ie, do_i(I,j) .and. (OBC%segnum_u(I,j) /= 0)) &
+              DO_LOCALITY(local(kc))
+            if (OBC%segnum_u(I,j) > 0) then  ! OBC_DIRECTION_E
+              do kc=1,nz
+                h_at_vel(I,j,kc) = h(i,j,kc) ; h_vel(I,j,kc) = h(i,j,kc)
+                dz_at_vel(I,j,kc) = dz(i,j,kc) ; dz_vel(I,j,kc) = dz(i,j,kc)
+              enddo
+              if (use_BBL_EOS) then
+                do kc=1,nz
+                  T_vel(I,j,kc) = tv%T(i,j,kc) ; S_vel(I,j,kc) = tv%S(i,j,kc)
+                enddo
+              else
+                do kc=1,nkmb
+                  Rml_vel(I,j,kc) = Rml(i,j,kc)
+                enddo
+              endif
+              if (allocated(tv%SpV_avg)) then ; do kc=1,nz
+                SpV_vel(I,j,kc) = tv%SpV_avg(i,j,kc)
+              enddo ; endif
+            elseif (OBC%segnum_u(I,j) < 0) then  ! OBC_DIRECTION_W
+              do kc=1,nz
+                h_at_vel(I,j,kc) = h(i+1,j,kc) ; h_vel(I,j,kc) = h(i+1,j,kc)
+                dz_at_vel(I,j,kc) = dz(i+1,j,kc) ; dz_vel(I,j,kc) = dz(i+1,j,kc)
+              enddo
+              if (use_BBL_EOS) then
+                do kc=1,nz
+                  T_vel(I,j,kc) = tv%T(i+1,j,kc) ; S_vel(I,j,kc) = tv%S(i+1,j,kc)
+                enddo
+              else
+                do kc=1,nkmb
+                  Rml_vel(I,j,kc) = Rml(i+1,j,kc)
+                enddo
+              endif
+              if (allocated(tv%SpV_avg)) then ; do kc=1,nz
+                SpV_vel(I,j,kc) = tv%SpV_avg(i+1,j,kc)
+              enddo ; endif
+            endif
+          enddo
+        else
+          do concurrent (i=is:ie, do_i(i,j) .and. (OBC%segnum_v(i,J) /= 0)) &
+              DO_LOCALITY(local(kc))
+            if (OBC%segnum_v(i,J) > 0) then  ! OBC_DIRECTION_N
+              do kc=1,nz
+                h_at_vel(i,j,kc) = h(i,j,kc) ; h_vel(i,j,kc) = h(i,j,kc)
+                dz_at_vel(i,j,kc) = dz(i,j,kc) ; dz_vel(i,j,kc) = dz(i,j,kc)
+              enddo
+              if (use_BBL_EOS) then
+                do kc=1,nz
+                  T_vel(i,j,kc) = tv%T(i,j,kc) ; S_vel(i,j,kc) = tv%S(i,j,kc)
+                enddo
+              else
+                do kc=1,nkmb
+                  Rml_vel(i,j,kc) = Rml(i,j,kc)
+                enddo
+              endif
+              if (allocated(tv%SpV_avg)) then ; do kc=1,nz
+                SpV_vel(i,j,kc) = tv%SpV_avg(i,j,kc)
+              enddo ;  endif
+            elseif (OBC%segnum_v(i,J) < 0) then  ! OBC_DIRECTION_S
+              do kc=1,nz
+                h_at_vel(i,j,kc) = h(i,j+1,kc) ; h_vel(i,j,kc) = h(i,j+1,kc)
+                dz_at_vel(i,j,kc) = dz(i,j+1,kc) ; dz_vel(i,j,kc) = dz(i,j+1,kc)
+              enddo
+              if (use_BBL_EOS) then
+                do kc=1,nz
+                  T_vel(i,j,kc) = tv%T(i,j+1,kc) ; S_vel(i,j,kc) = tv%S(i,j+1,kc)
+                enddo
+              else
+                do kc=1,nkmb
+                  Rml_vel(i,j,kc) = Rml(i,j+1,kc)
+                enddo
+              endif
+              if (allocated(tv%SpV_avg)) then ; do kc=1,nz
+                SpV_vel(i,j,kc) = tv%SpV_avg(i,j+1,kc)
+              enddo ; endif
+            endif
+          enddo
+#else
           do concurrent (I=is:ie, do_i(I,j) .and. (OBC%segnum_u(I,j) /= 0)) &
               DO_LOCALITY(local(k))
             if (OBC%segnum_u(I,j) > 0) then  ! OBC_DIRECTION_E
@@ -671,6 +757,7 @@ subroutine set_viscous_BBL(u, v, h, tv, visc, G, GV, US, CS, pbv)
               enddo ; endif
             endif
           enddo
+#endif
         endif
       endif ; endif
 
@@ -693,6 +780,86 @@ subroutine set_viscous_BBL(u, v, h, tv, visc, G, GV, US, CS, pbv)
         ! Calculate the mean velocity magnitude over the bottommost CS%Hbbl of
         ! the water column for determining the quadratic bottom drag.
         ! Used in ustar(i,j)
+#ifdef AMD_WORKAROUNDS
+        ! AMD_WORKAROUNDS: AFAR flang clashes OpenMP private(x) with do concurrent local(x)
+        ! (src/MOM6/frontier/bug_reports/01); renamed loop indices avoid it.
+        do concurrent (i=is:ie, do_i(i,j)) DO_LOCALITY(local(kc, cdrag_sqrt)) &
+            DO_LOCALITY(local_init(cdrag_sqrt_H, cdrag_sqrt_H_RL))
+          htot_vel = 0.0 ; hwtot = 0.0 ; hutot = 0.0
+          dztot_vel = 0.0 ; dzwtot = 0.0
+          Thtot = 0.0 ; Shtot = 0.0 ; SpV_htot = 0.0
+
+          if (CS%bottomdragmap) then
+            if (m==1) then
+              cdrag_sqrt = sqrt(CS%cdrag_u(i,j))
+            else
+              cdrag_sqrt = sqrt(CS%cdrag_v(i,j))
+            endif
+            cdrag_sqrt_H = cdrag_sqrt * US%L_to_m * GV%m_to_H
+            cdrag_sqrt_H_RL = cdrag_sqrt * US%L_to_Z * GV%RZ_to_H
+          endif
+
+          do kc=nz,1,-1
+            if (htot_vel>=CS%Hbbl) exit ! terminate the kc loop
+
+            hweight = MIN(CS%Hbbl - htot_vel, h_at_vel(i,j,kc))
+            if (hweight < 1.5*GV%Angstrom_H + h_neglect) cycle
+            dzweight = MIN(CS%dz_bbl - dztot_vel, dz_at_vel(i,j,kc))
+
+            htot_vel = htot_vel + h_at_vel(i,j,kc)
+            hwtot = hwtot + hweight
+            dztot_vel = dztot_vel + dz_at_vel(i,j,kc)
+            dzwtot = dzwtot + dzweight
+
+            if ((.not.CS%linear_drag) .and. (hweight >= 0.0)) then ; if (m==1) then
+              v_at_u = set_v_at_u(v, h, G, GV, i, j, kc, mask_v, OBC)
+              hutot = hutot + hweight * sqrt(u(I,j,kc)*u(I,j,kc) + v_at_u*v_at_u + u2_bg(I,j))
+            else
+              u_at_v = set_u_at_v(u, h, G, GV, i, j, kc, mask_u, OBC)
+              hutot = hutot + hweight * sqrt(v(i,J,kc)*v(i,J,kc) + u_at_v*u_at_v + u2_bg(i,j))
+            endif ; endif
+
+            if (use_BBL_EOS .and. (hweight >= 0.0)) then
+              Thtot = Thtot + hweight * T_vel(i,j,kc)
+              Shtot = Shtot + hweight * S_vel(i,j,kc)
+            endif
+            if (allocated(tv%SpV_avg) .and. (hweight >= 0.0)) then
+              SpV_htot = SpV_htot + hweight * SpV_vel(i,j,kc)
+            endif
+          enddo ! end of kc loop
+
+          ! Find the Adcroft reciprocal of the total thickness weights
+          I_hwtot = 0.0 ; if (hwtot > 0.0) I_hwtot = 1.0 / hwtot
+
+          ! Set u* based on u*^2 = Cdrag u_bbl^2
+          if ((hwtot <= 0.0) .or. (CS%linear_drag .and. .not.allocated(tv%SpV_avg))) then
+            ustar(i,j) = cdrag_sqrt_H * CS%drag_bg_vel
+          elseif (CS%linear_drag .and. allocated(tv%SpV_avg)) then
+            ustar(i,j) = cdrag_sqrt_H_RL * CS%drag_bg_vel * (hwtot / SpV_htot)
+          elseif (allocated(tv%SpV_avg)) then ! (.not.CS%linear_drag)
+            ustar(i,j) = cdrag_sqrt_H_RL * hutot / SpV_htot
+          else ! (.not.CS%linear_drag .and. .not.allocated(tv%SpV_avg))
+            ustar(i,j) = cdrag_sqrt_H * hutot / hwtot
+          endif
+
+          umag_avg(i,j) = hutot * I_hwtot
+          h_bbl_drag(i,j) = hwtot
+          dz_bbl_drag(i,j) = dzwtot
+
+          if (use_BBL_EOS) then ; if (hwtot > 0.0) then
+            T_EOS(i,j) = Thtot/hwtot ; S_EOS(i,j) = Shtot/hwtot
+          else
+            T_EOS(i,j) = 0.0 ; S_EOS(i,j) = 0.0
+          endif ; endif
+
+          ! Diagnostic BBL flow speed at u- and v-points.
+          if (CS%id_bbl_u>0 .and. m==1) then
+            if (hwtot > 0.0) CS%bbl_u(I,j) = hutot/hwtot
+          elseif (CS%id_bbl_v>0 .and. m==2) then
+            if (hwtot > 0.0) CS%bbl_v(i,J) = hutot/hwtot
+          endif
+        enddo
+#else
         do concurrent (i=is:ie, do_i(i,j)) DO_LOCALITY(local(k, cdrag_sqrt)) &
             DO_LOCALITY(local_init(cdrag_sqrt_H, cdrag_sqrt_H_RL))
           htot_vel = 0.0 ; hwtot = 0.0 ; hutot = 0.0
@@ -769,6 +936,7 @@ subroutine set_viscous_BBL(u, v, h, tv, visc, G, GV, US, CS, pbv)
             if (hwtot > 0.0) CS%bbl_v(i,J) = hutot/hwtot
           endif
         enddo
+#endif
       else
         do concurrent (i=is:ie) DO_LOCALITY(local(cdrag_sqrt)) &
             DO_LOCALITY(local_init(cdrag_sqrt_H))
@@ -2214,6 +2382,11 @@ subroutine set_viscous_ML(u, v, h, tv, forces, visc, dt, G, GV, US, CS, nIIB, nJ
   logical :: nonBous_ML  ! If true, use the non-Boussinesq form of some energy and
                          ! stratification calculations.
   integer :: i, j, k, is, ie, js, je, Isq, Ieq, Jsq, Jeq, nz, K2, nkmb, nkml, n, EOSdom(2,2)
+#ifdef AMD_WORKAROUNDS
+  ! AMD_WORKAROUNDS: AFAR flang clashes OpenMP private(x) with do concurrent local(x)
+  ! (src/MOM6/frontier/bug_reports/01); renamed loop indices avoid it.
+  integer :: io, jo
+#endif
   integer :: isb, ieb   !< The i-index bounds of the current block (centre-indexed).
   integer :: jsb, jeb   !< The j-index bounds of the current block (centre-indexed).
   integer :: IsbB, IebB !< The I-index bounds of the current block (face-indexed).
@@ -2292,6 +2465,17 @@ subroutine set_viscous_ML(u, v, h, tv, forces, visc, dt, G, GV, US, CS, nIIB, nJ
   if (associated(forces%frac_shelf_u) .or. associated(forces%frac_shelf_v)) then
 
     !$OMP parallel do default(shared)
+#ifdef AMD_WORKAROUNDS
+    ! AMD_WORKAROUNDS: AFAR flang clashes OpenMP private(x) with do concurrent local(x)
+    ! (src/MOM6/frontier/bug_reports/01); renamed loop indices avoid it.
+    do jo=js-1,je ; do io=is-1,ie+1
+      mask_v(io,jo) = G%mask2dCv(io,jo)
+    enddo ; enddo
+    !$OMP parallel do default(shared)
+    do jo=js-1,je+1 ; do io=is-1,ie
+      mask_u(io,jo) = G%mask2dCu(io,jo)
+    enddo ; enddo
+#else
     do J=js-1,je ; do i=is-1,ie+1
       mask_v(i,J) = G%mask2dCv(i,J)
     enddo ; enddo
@@ -2299,6 +2483,7 @@ subroutine set_viscous_ML(u, v, h, tv, forces, visc, dt, G, GV, US, CS, nIIB, nJ
     do j=js-1,je+1 ; do I=is-1,ie
       mask_u(I,j) = G%mask2dCu(I,j)
     enddo ; enddo
+#endif
 
     if (associated(OBC)) then ; do n=1,OBC%number_of_segments
       ! Project bottom depths across cell-corner points in the OBCs.
@@ -2356,6 +2541,30 @@ subroutine set_viscous_ML(u, v, h, tv, forces, visc, dt, G, GV, US, CS, nIIB, nJ
       if (do_any) then
         !$omp target
         do k=1,min(nkml,nz)
+#ifdef AMD_WORKAROUNDS
+          ! AMD_WORKAROUNDS: AFAR flang clashes OpenMP private(x) with do concurrent local(x)
+          ! (src/MOM6/frontier/bug_reports/01); renamed loop indices avoid it.
+          !$omp loop collapse(2) private(io,jo)
+          do jj=1,jje ; do II=1,IIe
+            io = IsbB + II - 1
+            jo = jsb + jj - 1
+
+            if (do_ij(II,jj)) then
+              htot(II,jj) = htot(II,jj) + 0.5 * (h(io,jo,k) + h(io+1,jo,k))
+              uhtot(II,jj) = uhtot(II,jj) + 0.5 * (h(io,jo,k) + h(io+1,jo,k)) * u(io,jo,k)
+              vhtot(II,jj) = vhtot(II,jj) + 0.25 * ((h(io,jo,k) * (v(io,jo,k) + v(io,jo-1,k))) + &
+                                            (h(io+1,jo,k) * (v(io+1,jo,k) + v(io+1,jo-1,k))))
+              if (use_EOS) then
+                Thtot(II,jj) = Thtot(II,jj) + &
+                  0.5 * ((h(io,jo,k)*tv%T(io,jo,k)) + (h(io+1,jo,k)*tv%T(io+1,jo,k)))
+                Shtot(II,jj) = Shtot(II,jj) + &
+                  0.5 * ((h(io,jo,k)*tv%S(io,jo,k)) + (h(io+1,jo,k)*tv%S(io+1,jo,k)))
+              else
+                Rhtot(II,jj) = Rhtot(II,jj) + 0.5 * (h(io,jo,k) + h(io+1,jo,k)) * GV%Rlay(k)
+              endif
+            endif
+          enddo ; enddo
+#else
           !$omp loop collapse(2) private(i,j)
           do jj=1,jje ; do II=1,IIe
             I = IsbB + II - 1
@@ -2376,6 +2585,7 @@ subroutine set_viscous_ML(u, v, h, tv, forces, visc, dt, G, GV, US, CS, nIIB, nJ
               endif
             endif
           enddo ; enddo
+#endif
         enddo
         !$omp end target
 
@@ -2412,6 +2622,58 @@ subroutine set_viscous_ML(u, v, h, tv, forces, visc, dt, G, GV, US, CS, nIIB, nJ
 #endif
 
           !$omp loop LOOP_BIND_TEAMS_PARALLEL collapse(2) &
+#ifdef AMD_WORKAROUNDS
+          ! AMD_WORKAROUNDS: AFAR flang clashes OpenMP private(x) with do concurrent local(x)
+          ! (src/MOM6/frontier/bug_reports/01); renamed loop indices avoid it.
+          !$omp   private(io,jo,hlay,I_2hlay,v_at_u,Uh2,T_lay,S_lay,gHprime,RiBulk)
+          do jj=1,jje ; do II=1,IIe
+            io = IsbB + II - 1
+            jo = jsb + jj - 1
+
+            if (do_ij(II,jj)) then
+              hlay = 0.5*(h(io,jo,k) + h(io+1,jo,k))
+              if (hlay > h_tiny) then ! Only consider non-vanished layers.
+                I_2hlay = 1.0 / (h(io,jo,k) + h(io+1,jo,k))
+                v_at_u = 0.5 * ((h(io,jo,k)   * (v(io,jo,k) + v(io,jo-1,k))) + &
+                                (h(io+1,jo,k) * (v(io+1,jo,k) + v(io+1,jo-1,k)))) * I_2hlay
+                Uh2 = (uhtot(II,jj) - htot(II,jj)*u(io,jo,k))**2 + &
+                      (vhtot(II,jj) - htot(II,jj)*v_at_u)**2
+
+                if (use_EOS) then
+                  T_lay = ((h(io,jo,k)*tv%T(io,jo,k)) + (h(io+1,jo,k)*tv%T(io+1,jo,k))) * I_2hlay
+                  S_lay = ((h(io,jo,k)*tv%S(io,jo,k)) + (h(io+1,jo,k)*tv%S(io+1,jo,k))) * I_2hlay
+                  if (nonBous_ML) then
+                    gHprime = (GV%g_Earth * GV%H_to_RZ) * &
+                      (dSpV_dT(II,jj) * (Thtot(II,jj) - T_lay*htot(II,jj)) + &
+                       dSpV_dS(II,jj) * (Shtot(II,jj) - S_lay*htot(II,jj)))
+                  else
+                    gHprime = g_H_Rho0 * (dR_dT(II,jj) * (T_lay*htot(II,jj) - Thtot(II,jj)) + &
+                                          dR_dS(II,jj) * (S_lay*htot(II,jj) - Shtot(II,jj)))
+                  endif
+                else
+                  gHprime = g_H_Rho0 * (GV%Rlay(k)*htot(II,jj) - Rhtot(II,jj))
+                endif
+
+                if (gHprime > 0.0) then
+                  RiBulk = CS%bulk_Ri_ML * exp_repro(-htot(II,jj) * Idecay_len_TKE(II,jj))
+                  if (RiBulk * Uh2 <= (htot(II,jj)**2) * gHprime) then
+                    visc%nkml_visc_u(io,jo) = real(k_massive(II,jj))
+                    do_ij(II,jj) = .false.
+                  elseif (RiBulk * Uh2 <= (htot(II,jj) + hlay)**2 * gHprime) then
+                    visc%nkml_visc_u(io,jo) = real(k-1) + &
+                      ( sqrt(RiBulk * Uh2 / gHprime) - htot(II,jj) ) / hlay
+                    do_ij(II,jj) = .false.
+                  endif
+                endif
+                k_massive(II,jj) = k
+              endif ! hlay > h_tiny
+
+#ifndef __NVCOMPILER_OPENMP_GPU
+              if (do_ij(II,jj)) do_any = .true.
+#endif
+            endif
+          enddo ; enddo
+#else
           !$omp   private(i,j,hlay,I_2hlay,v_at_u,Uh2,T_lay,S_lay,gHprime,RiBulk)
           do jj=1,jje ; do II=1,IIe
             I = IsbB + II - 1
@@ -2460,11 +2722,36 @@ subroutine set_viscous_ML(u, v, h, tv, forces, visc, dt, G, GV, US, CS, nIIB, nJ
 #endif
             endif
           enddo ; enddo
+#endif
 
 #ifndef __NVCOMPILER_OPENMP_GPU
           if (.not.do_any) exit ! All columns are done.
 #endif
 
+#ifdef AMD_WORKAROUNDS
+          ! AMD_WORKAROUNDS: AFAR flang clashes OpenMP private(x) with do concurrent local(x)
+          ! (src/MOM6/frontier/bug_reports/01); renamed loop indices avoid it.
+          !$omp loop LOOP_BIND_TEAMS_PARALLEL collapse(2) private(io,jo)
+          do jj=1,jje ; do II=1,IIe
+            io = IsbB + II - 1
+            jo = jsb + jj - 1
+
+            if (do_ij(II,jj)) then
+              htot(II,jj) = htot(II,jj) + 0.5 * (h(io,jo,k) + h(io+1,jo,k))
+              uhtot(II,jj) = uhtot(II,jj) + 0.5 * (h(io,jo,k) + h(io+1,jo,k)) * u(io,jo,k)
+              vhtot(II,jj) = vhtot(II,jj) + 0.25 * ((h(io,jo,k) * (v(io,jo,k) + v(io,jo-1,k))) + &
+                                            (h(io+1,jo,k) * (v(io+1,jo,k) + v(io+1,jo-1,k))))
+              if (use_EOS) then
+                Thtot(II,jj) = Thtot(II,jj) + &
+                  0.5 * ((h(io,jo,k)*tv%T(io,jo,k)) + (h(io+1,jo,k)*tv%T(io+1,jo,k)))
+                Shtot(II,jj) = Shtot(II,jj) + &
+                  0.5 * ((h(io,jo,k)*tv%S(io,jo,k)) + (h(io+1,jo,k)*tv%S(io+1,jo,k)))
+              else
+                Rhtot(II,jj) = Rhtot(II,jj) + 0.5 * (h(io,jo,k) + h(io+1,jo,k)) * GV%Rlay(k)
+              endif
+            endif
+          enddo ; enddo
+#else
           !$omp loop LOOP_BIND_TEAMS_PARALLEL collapse(2) private(i,j)
           do jj=1,jje ; do II=1,IIe
             I = IsbB + II - 1
@@ -2485,6 +2772,7 @@ subroutine set_viscous_ML(u, v, h, tv, forces, visc, dt, G, GV, US, CS, nIIB, nJ
               endif
             endif
           enddo ; enddo
+#endif
         enddo
         !$omp end target teams
       endif
@@ -2727,6 +3015,30 @@ subroutine set_viscous_ML(u, v, h, tv, forces, visc, dt, G, GV, US, CS, nIIB, nJ
       if (do_any) then
         !$omp target
         do k=1,nkml
+#ifdef AMD_WORKAROUNDS
+          ! AMD_WORKAROUNDS: AFAR flang clashes OpenMP private(x) with do concurrent local(x)
+          ! (src/MOM6/frontier/bug_reports/01); renamed loop indices avoid it.
+          !$omp loop collapse(2) private(io,jo)
+          do JJ=1,JJe ; do ii=1,iie
+            io = isb + ii - 1
+            jo = JsbB + JJ - 1
+
+            if (do_ij(ii,JJ)) then
+              htot(ii,JJ) = htot(ii,JJ) + 0.5 * (h(io,jo,k) + h(io,jo+1,k))
+              vhtot(ii,JJ) = vhtot(ii,JJ) + 0.5 * (h(io,jo,k) + h(io,jo+1,k)) * v(io,jo,k)
+              uhtot(ii,JJ) = uhtot(ii,JJ) + 0.25 * ((h(io,jo,k) * (u(io-1,jo,k) + u(io,jo,k))) + &
+                                            (h(io,jo+1,k) * (u(io-1,jo+1,k) + u(io,jo+1,k))))
+              if (use_EOS) then
+                Thtot(ii,JJ) = Thtot(ii,JJ) + &
+                  0.5 * ((h(io,jo,k)*tv%T(io,jo,k)) + (h(io,jo+1,k)*tv%T(io,jo+1,k)))
+                Shtot(ii,JJ) = Shtot(ii,JJ) + &
+                  0.5 * ((h(io,jo,k)*tv%S(io,jo,k)) + (h(io,jo+1,k)*tv%S(io,jo+1,k)))
+              else
+                Rhtot(ii,JJ) = Rhtot(ii,JJ) + 0.5 * (h(io,jo,k) + h(io,jo+1,k)) * GV%Rlay(k)
+              endif
+            endif
+          enddo ; enddo
+#else
           !$omp loop collapse(2) private(i,j)
           do JJ=1,JJe ; do ii=1,iie
             i = isb + ii - 1
@@ -2747,6 +3059,7 @@ subroutine set_viscous_ML(u, v, h, tv, forces, visc, dt, G, GV, US, CS, nIIB, nJ
               endif
             endif
           enddo ; enddo
+#endif
         enddo
         !$omp end target
 
@@ -2786,6 +3099,59 @@ subroutine set_viscous_ML(u, v, h, tv, forces, visc, dt, G, GV, US, CS, nIIB, nJ
 #endif
 
           !$omp loop LOOP_BIND_TEAMS_PARALLEL collapse(2) &
+#ifdef AMD_WORKAROUNDS
+          ! AMD_WORKAROUNDS: AFAR flang clashes OpenMP private(x) with do concurrent local(x)
+          ! (src/MOM6/frontier/bug_reports/01); renamed loop indices avoid it.
+          !$omp   private(io,jo,hlay,I_2hlay,u_at_v,Uh2,T_lay,S_lay,gHprime,RiBulk)
+          do JJ=1,JJe ; do ii=1,iie
+            io = isb + ii - 1
+            jo = JsbB + JJ - 1
+
+            if (do_ij(ii,JJ)) then
+              hlay = 0.5*(h(io,jo,k) + h(io,jo+1,k))
+              if (hlay > h_tiny) then ! Only consider non-vanished layers.
+                I_2hlay = 1.0 / (h(io,jo,k) + h(io,jo+1,k))
+                u_at_v = 0.5 * ((h(io,jo,k)   * (u(io-1,jo,k)   + u(io,jo,k))) + &
+                                (h(io,jo+1,k) * (u(io-1,jo+1,k) + u(io,jo+1,k)))) * I_2hlay
+                Uh2 = (vhtot(ii,JJ) - htot(ii,JJ)*v(io,jo,k))**2 + &
+                      (uhtot(ii,JJ) - htot(ii,JJ)*u_at_v)**2
+
+                if (use_EOS) then
+                  T_lay = ((h(io,jo,k)*tv%T(io,jo,k)) + (h(io,jo+1,k)*tv%T(io,jo+1,k))) * I_2hlay
+                  S_lay = ((h(io,jo,k)*tv%S(io,jo,k)) + (h(io,jo+1,k)*tv%S(io,jo+1,k))) * I_2hlay
+                  if (nonBous_ML) then
+                    gHprime = (GV%g_Earth * GV%H_to_RZ) * &
+                      (dSpV_dT(ii,JJ) * (Thtot(ii,JJ) - T_lay*htot(ii,JJ)) + &
+                       dSpV_dS(ii,JJ) * (Shtot(ii,JJ) - S_lay*htot(ii,JJ)))
+                  else
+                    gHprime = g_H_Rho0 * (dR_dT(ii,JJ) * (T_lay*htot(ii,JJ) - Thtot(ii,JJ)) + &
+                                          dR_dS(ii,JJ) * (S_lay*htot(ii,JJ) - Shtot(ii,JJ)))
+                  endif
+                else
+                  gHprime = g_H_Rho0 * (GV%Rlay(k)*htot(ii,JJ) - Rhtot(ii,JJ))
+                endif
+
+                if (gHprime > 0.0) then
+                  RiBulk = CS%bulk_Ri_ML * exp_repro(-htot(ii,JJ) * Idecay_len_TKE(ii,JJ))
+                  if (RiBulk * Uh2 <= htot(ii,JJ)**2 * gHprime) then
+                    visc%nkml_visc_v(io,jo) = real(k_massive(ii,JJ))
+                    do_ij(ii,JJ) = .false.
+                  elseif (RiBulk * Uh2 <= (htot(ii,JJ) + hlay)**2 * gHprime) then
+                    visc%nkml_visc_v(io,jo) = real(k-1) + &
+                      ( sqrt(RiBulk * Uh2 / gHprime) - htot(ii,JJ) ) / hlay
+                    do_ij(ii,JJ) = .false.
+                  endif
+                endif
+                k_massive(ii,JJ) = k
+              endif ! hlay > h_tiny
+
+! no early exit on GPU
+#ifndef __NVCOMPILER_OPENMP_GPU
+              if (do_ij(ii,JJ)) do_any = .true.
+#endif
+            endif
+          enddo ; enddo
+#else
           !$omp   private(i,j,hlay,I_2hlay,u_at_v,Uh2,T_lay,S_lay,gHprime,RiBulk)
           do JJ=1,JJe ; do ii=1,iie
             i = isb + ii - 1
@@ -2835,11 +3201,36 @@ subroutine set_viscous_ML(u, v, h, tv, forces, visc, dt, G, GV, US, CS, nIIB, nJ
 #endif
             endif
           enddo ; enddo
+#endif
 
 ! on GPU, faster to do all k iterations, instead of exit early.
 #ifndef __NVCOMPILER_OPENMP_GPU
           if (.not.do_any) exit ! All columns are done.
 #endif
+#ifdef AMD_WORKAROUNDS
+          ! AMD_WORKAROUNDS: AFAR flang clashes OpenMP private(x) with do concurrent local(x)
+          ! (src/MOM6/frontier/bug_reports/01); renamed loop indices avoid it.
+          !$omp loop LOOP_BIND_TEAMS_PARALLEL collapse(2) private(io,jo)
+          do JJ=1,JJe ; do ii=1,iie
+            io = isb + ii - 1
+            jo = JsbB + JJ - 1
+
+            if (do_ij(ii,JJ)) then
+              htot(ii,JJ) = htot(ii,JJ) + 0.5 * (h(io,jo,k) + h(io,jo+1,k))
+              vhtot(ii,JJ) = vhtot(ii,JJ) + 0.5 * (h(io,jo,k) + h(io,jo+1,k)) * v(io,jo,k)
+              uhtot(ii,JJ) = uhtot(ii,JJ) + 0.25 * ((h(io,jo,k) * (u(io-1,jo,k) + u(io,jo,k))) + &
+                                            (h(io,jo+1,k) * (u(io-1,jo+1,k) + u(io,jo+1,k))))
+              if (use_EOS) then
+                Thtot(ii,JJ) = Thtot(ii,JJ) + &
+                  0.5 * ((h(io,jo,k)*tv%T(io,jo,k)) + (h(io,jo+1,k)*tv%T(io,jo+1,k)))
+                Shtot(ii,JJ) = Shtot(ii,JJ) + &
+                  0.5 * ((h(io,jo,k)*tv%S(io,jo,k)) + (h(io,jo+1,k)*tv%S(io,jo+1,k)))
+              else
+                Rhtot(ii,JJ) = Rhtot(ii,JJ) + 0.5 * (h(io,jo,k) + h(io,jo+1,k)) * GV%Rlay(k)
+              endif
+            endif
+          enddo ; enddo
+#else
           !$omp loop LOOP_BIND_TEAMS_PARALLEL collapse(2) private(i,j)
           do JJ=1,JJe ; do ii=1,iie
             i = isb + ii - 1
@@ -2860,6 +3251,7 @@ subroutine set_viscous_ML(u, v, h, tv, forces, visc, dt, G, GV, US, CS, nIIB, nJ
               endif
             endif
           enddo ; enddo
+#endif
 
         enddo
         !$omp end target teams

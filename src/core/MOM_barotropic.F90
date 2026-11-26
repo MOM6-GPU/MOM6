@@ -4802,7 +4802,6 @@ subroutine btcalc(h, G, GV, CS, h_u, h_v, may_use_default, OBC)
     do concurrent (j=js:je)
       ! Reset velocity point thicknesses and their sums at OBC points
       if ((j >= CS%BT_OBC%js_u_E_obc) .and. (j <= CS%BT_OBC%je_u_E_obc)) then
-        !$omp do
         do I = max(is-1,CS%BT_OBC%Is_u_E_obc), min(ie,CS%BT_OBC%Ie_u_E_obc)
           if (CS%BT_OBC%u_OBC_type(I,j) > 0) then ! Eastern boundary condition
             hatutot(I,j) = 0.0
@@ -4814,7 +4813,6 @@ subroutine btcalc(h, G, GV, CS, h_u, h_v, may_use_default, OBC)
         enddo
       endif
       if ((j >= CS%BT_OBC%js_u_W_obc) .and. (j <= CS%BT_OBC%je_u_W_obc)) then
-        !$omp do
         do I = max(is-1,CS%BT_OBC%Is_u_W_obc), min(ie,CS%BT_OBC%Ie_u_W_obc)
           if (CS%BT_OBC%u_OBC_type(I,j) < 0) then ! Western boundary condition
             hatutot(I,j) = 0.0
@@ -4901,7 +4899,6 @@ subroutine btcalc(h, G, GV, CS, h_u, h_v, may_use_default, OBC)
     do concurrent (J=js-1:je)
       ! Reset v-velocity point thicknesses and their sums at OBC points
       if ((J >= CS%BT_OBC%Js_v_N_obc) .and. (J <= CS%BT_OBC%Je_v_N_obc)) then
-        !$omp do simd
         do i = max(is,CS%BT_OBC%is_v_N_obc), min(ie,CS%BT_OBC%ie_v_N_obc)
           if (CS%BT_OBC%v_OBC_type(i,J) > 0) then ! Northern boundary condition
             hatvtot(i,J) = 0.0
@@ -4913,7 +4910,6 @@ subroutine btcalc(h, G, GV, CS, h_u, h_v, may_use_default, OBC)
         enddo
       endif
       if ((J >= CS%BT_OBC%Js_v_S_obc) .and. (J <= CS%BT_OBC%Je_v_S_obc)) then
-        !$omp do simd
         do i = max(is,CS%BT_OBC%is_v_S_obc), min(ie,CS%BT_OBC%ie_v_S_obc)
           if (CS%BT_OBC%v_OBC_type(i,J) < 0) then ! Southern boundary condition
             hatvtot(i,J) = 0.0

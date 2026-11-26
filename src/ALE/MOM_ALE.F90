@@ -1565,7 +1565,11 @@ subroutine ALE_PLM_edge_values( CS, G, GV, h, Q, bdry_extrap, Q_t, Q_b )
     h_neglect = GV%kg_m2_to_H*1.0e-30
   endif
 
-#ifdef __NVCOMPILER_OPENMP_GPU
+#ifdef AMD_WORKAROUNDS
+  ! AMD_WORKAROUNDS: this build defines __NVCOMPILER_OPENMP_GPU for its GPU defaults, but
+  ! bind(parallel,teams) on a combined construct is an nvfortran extension that flang rejects.
+  !$omp target teams loop collapse(2) private(slp, mslp, k)
+#elif defined(__NVCOMPILER_OPENMP_GPU)
   ! saw a bug on V100s running into illegal memory accesses, bind(parallel, teams) is used here
   ! as a solution to this bug due to a compiler bug, REVISIT
   !

@@ -3305,6 +3305,7 @@ subroutine initialize_MOM(Time, Time_init, param_file, dirs, CS, &
   if (bound_salinity) allocate(CS%tv%salt_deficit(isd:ied,jsd:jed), source=0.0)
 
   allocate(CS%Hml(isd:ied,jsd:jed), source=0.0)
+  !$omp target enter data map(to: CS%Hml)
 
   if (bulkmixedlayer) then
     GV%nkml = nkml ; GV%nk_rho_varies = nkml + nkbl
@@ -4501,9 +4502,12 @@ subroutine extract_surface_state(CS, sfc_state_in)
   endif
 
   ! copy Hml into sfc_state, so that caps can access it
+  ! CS%Hml is a pointer component, so it must be attached to the device copy of CS (as for frazil).
+  !$omp target data map(to: CS%Hml)
   do concurrent (j=js:je, i=is:ie)
     sfc_state%Hml(i,j) = CS%Hml(i,j)
   enddo
+  !$omp end target data
 
   if (CS%Hmix < 0.0) then  ! A bulk mixed layer is in use, so layer 1 has the properties
     if (use_temperature) then ; do concurrent (j=js:je, i=is:ie)
@@ -5088,7 +5092,10 @@ subroutine MOM_end(CS)
   if (allocated(CS%uhtr_resolved)) deallocate(CS%uhtr_resolved)
   if (allocated(CS%vhtr_resolved)) deallocate(CS%vhtr_resolved)
 
-  if (associated(CS%Hml)) deallocate(CS%Hml)
+  if (associated(CS%Hml)) then
+    !$omp target exit data map(delete: CS%Hml)
+    deallocate(CS%Hml)
+  endif
   if (associated(CS%tv%salt_deficit)) deallocate(CS%tv%salt_deficit)
   if (associated(CS%tv%frazil)) deallocate(CS%tv%frazil)
   if (allocated(CS%tv%SpV_avg)) deallocate(CS%tv%SpV_avg)

@@ -395,8 +395,17 @@ AC_LANG_PUSH([C])
 AX_MPI([], [AC_MSG_ERROR([Could not find MPI launcher.])])
 AC_SUBST([CC], [$MPICC])
 
+# These C probes only need libc.  Linking them against LIBS/LDFLAGS (e.g. an
+# offload-built libFMS) can fail at the device link step, which would silently
+# yield a size of 0 and break posix.F90.
+save_LIBS="$LIBS"
+save_LDFLAGS="$LDFLAGS"
+LIBS=""
+LDFLAGS=""
 AC_CHECK_SIZEOF([jmp_buf], [], [#include <setjmp.h>])
 AC_CHECK_SIZEOF([sigjmp_buf], [], [#include <setjmp.h>])
+LIBS="$save_LIBS"
+LDFLAGS="$save_LDFLAGS"
 
 AC_LANG_POP([C])
 

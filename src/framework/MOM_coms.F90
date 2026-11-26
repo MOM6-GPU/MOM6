@@ -717,10 +717,19 @@ subroutine increment_block_ints(array, is, ie, js, je, descale, ints_sum, &
     block_max_neg = 0.
 
     ! Compute the sum of each block
+#ifdef AMD_WORKAROUNDS
+    ! AMD_WORKAROUNDS: AFAR flang miscompiles array reductions in device do concurrent
+    ! (src/MOM6/frontier/bug_reports/06); the equivalent OpenMP construct works.
+    !$omp target teams distribute parallel do collapse(2) private(r, e, rmag, lnan, lovf) &
+    !$omp   reduction(+: block_sum) reduction(max: block_max_pos, block_max_neg, inan, iovf) &
+    !$omp   map(to: array) map(tofrom: block_sum, block_max_pos, block_max_neg, inan, iovf)
+    do j=jbs,jbe ; do i=ibs,ibe
+#else
     do concurrent (j=jbs:jbe, i=ibs:ibe) &
         DO_LOCALITY(local(r, e, rmag, lnan, lovf)) &
         DO_LOCALITY(reduce(+: block_sum)) &
         DO_LOCALITY(reduce(max: block_max_pos, block_max_neg, inan, iovf))
+#endif
 
       ! Convert array(i,j) to EFP form
       r = descale * array(i,j)
@@ -738,7 +747,11 @@ subroutine increment_block_ints(array, is, ie, js, je, descale, ints_sum, &
 
       ! Add the EFP result (including potential carry bits)
       block_sum(:) = block_sum(:) + e(:)
+#ifdef AMD_WORKAROUNDS
+    enddo ; enddo
+#else
     enddo
+#endif
 
     array_sum(:) = array_sum(:) + block_sum(:)
 

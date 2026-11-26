@@ -729,6 +729,11 @@ subroutine find_rho_bottom_2d(G, GV, US, tv, h, dz, pres_int, dz_avg, isb, ieb, 
   logical :: use_EOS
   integer, dimension(2) :: EOSdom ! The i-computational domain for the equation of state
   integer :: i, j, k, nz, ii, jj, iie, jje
+#ifdef AMD_WORKAROUNDS
+  ! AMD_WORKAROUNDS: AFAR flang clashes OpenMP private(x) with do concurrent local(x)
+  ! (src/MOM6/frontier/bug_reports/01); renamed loop indices avoid it.
+  integer :: io, jo
+#endif
 
   nz = GV%ke
   iie = ieb-isb+1 ; jje = jeb-jsb+1
@@ -760,6 +765,35 @@ subroutine find_rho_bottom_2d(G, GV, US, tv, h, dz, pres_int, dz_avg, isb, ieb, 
 #ifndef __NVCOMPILER_OPENMP_GPU
       do_any = .false.
 #endif
+#ifdef AMD_WORKAROUNDS
+      ! AMD_WORKAROUNDS: AFAR flang clashes OpenMP private(x) with do concurrent local(x)
+      ! (src/MOM6/frontier/bug_reports/01); renamed loop indices avoid it.
+      !$omp loop collapse(2) private(io,jo)
+      do jj=1,jje ; do ii=1,iie
+        jo = jsb+jj-1 ; io = isb+ii-1
+        if (do_i(ii,jj)) then
+        if (dz(io,jo,k) < dz_bbl_rem(ii,jj)) then
+          ! This layer is fully within the averaging depth.
+          dz_bbl_rem(ii,jj) = dz_bbl_rem(ii,jj) - dz(io,jo,k)
+          hb(ii,jj) = hb(ii,jj) + h(io,jo,k)
+          k_bot(ii,jj) = k
+#ifndef __NVCOMPILER_OPENMP_GPU
+          do_any = .true.
+#endif
+        else
+          if (dz(io,jo,k) > 0.0) then
+            frac_in = dz_bbl_rem(ii,jj) / dz(io,jo,k)
+            if (frac_in >= 0.5) k_bot(ii,jj) = k ! update bbl top index if >= 50% of layer
+          else
+            frac_in = 0.0
+          endif
+          h_bbl_frac(ii,jj) = frac_in * h(io,jo,k)
+          dz_bbl_rem(ii,jj) = 0.0
+          do_i(ii,jj) = .false.
+        endif
+        endif
+      enddo ; enddo
+#else
       !$omp loop collapse(2) private(i,j)
       do jj=1,jje ; do ii=1,iie
         j = jsb+jj-1 ; i = isb+ii-1
@@ -785,6 +819,7 @@ subroutine find_rho_bottom_2d(G, GV, US, tv, h, dz, pres_int, dz_avg, isb, ieb, 
         endif
         endif
       enddo ; enddo
+#endif
 #ifndef __NVCOMPILER_OPENMP_GPU
       if (.not.do_any) exit
 #endif
@@ -829,6 +864,45 @@ subroutine find_rho_bottom_2d(G, GV, US, tv, h, dz, pres_int, dz_avg, isb, ieb, 
 #ifndef __NVCOMPILER_OPENMP_GPU
       do_any = .false.
 #endif
+#ifdef AMD_WORKAROUNDS
+      ! AMD_WORKAROUNDS: AFAR flang clashes OpenMP private(x) with do concurrent local(x)
+      ! (src/MOM6/frontier/bug_reports/01); renamed loop indices avoid it.
+      !$omp loop collapse(2) private(io,jo)
+      do jj=1,jje ; do ii=1,iie
+        jo = jsb+jj-1 ; io = isb+ii-1
+        if (do_i(ii,jj)) then
+        if (dz(io,jo,k) < dz_bbl_rem(ii,jj)) then
+          ! This layer is fully within the averaging depth.
+          SpV_h_bot(ii,jj) = SpV_h_bot(ii,jj) + h(io,jo,k) * tv%SpV_avg(io,jo,k)
+          dz_bbl_rem(ii,jj) = dz_bbl_rem(ii,jj) - dz(io,jo,k)
+          hb(ii,jj) = hb(ii,jj) + h(io,jo,k)
+          k_bot(ii,jj) = k
+#ifndef __NVCOMPILER_OPENMP_GPU
+          do_any = .true.
+#endif
+        else
+          if (dz(io,jo,k) > 0.0) then
+            frac_in = dz_bbl_rem(ii,jj) / dz(io,jo,k)
+            if (frac_in >= 0.5) k_bot(ii,jj) = k ! update bbl top index if >= 50% of layer
+          else
+            frac_in = 0.0
+          endif
+          if (use_EOS) then
+            ! Store the properties of this layer to determine the average
+            ! specific volume of the portion that is within the BBL.
+            T_bbl(ii,jj) = tv%T(io,jo,k) ; S_bbl(ii,jj) = tv%S(io,jo,k)
+            dp(ii,jj) = frac_in * (GV%g_Earth*GV%H_to_RZ * h(io,jo,k))
+            P_bbl(ii,jj) = pres_int(ii,jj,K) + (1.0-frac_in) * (GV%g_Earth*GV%H_to_RZ * h(io,jo,k))
+          else
+            SpV_bbl(ii,jj) = tv%SpV_avg(io,jo,k)
+          endif
+          h_bbl_frac(ii,jj) = frac_in * h(io,jo,k)
+          dz_bbl_rem(ii,jj) = 0.0
+          do_i(ii,jj) = .false.
+        endif
+        endif
+      enddo ; enddo
+#else
       !$omp loop collapse(2) private(i,j)
       do jj=1,jje ; do ii=1,iie
         j = jsb+jj-1 ; i = isb+ii-1
@@ -864,6 +938,7 @@ subroutine find_rho_bottom_2d(G, GV, US, tv, h, dz, pres_int, dz_avg, isb, ieb, 
         endif
         endif
       enddo ; enddo
+#endif
 #ifndef __NVCOMPILER_OPENMP_GPU
       if (.not.do_any) exit
 #endif
