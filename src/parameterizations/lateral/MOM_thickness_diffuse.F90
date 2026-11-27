@@ -794,9 +794,6 @@ subroutine thickness_diffuse_full(h, e, Kh_u, Kh_v, tv, uhD, vhD, cg1, dt, G, GV
   real :: wtL, wtR      ! Unnormalized weights of the slopes to the left and right [H3 Z ~> m4 or kg3 m-5]
   real :: drdx, drdy    ! Zonal and meridional density gradients [R L-1 ~> kg m-4].
   real :: drdz          ! Vertical density gradient [R Z-1 ~> kg m-4].
-  real :: dz_harm       ! Harmonic mean layer vertical extent [Z ~> m].
-  real :: c2_dz_u(niblock,njblock,SZK_(GV)+1) ! Wave speed squared divided by dz at u-points [L2 Z-1 T-2 ~> m s-2]
-  real :: c2_dz_v(niblock,njblock,SZK_(GV)+1)  ! Wave speed squared divided by dz at v-points [L2 Z-1 T-2 ~> m s-2]
   real :: dzN2_u(niblock,njblock,SZK_(GV)+1) ! Vertical extent times N2 at interfaces above u-points times
                         ! rescaling factors from vertical to horizontal distances [L2 Z-1 T-2 ~> m s-2]
   real :: dzN2_v(niblock,njblock,SZK_(GV)+1)  ! Vertical extent times N2 at interfaces above v-points times
@@ -1206,29 +1203,9 @@ subroutine thickness_diffuse_full(h, e, Kh_u, Kh_v, tv, uhD, vhD, cg1, dt, G, GV
     enddo ! k-loop
 
     if (CS%use_FGNV_streamfn) then
-      do concurrent (k=1:nz, jj=1:jje, II=1:IIe, &
-                     G%OBCmaskCu(IsbB+II-1,jsb+jj-1)>0.) DO_LOCALITY(local(I,j))
-        j = jsb + jj - 1 ; I = IsbB + II - 1
-        dz_harm = max( dz_neglect, &
-              2. * dz(i,j,k) * dz(i+1,j,k) / ( ( dz(i,j,k) + dz(i+1,j,k) ) + dz_neglect ) )
-        c2_dz_u(II,jj,k) = CS%FGNV_scale * ( 0.5*( cg1(i,j) + cg1(i+1,j) ) )**2 / dz_harm
-      enddo
-
       ! Solve an elliptic equation for the streamfunction following Ferrari et al., 2010.
-      do concurrent (jj=1:jje, II=1:IIe) DO_LOCALITY(local(I,j))
-        j = jsb + jj - 1 ; I = IsbB + II - 1
-        if (G%OBCmaskCu(I,j)>0.) then
-          do K=2,nz
-            Sfn_unlim_u(II,jj,K) = (1. + CS%FGNV_scale) * Sfn_unlim_u(II,jj,K)
-          enddo
-          ! unsure if this works on GPU due to non-contiguous memory access
-          call streamfn_solver(nz, c2_dz_u(II,jj,:), dzN2_u(II,jj,:), Sfn_unlim_u(II,jj,:))
-        else
-          do K=2,nz
-            Sfn_unlim_u(II,jj,K) = 0.
-          enddo
-        endif
-      enddo
+      call streamfn_solver(nz, niblock, njblock, IIe, jje, IsbB, jsb, 1, 0, G%IsdB, G%IedB, G%jsd, G%jed, &
+                           G%OBCmaskCu, dz, cg1, dz_neglect, CS%FGNV_scale, dzN2_u, Sfn_unlim_u, G)
     endif
     do concurrent (jj=1:jje) DO_LOCALITY(local(j))
       j = jsb + jj - 1
@@ -1566,28 +1543,9 @@ subroutine thickness_diffuse_full(h, e, Kh_u, Kh_v, tv, uhD, vhD, cg1, dt, G, GV
     enddo ! k-loop
 
     if (CS%use_FGNV_streamfn) then
-      do concurrent (k=1:nz, JJ=1:JJe, ii=1:iie, &
-                     G%OBCmaskCv(isb+ii-1,JsbB+JJ-1)>0.) DO_LOCALITY(local(i,J))
-        J = JsbB + JJ - 1 ; i = isb + ii - 1
-        dz_harm = max( dz_neglect, &
-              2. * dz(i,j,k) * dz(i,j+1,k) / ( ( dz(i,j,k) + dz(i,j+1,k) ) + dz_neglect ) )
-        c2_dz_v(ii,JJ,k) = CS%FGNV_scale * ( 0.5*( cg1(i,j) + cg1(i,j+1) ) )**2 / dz_harm
-      enddo
-
       ! Solve an elliptic equation for the streamfunction following Ferrari et al., 2010.
-      do concurrent (JJ=1:JJe, ii=1:iie) DO_LOCALITY(local(i,J))
-        J = JsbB + JJ - 1 ; i = isb + ii - 1
-        if (G%OBCmaskCv(i,J)>0.) then
-          do K=2,nz
-            Sfn_unlim_v(ii,JJ,K) = (1. + CS%FGNV_scale) * Sfn_unlim_v(ii,JJ,K)
-          enddo
-          call streamfn_solver(nz, c2_dz_v(ii,JJ,:), dzN2_v(ii,JJ,:), Sfn_unlim_v(ii,JJ,:))
-        else
-          do K=2,nz
-            Sfn_unlim_v(ii,JJ,K) = 0.
-          enddo
-        endif
-      enddo
+      call streamfn_solver(nz, niblock, njblock, iie, JJe, isb, JsbB, 0, 1, G%isd, G%ied, G%JsdB, G%JedB, &
+                           G%OBCmaskCv, dz, cg1, dz_neglect, CS%FGNV_scale, dzN2_v, Sfn_unlim_v, G)
     endif
 
     do concurrent (JJ=1:JJe) DO_LOCALITY(local(J))
@@ -1846,41 +1804,85 @@ subroutine thickness_diffuse_full(h, e, Kh_u, Kh_v, tv, uhD, vhD, cg1, dt, G, GV
 
 end subroutine thickness_diffuse_full
 
-!> Tridiagonal solver for streamfunction at interfaces
-pure subroutine streamfn_solver(nk, c2_h, hN2, sfn)
-  integer,               intent(in)    :: nk   !< Number of layers
-  real, dimension(nk),   intent(in)    :: c2_h !< Wave speed squared over thickness in layers, rescaled to
+!> Tridiagonal solver for streamfunction at interfaces, for every unmasked column of a block
+subroutine streamfn_solver(nk, nii, njj, iie, jje, isb, jsb, di, dj, isdm, iedm, jsdm, jedm, mask, &
+                           dz, cg1, dz_neglect, FGNV_scale, hN2, sfn, G)
+  type(ocean_grid_type), intent(in) :: G    !< Ocean grid structure
+  integer, intent(in) :: nk   !< Number of layers
+  integer, intent(in) :: nii  !< The i-extent of the blocked arrays
+  integer, intent(in) :: njj  !< The j-extent of the blocked arrays
+  integer, intent(in) :: iie  !< The number of columns in the i-direction of this block
+  integer, intent(in) :: jje  !< The number of columns in the j-direction of this block
+  integer, intent(in) :: isb  !< The global i-index of the first column of this block
+  integer, intent(in) :: jsb  !< The global j-index of the first column of this block
+  integer, intent(in) :: di   !< The i-offset of the second tracer point next to each column (1 at u-points)
+  integer, intent(in) :: dj   !< The j-offset of the second tracer point next to each column (1 at v-points)
+  integer, intent(in) :: isdm !< The lower i-bound of mask
+  integer, intent(in) :: iedm !< The upper i-bound of mask
+  integer, intent(in) :: jsdm !< The lower j-bound of mask
+  integer, intent(in) :: jedm !< The upper j-bound of mask
+  real, dimension(isdm:iedm,jsdm:jedm), intent(in) :: mask !< 0 for boundary or OBC points and 1 for
+                                               !! ocean points at the velocity points of the columns [nondim]
+  real, dimension(SZI_(G),SZJ_(G),nk), intent(in) :: dz  !< Height change across layers [Z ~> m]
+  real, dimension(SZI_(G),SZJ_(G)),    intent(in) :: cg1 !< Wave speed [L T-1 ~> m s-1]
+  real, intent(in) :: dz_neglect !< A negligible vertical extent [Z ~> m]
+  real, intent(in) :: FGNV_scale !< A coefficient scaling the vertical smoothing term in the
+                                 !! Ferrari et al., 2010, streamfunction formulation [nondim].
+  real, dimension(nii,njj,nk+1), intent(in)    :: hN2  !< Thickness times N2 at interfaces times rescaling factors
                                                !! [H L2 Z-2 T-2 ~> m s-2 or kg m-2 s-2]
-  real, dimension(nk+1), intent(in)    :: hN2  !< Thickness times N2 at interfaces times rescaling factors
-                                               !! [H L2 Z-2 T-2 ~> m s-2 or kg m-2 s-2]
-  real, dimension(nk+1), intent(inout) :: sfn  !< Streamfunction [H L2 T-1 ~> m3 s-1 or kg s-1] or arbitrary units
+  real, dimension(nii,njj,nk+1), intent(inout) :: sfn  !< Streamfunction [H L2 T-1 ~> m3 s-1 or kg s-1] or
+                                               !! arbitrary units
                                                !! On entry, equals diffusivity times slope.
                                                !! On exit, equals the streamfunction.
   ! Local variables
-  real :: c1(nk)  ! The dependence of the final streamfunction on the values below [nondim]
+  real :: c2_h(nii,njj,nk) ! Wave speed squared divided by dz [L2 Z-1 T-2 ~> m s-2]
+  real :: c1(nii,njj,nk) ! The dependence of the final streamfunction on the values below [nondim]
+  real :: dz_harm ! Harmonic mean layer vertical extent [Z ~> m].
   real :: d1      ! The complement of c1(k) (i.e., 1 - c1(k)) [nondim]
   real :: b_denom ! A term in the denominator of beta [H L2 Z-2 T-2 ~> m s-2 or kg m-2 s-2]
   real :: beta    ! The normalization for the pivot [Z2 T2 H-1 L-2 ~> s2 m-1 or m2 s2 kg-1]
-  integer :: k
-  !$omp declare target
+  integer :: i, j, ii, jj, k
 
-  sfn(1) = 0.
-  b_denom = hN2(2) + c2_h(1)
-  beta = 1.0 / ( b_denom + c2_h(2) )
-  d1 = beta * b_denom
-  sfn(2) = ( beta * hN2(2) )*sfn(2)
-  do K=3,nk
-    c1(k-1) = beta * c2_h(k-1)
-    b_denom = hN2(K) + d1*c2_h(k-1)
-    beta = 1.0 / (b_denom + c2_h(k))
-    d1 = beta * b_denom
-    sfn(K) = beta * (hN2(K)*sfn(K) + c2_h(k-1)*sfn(K-1))
+  !$omp target enter data map(alloc: c2_h, c1)
+
+  do concurrent (k=1:nk, jj=1:jje, ii=1:iie, mask(isb+ii-1,jsb+jj-1)>0.) &
+      DO_LOCALITY(local(i, j, dz_harm))
+    j = jsb + jj - 1 ; i = isb + ii - 1
+    dz_harm = max( dz_neglect, &
+          2. * dz(i,j,k) * dz(i+di,j+dj,k) / ( ( dz(i,j,k) + dz(i+di,j+dj,k) ) + dz_neglect ) )
+    c2_h(ii,jj,k) = FGNV_scale * ( 0.5*( cg1(i,j) + cg1(i+di,j+dj) ) )**2 / dz_harm
   enddo
-  c1(nk) = beta * c2_h(nk)
-  sfn(nk+1) = 0.
-  do K=nk,2,-1
-    sfn(K) = sfn(K) + c1(k)*sfn(K+1)
+
+  do concurrent (jj=1:jje, ii=1:iie) DO_LOCALITY(local(d1, b_denom, beta, k))
+    if (mask(isb+ii-1,jsb+jj-1)>0.) then
+      do K=2,nk
+        sfn(ii,jj,K) = (1. + FGNV_scale) * sfn(ii,jj,K)
+      enddo
+      sfn(ii,jj,1) = 0.
+      b_denom = hN2(ii,jj,2) + c2_h(ii,jj,1)
+      beta = 1.0 / ( b_denom + c2_h(ii,jj,2) )
+      d1 = beta * b_denom
+      sfn(ii,jj,2) = ( beta * hN2(ii,jj,2) )*sfn(ii,jj,2)
+      do K=3,nk
+        c1(ii,jj,k-1) = beta * c2_h(ii,jj,k-1)
+        b_denom = hN2(ii,jj,K) + d1*c2_h(ii,jj,k-1)
+        beta = 1.0 / (b_denom + c2_h(ii,jj,k))
+        d1 = beta * b_denom
+        sfn(ii,jj,K) = beta * (hN2(ii,jj,K)*sfn(ii,jj,K) + c2_h(ii,jj,k-1)*sfn(ii,jj,K-1))
+      enddo
+      c1(ii,jj,nk) = beta * c2_h(ii,jj,nk)
+      sfn(ii,jj,nk+1) = 0.
+      do K=nk,2,-1
+        sfn(ii,jj,K) = sfn(ii,jj,K) + c1(ii,jj,k)*sfn(ii,jj,K+1)
+      enddo
+    else
+      do K=2,nk
+        sfn(ii,jj,K) = 0.
+      enddo
+    endif
   enddo
+
+  !$omp target exit data map(delete: c2_h, c1)
 
 end subroutine streamfn_solver
 
