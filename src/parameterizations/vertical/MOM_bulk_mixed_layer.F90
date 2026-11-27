@@ -1489,6 +1489,7 @@ subroutine find_starting_TKE(htot, h_CA, fluxes, U_star_2d, Conv_En, cTKE, dKE_F
 
   ! Local variables
   real :: dKE_conv  ! The change in mean kinetic energy due to all convection [H Z2 T-2 ~> m3 s-2 or J m-2].
+  real :: TKE_conv  ! The decayed convective source of TKE [H Z2 T-2 ~> m3 s-2 or J m-2].
   real :: nstar_FC  ! The effective efficiency with which the energy released by
                     ! free convection is converted to TKE, often ~0.2 [nondim].
   real :: nstar_CA  ! The effective efficiency with which the energy released by
@@ -1609,13 +1610,13 @@ subroutine find_starting_TKE(htot, h_CA, fluxes, U_star_2d, Conv_En, cTKE, dKE_F
     dKE_conv = dKE_CA(i,1) * MKE_rate_CA + dKE_FC(i) * MKE_rate_FC
 ! At this point, it is assumed that cTKE is positive and stored in TKE_CA!
 ! Note: Removed factor of 2 in u*^3 terms.
+    ! TKE_conv is a separate statement only to avoid an nvfortran -O3 bug that ignores the parentheses.
+    TKE_conv = exp_kh * dKE_conv + nstar_FC*Conv_En(i) + nstar_CA * TKE_CA
     if (GV%Boussinesq .or. GV%semi_Boussinesq .or. .not.(associated(fluxes%tau_mag))) then
-      TKE(i) = (dt*CS%mstar)*((GV%Z_to_H*(U_star*U_Star*U_Star))*exp_kh) + &
-               (exp_kh * dKE_conv + nstar_FC*Conv_En(i) + nstar_CA * TKE_CA)
+      TKE(i) = (dt*CS%mstar)*((GV%Z_to_H*(U_star*U_Star*U_Star))*exp_kh) + TKE_conv
     else
       ! Note that GV%Z_to_H*U_star**3 = GV%RZ_to_H * fluxes%tau_mag(i,j) * U_star
-      TKE(i) = (dt*CS%mstar) * ((GV%RZ_to_H * fluxes%tau_mag(i,j) * U_star)*exp_kh) + &
-               (exp_kh * dKE_conv + nstar_FC*Conv_En(i) + nstar_CA * TKE_CA)
+      TKE(i) = (dt*CS%mstar) * ((GV%RZ_to_H * fluxes%tau_mag(i,j) * U_star)*exp_kh) + TKE_conv
     endif
 
     if (CS%do_rivermix) then ! Add additional TKE at river mouths
